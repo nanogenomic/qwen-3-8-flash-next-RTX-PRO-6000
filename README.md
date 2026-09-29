@@ -243,7 +243,31 @@ the `hc_fused_tail` JIT during CUDA-graph warmup.
 `[measured]`. That is enough for steady-state serving and **not** always enough for a *lazy*
 allocation made after serving starts.
 
-This bit the reference deployment. At 16:45:24 on 2026-09-29 it died with:
+**This failure class is recurring, not a one-off.** The reference deployment's own recorded
+operational history has it happening twice in a single day at `--mem-fraction-static 0.99`, on
+2026-09-11 — **once after 18 h 52 m of continuous uptime**, and once earlier for want of 48 MiB.
+Both were **runtime allocation failures during serving**, not CUDA-graph capture failures.
+Measured at 0.99 on that lane:
+
+| | |
+|---|---|
+| KV pool | 270,208 tokens |
+| Static headroom reported at boot | **2.20 GB** |
+| At the OOM | process held **93.44 GiB**; card had **190.06 MiB** free; the allocation needed **312.00 MiB** |
+| Co-resident on the same card | one process holding 550 MiB **and growing**, plus a launcher holding a further 698 MiB |
+
+The note that replaced the 0.99 configuration puts it better than a paragraph can:
+
+> 2.20 GiB of static headroom is not a margin, it is a countdown.
+
+The lesson that generalises: **a memory fraction that survives a soak can still kill the lane
+hours later.** The 18 h 52 m death is the important one — nothing in a start-up check or a
+five-minute soak would have caught it. Anything else resident on the card, or anything that
+grows, eats the same budget.
+
+At the shipped 0.98 the headroom is 3.39 GB rather than 2.20 GB, which is more margin — and
+**the same class of failure still occurred.** At 16:45:24 on 2026-09-29 the deployment died
+with:
 
 ```
 Triton kernel 'apply_token_bitmask_inplace_kernel' device-loaded after serving started
@@ -252,8 +276,9 @@ Triton kernel 'apply_token_bitmask_inplace_kernel' device-loaded after serving s
 
 → scheduler exception → `SIGQUIT` → `kill_process_tree`. A constrained-decoding request
 (tool-call / JSON, i.e. `response_format`, a grammar, or a tool schema) took a **lazy Triton
-kernel-load path with no VRAM left to load into**. Nothing in this fork's levers caused it;
-it is what a high static memory fraction costs.
+kernel-load path with no VRAM left to load into** — the same shape as the 0.99 deaths above: an
+allocation that arrives *after* the static pool is already committed. Nothing in this fork's
+levers caused it; it is what a high static memory fraction costs.
 
 The mitigation that was applied — and the one to prefer, because it **costs no KV pool** —
 is to issue one grammar-constrained request at startup, so the kernel loads while memory is

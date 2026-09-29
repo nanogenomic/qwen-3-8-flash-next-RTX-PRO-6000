@@ -248,10 +248,13 @@ Contributions, all measured:
   on the production card** at that setting. ⚠ **That headroom is enough for steady-state
   serving and not always enough for a lazy allocation made after serving starts** — the
   reference deployment was killed once by a constrained-decoding request taking a lazy Triton
-  kernel-load path with 0.54 GiB free. The mitigation (a grammar-constrained warmup request at
-  startup, which costs no KV pool) and the full failure chain are in
+  kernel-load path with 0.54 GiB free, and its recorded history has the same failure class
+  killing the lane **twice in one day at 0.99** (2.20 GB headroom), once after 18 h 52 m of
+  uptime. The mitigation (a grammar-constrained warmup request at startup, which costs no KV
+  pool) and the full failure chain are in
   [README.md](README.md#operational-warning---mem-fraction-static-098-is-tight). Anyone copying
-  this configuration should read that before treating 0.98 as free.
+  this configuration should read that before treating 0.98 as free — in particular, **a memory
+  fraction that survives a soak can still kill the lane hours later.**
 - `--max-mamba-cache-size 12` with `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`, instead of 16.
   Mamba slots trade against KV at **~0.093 GB ≈ 3,750 pool tokens per slot**, and **each
   running request costs 3 mamba state slots** (`mamba num: 45` observed at
