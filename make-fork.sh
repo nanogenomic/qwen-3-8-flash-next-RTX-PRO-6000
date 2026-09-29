@@ -31,6 +31,10 @@ fi
 echo "==> cloning upstream SGLang at $BASE (shallow, one commit)"
 mkdir -p "$TARGET"
 git -C "$TARGET" init -q .
+# `git am` needs a committer identity. Use the repository's own, so the script works on a
+# machine with no global git config; the patches carry their own author, which is preserved.
+git -C "$TARGET" config user.name  "$(git -C "$HERE" log -1 --format=%an 2>/dev/null || echo qwen-opt)"
+git -C "$TARGET" config user.email "$(git -C "$HERE" log -1 --format=%ae 2>/dev/null || echo qwen-opt@localhost)"
 git -C "$TARGET" remote add sglang "$UPSTREAM"
 git -C "$TARGET" fetch --depth 1 sglang "$BASE"
 git -C "$TARGET" checkout -q -b upstream-base FETCH_HEAD
