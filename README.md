@@ -266,7 +266,3 @@ CHANGES §Why not 2×).
 Upstream SGLang is **Apache-2.0**, and `LICENSE` in this repository is upstream's, unmodified.
 The files added by this fork carry `SPDX-License-Identifier: Apache-2.0` alongside their
 copyright line and are offered under the same terms.
-
-> Note: GitHub created this repository with an MIT `LICENSE`. That was replaced with
-> upstream's Apache-2.0 text, because the overwhelming majority of the content here is
-> Apache-2.0 SGLang and the modified files are derivative works of Apache-2.0 sources.
