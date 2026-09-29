@@ -39,7 +39,11 @@ The `138.8 → 166.4` figure compares:
 
 - **Stock:** SGLang PR #36497 @`73a255206f`, venv with **flashinfer 0.6.17** and
   **sglang-kernel 0.4.6.post1**, `--mem-fraction-static 0.958`, `--max-mamba-cache-size 16`,
-  no token map, BF16 KV, on the card that was also serving live traffic.
+  no token map, BF16 KV, on the card that was also serving live traffic. Its figures are
+  **mined from that lane's own scheduler log** — 738 decode and 471 prefill samples from one
+  boot segment, p50 per `#running-req` — not from a dedicated sweep. Its accept length of
+  2.52 is therefore measured on its own traffic mix and **is not comparable** row-to-row with
+  this tree's accept lengths, which come from a held-out eval split.
 - **This tree:** base `6fa3fe69e2` + these 32 commits, venv with **flashinfer 0.6.18** and
   **sglang-kernel 0.4.7**, `--mem-fraction-static 0.98`, `--max-mamba-cache-size 12` with
   `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`, graph-bs 4, **a 24k hot-token speculative map**, BF16

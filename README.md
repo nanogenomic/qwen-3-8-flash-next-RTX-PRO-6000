@@ -20,8 +20,10 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 ## Headline measured results
 
 Against **the same model on the stock engine** (SGLang PR #36497 @`73a255206f`) on an
-identical card. Temperature 0. Both columns are single measurement sweeps; see the noise
-band below before reading any difference under ~6% as real.
+identical card. Temperature 0. The stock figures are the production lane's own **logged**
+rates; this tree's are single measurement sweeps on a dedicated card. See the noise band
+before reading any single-stream difference under ~6 % as real, and BENCHMARKS.md §1.2 for
+why this is a cross-engine comparison rather than a single-variable A/B.
 
 | Metric | Stock engine | This tree (all lossless levers on) | Δ |
 |---|---|---|---|
