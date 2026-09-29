@@ -203,6 +203,47 @@ The shipped profile deliberately takes the pool.
 line hit 4.10, breaking the 4.00 cap) and it is still off, because it cost −3.8 % throughput
 and −67 % of the pool.
 
+### 3.3b Pool-capacity constants, for multi-client sizing
+
+`[measured / arithmetic from the checkpoint config]` The constants a deployment needs in order
+to size a shared backend. The guidance built on them is in
+[README.md](README.md#sizing-for-multiple-clients-and-subagents).
+
+| Quantity | Value | Basis |
+|---|---|---|
+| Full-attention KV, bf16 | **24,576 B/token** | 12 full-attn layers × 2 KV heads × 256 head_dim × (K+V) × 2 B `[arithmetic]` |
+| Compressed indexer keys | 768 B/token | 12 layers × 1 head × 128 dim × 2 B ÷ 4 (compress ratio) `[arithmetic]` |
+| MTP draft KV | 2,048 B/token | 1 layer × 2 heads × 256 × (K+V) × 2 B `[arithmetic]` |
+| **Total per context token** | **27,392 B (26.75 KiB)** | sum of the above; a measured pool line worked out at 26.0 KiB/token |
+| Mamba state slots per running request | **3** | `[measured]` "mamba num: 45" observed at 15 running requests |
+| Pool cost of one mamba slot | **~0.093 GB ≈ 3,750 pool tokens** | `[measured]` |
+| Pool cost of one extra running request | **~11,250 pool tokens** | 3 × the above |
+| Concurrency cap | `--max-mamba-cache-size` ÷ 3 | 12 slots → 4 concurrent, which is why the shipping config pairs 12 with `--max-running-requests 4` |
+| KV pool, bf16 → fp8 | 279,680 → **542,912** (**1.94×**) | `[measured]`, same build and card |
+| Cost of declaring a larger window | 542,912 tokens at a 262k declaration vs **519,040** at 540k | `[measured]`, same fp8 build |
+
+**Why the cost is affine rather than linear.** Only 12 of 48 layers are full attention; the other
+36 are gated-delta-net linear attention, whose recurrent state is **constant per sequence** and
+does not grow with context. Pool cost is therefore ≈ `N × fixed + total_tokens × rate`. The
+operationally useful consequence is that **for many small requests the fixed term dominates**, so
+reducing the number of admitted clients can free more pool than reducing each client's context.
+
+One measurement quality note: two sources give different per-slot state sizes — **~0.093 GB**
+`[measured on this engine, and the figure used above because it is the pool trade-off that
+matters]` and **~56 MiB** `[measured on the older engine]`. The ~0.093 GB figure covers more than
+the raw GDN state, so they are not directly comparable and are not averaged here.
+
+**Prefix-cache behaviour, which is what actually degrades under oversubscription.** `[measured]`
+In normal operation the deployment serves **64 % of prefill tokens from cache** — 218 prefill
+batches with more than 50k cached tokens each, maximum 203,904. A live reading at 18:11Z on the
+331,456-token pool showed the oversubscribed state instead: 254,144 tokens used (76.7 %), 3
+running and 6 waiting requests, **335,949 waiting uncached tokens — more than the whole pool** —
+for 590,093 total (**1.78×** oversubscribed), at `cache_hit_rate` 0.0. That reading is a single
+instantaneous sample from the live lane, not a benchmark cell, and is reported as such. It is
+included because it identifies the failure mode: **the scheduler queues rather than erroring, and
+the cost lands as prefix eviction and full re-prefill**, which at ~250k context is tens of seconds
+per turn.
+
 ### 3.4 Acceptance rule used for shipping
 
 A single-stream gain counted only if, on the same boot: 4-concurrent aggregate ≥ 386.9,
@@ -505,6 +546,8 @@ Recorded so this is not mistaken for a finished evaluation.
 | Same-instance NLL repeat (the true NLL noise floor rather than a cross-instance one) | **never run**, same reason. |
 | IFEval, decpath and degen on the YaRN f=4 / 1M configuration | **not measured** — the run was stopped mid-suite, and the later gate returned INVALID. |
 | Cache-integrity (v2, cache-exercising) prefix probe on this engine | **not measured.** |
+| A multi-client / multi-subagent capacity benchmark (aggregate throughput and per-turn latency at a realistic mix of one long-context primary plus N small subagents) | **not run.** §3.3b gives the constants to size with and one live oversubscription reading; there is no swept measurement of the mixed workload, so the sizing guidance is arithmetic plus a single observation, not a benchmark. |
+| Prefill re-cost under deliberate prefix eviction (how many seconds a turn actually costs once a ~250k prefix has been evicted) | **not measured directly.** Inferred from the measured prefill rate, not timed under induced eviction. |
 | A deep single-stream context sweep on the exact shipping bf16-KV configuration (beyond 95.4k, up to its 279,680-token pool) | **not run.** The harness cells stopped at 95.4k, so §3.1b's deeper rows come from the fp8-KV and host-KV arms instead. This is the single most useful missing measurement for anyone sizing a long-context agent lane on the shipping config. |
 | Bracketing the native-RoPE cliff between 400k and 500k (e.g. 440k, 470k) | **not run.** §3.8 can only say "holds to 400k, broken by 500k". |
 | Single-stream throughput on the native-RoPE 400k configuration | **not measured** — that run was a retrieval probe only, so there is no tok/s figure at 400k without YaRN. |

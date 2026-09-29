@@ -295,6 +295,131 @@ Run it after `/health` returns, and make it non-fatal — a warmup hiccup must n
 lane down. If you would rather not depend on a warmup step, lower `--mem-fraction-static`
 and accept the smaller pool.
 
+### Sizing for multiple clients and subagents
+
+The benchmarks above are single-stream and 4-concurrent. Neither tells you how to size this
+when several agent sessions — each spawning subagents — share one backend. That is a different
+problem, and it has an architecture-specific answer.
+
+**The KV pool is shared by every client, and demand oversubscribes trivially.** A live reading
+from the reference deployment at 18:11Z, on the 331,456-token bf16 pool:
+
+| Field | Value |
+|---|---|
+| `num_used_tokens` | 254,144 (**76.7 %** of pool) |
+| `num_running_reqs` | 3 |
+| `num_waiting_reqs` | 6 |
+| `num_waiting_uncached_tokens` | **335,949** — more than the entire pool |
+| `num_total_tokens` | 590,093 (**1.78×** oversubscribed) |
+| `cache_hit_rate` | 0.0 |
+
+That is one instantaneous reading, not a benchmark. It is here because of what it shows.
+
+**The failure mode is not an OOM — the scheduler queues. It is prefix-cache collapse.** Queued
+requests have their cached prefixes evicted and then re-prefill from scratch. At ~250k context
+that is tens of seconds per turn, every turn. So *"it queues, so it is fine"* is the wrong
+conclusion: nothing errors, and the lane just becomes slow in a way that looks like the model
+got worse. For contrast, the same deployment normally serves **64 % of prefill tokens from
+cache** (218 prefill batches with >50k cached, max 203,904) `[measured]` — a `cache_hit_rate`
+of 0.0 under load is the signal that this is happening.
+
+#### The cost model is affine, not linear — and that is architectural
+
+This model has **36 gated-delta-net (linear attention) layers and only 12 full-attention
+layers**, which splits the memory cost in two:
+
+- The **12 full-attention layers** carry KV that is **linear in tokens**: 24,576 B/token at
+  bf16 for K+V `[arithmetic from the checkpoint config]`, or **27,392 B/token (26.75 KiB)**
+  once the compressed indexer keys and the MTP draft's own KV are included. The measured pool
+  line worked out at 26.0 KiB/token.
+- The **36 GDN layers** carry a **recurrent state that is constant per sequence** — it does not
+  grow with context. Each running request costs **3 mamba state slots** `[measured:
+  "mamba num: 45" observed at 15 running requests]`.
+
+So the pool cost is roughly `N × fixed + total_tokens × rate`. Two consequences matter more
+than the formula:
+
+1. **Concurrency is capped by `--max-mamba-cache-size`, not by the token budget.** At 12 slots
+   and 3 slots per request that is **4 concurrent requests**, which is why the shipping config
+   pairs `--max-mamba-cache-size 12` with `--max-running-requests 4`. Raise one without the
+   other and nothing happens.
+2. **Every extra mamba slot comes out of the KV pool 1:1** — `[measured]` **~0.093 GB ≈ 3,750
+   pool tokens per slot**, so **~11,250 pool tokens per additional running request**.
+   Concurrency and context trade directly against each other.
+
+The practical inversion: **for many small requests the fixed term dominates, so admitting fewer
+clients can free more pool than shrinking each client's context.** That is the opposite of the
+usual intuition, and it follows directly from 36 of 48 layers being context-length-independent.
+
+#### Sizing principle
+
+**What must fit the pool is the in-flight set — bounded by `--max-running-requests` — not every
+client's theoretical maximum.** That makes the arithmetic tractable:
+
+- One long-context primary session at ~190k resident plus three small subagents at ~35k each is
+  ~295k, which fits a 331k pool.
+- Four long-context sessions at ~190k each is ~762k, which thrashes.
+
+So: **give the primary session the full window, and size subagents explicitly and small.**
+Subagent work is bounded — a subagent that searches, reads and reports does not need the
+primary's window — and sizing it small is what buys the primary its context. Treat the numbers
+above as an illustration of the method, not as your budget; substitute your own pool and your
+own session shapes.
+
+#### The trap: subagents that inherit their context window
+
+If your orchestrator derives a subagent's context window from the **parent's** configured
+`context_length`, then editing that one value silently reshapes every subagent spawned
+afterwards. This is worth stating because of how it fails.
+
+On the reference deployment a capacity-tuning change lowered a profile's `context_length` to
+65,536. Subagents inherited it, and their compaction trigger became:
+
+```
+(65,536 window − 24,576 output reserve) × 0.85 = 34,816 tokens
+```
+
+At that point **compaction could not free enough to get back under its own threshold, and
+agents stalled outright** — not slowly, not with a warning. Note the second-order problem: a
+24,576-token output reservation is **37.5 % of a 65,536-token window**. A reservation sized for
+a large window becomes pathological in a small one.
+
+Two rules, and they hold for any orchestrator on any engine:
+
+1. **Size subagent context explicitly. Never inherit it from the parent.**
+2. **Keep the output reservation proportionate to the window**, and check that the compaction
+   threshold leaves enough room for compaction to actually succeed.
+
+#### fp8 KV is the capacity lever, and it is the honest trade
+
+`[measured, same build, same card]` The KV pool goes from **279,680 → 542,912 tokens: 1.94×.**
+That is the single biggest capacity change available, and it buys roughly one extra long-context
+session or a handful of subagents.
+
+What it costs, stated as precisely as the measurements allow:
+
+| | |
+|---|---|
+| GSM8K (n=150) | 0.9533 → 0.9533 — **identical** |
+| Needle retrieval | 1.0 → 1.0 — **identical** |
+| Degeneracy | **PASS** |
+| Decode-path equivalence, 1 stream | **PASS** |
+| Decode-path equivalence, 4 streams | **WARN**, p = 0.033 |
+| Single-stream throughput | **−4.0 %** |
+
+The WARN is a real divergence and is why this is labelled lossy. But be precise about what the
+instrument measures: **divergence from the bf16 reference, not degradation.** No task metric
+moved. It is labelled lossy because it changes numerics by design, and because a small real
+divergence at concurrency 4 is exactly what you would expect from quantizing the cache the
+decode path reads. Decide accordingly: for an agent lane that is pool-starved, 1.94× the pool
+for no measured task-metric change is usually the right trade; for anything where bit-level
+agreement with a bf16 baseline matters, it is not.
+
+One non-obvious interaction: **declaring a very large `--context-length` itself costs pool.**
+`[measured]` The same fp8 build gives **542,912** tokens at a 262k declaration but **519,040**
+at 540k. The window you advertise and the pool you get trade off, so do not declare a window
+you do not intend to serve.
+
 ### Deployment gotcha: a router that pins the context window
 
 If a router or gateway fronts the backend and advertises its own `max_model_len`, **raise it
@@ -357,7 +482,9 @@ Not ours, listed because a result above needs them.
 | Variable / flag | Why it appears here |
 |---|---|
 | `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Required to boot with `--context-length` above the window SGLang derives from the checkpoint. Needed for the native-extrapolation result and for any YaRN configuration. |
-| `--kv-cache-dtype fp8_e4m3` | Opt-in lossy. Required to reach a KV pool that admits ~400k-token prompts. |
+| `--kv-cache-dtype fp8_e4m3` | Opt-in lossy. **1.94× the KV pool** (279,680 → 542,912), and required to reach a pool that admits ~400k-token prompts. |
+| `--max-mamba-cache-size` **and** `--max-running-requests` | These two must be set **together**: 3 mamba slots per request means the cache size divided by 3 is the real concurrency cap, whatever `--max-running-requests` says. See [Sizing for multiple clients and subagents](#sizing-for-multiple-clients-and-subagents). |
+| `--context-length` | Declaring a larger window **costs pool** (measured: 542,912 tokens at 262k vs 519,040 at 540k), so do not advertise a window you do not intend to serve. |
 
 ### Build helpers (optional levers only)
 
