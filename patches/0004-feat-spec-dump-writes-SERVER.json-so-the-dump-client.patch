@@ -1,0 +1,37 @@
+From 29162efe7bf87508d5848ab34b569ca4888717d1 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 20:27:32 +0000
+Subject: [PATCH 04/32] feat(spec): dump writes SERVER.json so the dump client
+ can refuse a non-dump instance
+
+---
+ python/sglang/srt/debug_utils/mtp_hidden_dump.py | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/python/sglang/srt/debug_utils/mtp_hidden_dump.py b/python/sglang/srt/debug_utils/mtp_hidden_dump.py
+index 40cee66..742153c 100644
+--- a/python/sglang/srt/debug_utils/mtp_hidden_dump.py
++++ b/python/sglang/srt/debug_utils/mtp_hidden_dump.py
+@@ -81,6 +81,22 @@ class _Dumper:
+         # records carry the same `step` so the loader can pair them.
+         self._step = 0
+         self._rotate()
++        # Proof-of-life for the dump client: it refuses to send traffic unless
++        # a fresh SERVER.json exists, so it can never aim at a non-dump
++        # instance (i.e. at GPU0's live serving).
++        with open(os.path.join(self.dir, "SERVER.json"), "w") as fh:
++            json.dump(
++                {
++                    "pid": os.getpid(),
++                    "host": os.uname().nodename,
++                    "started": self.t0,
++                    "gate": self.gate,
++                    "max_tokens": self.max_tokens,
++                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
++                },
++                fh,
++                indent=2,
++            )
+         self._thread = threading.Thread(target=self._run, daemon=True, name="mtp-dump")
+         self._thread.start()
+         atexit.register(self.close)

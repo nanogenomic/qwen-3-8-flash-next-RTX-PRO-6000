@@ -1,0 +1,1297 @@
+From 68fc0240913bee4da5a40e8152108149d7af86b5 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:56:20 +0000
+Subject: [PATCH 25/32] perf(hc): fused hyper-connection chain behind
+ SGLANG_QWENOPT_FUSE_HC=1
+
+(A) fused_hc_mix_gate: the combine-gate logits normed . W_inject^T ride along phase 1 of the
+HC mix kernel (prefetch + persistent variants; gate tiles in a separate loop on the CTAs with one
+main tile fewer), so hc_combine_gate disappears.
+(B) hc_fused_tail (CUDA JIT): R + y (x) 2*sigmoid(logit/hc), then the next sublayer's grouped
+Gemma RMSNorm (bit-identical layout/reduction to grouped_gemma_rmsnorm), and on the MLP side
+y = routed + sigmoid(h . w_sg) * shared via DeferredSharedAdd from Qwen2MoeSparseMoeBlock
+(defer_shared_add, tp_size == 1 only). Per layer 9 HC launches -> 4.
+qwen4_exp links each combine to the GatedResidual whose hc_norm follows it (next attn, or the
+final hyper_connection_mixer; none before a PLE layer). T > 16, deterministic mode and sm100
+keep the original path. Flag off: original code (additions only).
+SGLANG_QWENOPT_FUSE_HC_SHARED=0 keeps the shared add in the MoE block.
+---
+ .../kernels/ops/elementwise/hc_fused_tail.cuh | 264 +++++++++++
+ .../kernels/ops/elementwise/hc_fused_tail.py  | 125 +++++
+ python/sglang/kernels/ops/gemm/hc_mix.py      | 441 ++++++++++++++++++
+ python/sglang/srt/layers/hyperconnection.py   | 169 +++++++
+ python/sglang/srt/models/qwen2_moe.py         |  19 +
+ python/sglang/srt/models/qwen4_exp.py         |  41 ++
+ .../ops/elementwise/test_hc_fused_tail.py     |  74 +++
+ 7 files changed, 1133 insertions(+)
+ create mode 100644 python/sglang/kernels/ops/elementwise/hc_fused_tail.cuh
+ create mode 100644 python/sglang/kernels/ops/elementwise/hc_fused_tail.py
+ create mode 100644 test/registered/kernels/ops/elementwise/test_hc_fused_tail.py
+
+diff --git a/python/sglang/kernels/ops/elementwise/hc_fused_tail.cuh b/python/sglang/kernels/ops/elementwise/hc_fused_tail.cuh
+new file mode 100644
+index 0000000..eaf6845
+--- /dev/null
++++ b/python/sglang/kernels/ops/elementwise/hc_fused_tail.cuh
+@@ -0,0 +1,264 @@
++// Copyright © 2025 Ligandal, Inc.
++// SPDX-License-Identifier: Apache-2.0
++//
++// qwen-opt fuse: HyperConnection "tail" kernel.
++//
++// One CTA per (token row m, branch c), kGroupSize = kHiddenSize elements, laid out
++// and reduced exactly like grouped_gemma_rmsnorm_kernel so that the fused RMSNorm is
++// bit-identical to the unfused one given the same input:
++//
++//   [kShared]  y[m, i] = Float( sigmoid(dot(h[m], w_sg)) * s[m, i] + f[m, i] )
++//                        (the _fused_gate_sigmoid_mul_add epilogue of the MoE block)
++//              else y = block_output
++//   a[m, c]    = 2 / (1 + exp(-logit[m, c] / HC))                  (as hc_combine_apply)
++//   hyper[m, c*H + i] = Float( r[m, c*H + i] + a[m, c] * y[m, i] ) (as hc_combine_apply)
++//   [kNorm]    normed[m, c*H + i] = Float( hyper * rsqrt(mean(hyper^2) + eps) * (1 + w) )
++//                                                                  (as grouped_gemma_rmsnorm)
++//
++// It replaces hc_combine_gate (gate logits come from the mix, hc_mix.fused_hc_mix_gate),
++// hc_combine_apply, the next sublayer's grouped_gemma_rmsnorm and, on the MoE side,
++// _fused_gate_sigmoid_mul_add.
++
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/math.cuh>
++#include <sgl_kernel/tile.cuh>
++#include <sgl_kernel/type.cuh>
++#include <sgl_kernel/utils.cuh>
++#include <sgl_kernel/vec.cuh>
++#include <sgl_kernel/warp.cuh>
++
++#include <tvm/ffi/container/tensor.h>
++
++namespace sglang {
++
++struct HcFusedTailParams {
++  const void* y;          // [M, H]  block_output, or routed output f when kShared
++  const void* s;          // [M, H]  ungated shared-expert output (kShared)
++  const void* h;          // [M, H]  MoE input, shared gate operand (kShared)
++  const void* w_sg;       // [H]     shared_expert_gate weight (kShared)
++  const void* residual;   // [M, HC*H]
++  const float* logits;    // [M, HC] combine-gate logits (fp32)
++  const void* norm_w;     // [HC*H]  next sublayer hc_norm weight (kNorm)
++  void* out_hyper;        // [M, HC*H]
++  void* out_normed;       // [M, HC*H] (kNorm)
++  float eps;
++};
++
++template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float, bool kShared, bool kNorm>
++__global__ __launch_bounds__(kHiddenSize / 16) void hc_fused_tail_kernel(const HcFusedTailParams __grid_constant__ params) {
++  using namespace device;
++  using Float2 = packed_t<Float>;
++#if SGL_ARCH_BLACKWELL_OR_GREATER
++  using Storage = AlignedVector<Float2, 8>;
++  constexpr uint32_t kNumLoads = 1;
++#else
++  using Storage = AlignedVector<Float2, 4>;
++  constexpr uint32_t kNumLoads = 2;
++#endif
++  constexpr uint32_t kVecLen = kNumLoads == 1 ? 8 : 4;
++  constexpr int64_t kGroupSize = kHiddenSize;
++  constexpr auto kNumThreads = kGroupSize / 16;
++  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
++  constexpr int64_t kRowSize = kHcCount * kHiddenSize;
++
++  const uint32_t bid = blockIdx.x;  // = m * kHcCount + c, same chunk order as grouped rmsnorm
++  const uint32_t m = bid / kHcCount;
++  const uint32_t c = bid % kHcCount;
++  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
++  __shared__ float smem[kWarpThreads];
++  __shared__ float smem_sg[kWarpThreads];
++
++  const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(bid) * kGroupSize);
++  const auto y_ptr = pointer::offset<Float>(params.y, static_cast<int64_t>(m) * kHiddenSize);
++  const auto out_ptr = pointer::offset<Float>(params.out_hyper, static_cast<int64_t>(bid) * kGroupSize);
++
++  // Static operands (weights) do not depend on the upstream grid.
++  Storage norm_w_vec[kNumLoads];
++  Storage wsg_vec[kNumLoads];
++  if constexpr (kNorm) {
++    const auto nw_ptr = pointer::offset<Float>(params.norm_w, static_cast<int64_t>(c) * kGroupSize);
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) norm_w_vec[j] = gmem.load(nw_ptr, j);
++  }
++  if constexpr (kShared) {
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) wsg_vec[j] = gmem.load(params.w_sg, j);
++  }
++
++  PDLWaitPrimary<kUsePDL>();
++
++  const float total = params.logits[static_cast<int64_t>(m) * kHcCount + c];
++  const float a = 2.0f / (1.0f + math::exp(-total / kHcCount));
++
++  Storage y_vec[kNumLoads];
++  Storage r_vec[kNumLoads];
++#pragma unroll
++  for (uint32_t j = 0; j < kNumLoads; ++j) {
++    r_vec[j] = gmem.load(r_ptr, j);
++    y_vec[j] = gmem.load(y_ptr, j);
++  }
++
++  if constexpr (kShared) {
++    const auto s_ptr = pointer::offset<Float>(params.s, static_cast<int64_t>(m) * kHiddenSize);
++    const auto h_ptr = pointer::offset<Float>(params.h, static_cast<int64_t>(m) * kHiddenSize);
++    Storage s_vec[kNumLoads];
++    Storage h_vec[kNumLoads];
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) {
++      s_vec[j] = gmem.load(s_ptr, j);
++      h_vec[j] = gmem.load(h_ptr, j);
++    }
++    float dot = 0.0f;
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) {
++#pragma unroll
++      for (uint32_t i = 0; i < kVecLen; ++i) {
++        const auto [hx, hy] = cast<fp32x2_t>(h_vec[j][i]);
++        const auto [wx, wy] = cast<fp32x2_t>(wsg_vec[j][i]);
++        dot += hx * wx + hy * wy;
++      }
++    }
++    dot = warp::reduce_sum(dot);
++    const auto warp_id = threadIdx.x / kWarpThreads;
++    if constexpr (kNumWarps > 1) {
++      if (threadIdx.x % kWarpThreads == 0) smem_sg[warp_id] = dot;
++      __syncthreads();
++      if (warp_id == 0) {
++        const auto tx = threadIdx.x;
++        const auto local = tx < kNumWarps ? smem_sg[tx] : 0.0f;
++        smem_sg[tx] = warp::reduce_sum(local);
++      }
++      __syncthreads();
++      dot = smem_sg[0];
++    }
++    const float sg = 1.0f / (1.0f + math::exp(-dot));
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) {
++#pragma unroll
++      for (uint32_t i = 0; i < kVecLen; ++i) {
++        const auto [fx, fy] = cast<fp32x2_t>(y_vec[j][i]);
++        const auto [sx, sy] = cast<fp32x2_t>(s_vec[j][i]);
++        y_vec[j][i] = cast<Float2>(fp32x2_t{sg * sx + fx, sg * sy + fy});
++      }
++    }
++  }
++
++  Storage hyper_vec[kNumLoads];
++#pragma unroll
++  for (uint32_t j = 0; j < kNumLoads; ++j) {
++#pragma unroll
++    for (uint32_t i = 0; i < kVecLen; ++i) {
++      const auto [rx, ry] = cast<fp32x2_t>(r_vec[j][i]);
++      const auto [yx, yy] = cast<fp32x2_t>(y_vec[j][i]);
++      hyper_vec[j][i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
++    }
++    gmem.store(out_ptr, hyper_vec[j], j);
++  }
++
++  if constexpr (kNorm) {
++    const auto normed_ptr = pointer::offset<Float>(params.out_normed, static_cast<int64_t>(bid) * kGroupSize);
++    float sum_of_squares = 0.0f;
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) {
++#pragma unroll
++      for (uint32_t i = 0; i < kVecLen; ++i) {
++        const auto [x, y] = cast<fp32x2_t>(hyper_vec[j][i]);
++        sum_of_squares += x * x + y * y;
++      }
++    }
++
++    sum_of_squares = warp::reduce_sum(sum_of_squares);
++    float norm_factor;
++    if constexpr (kNumWarps == 1) {
++      norm_factor = math::rsqrt(sum_of_squares / kGroupSize + params.eps);
++    } else {
++      const auto warp_id = threadIdx.x / kWarpThreads;
++      smem[warp_id] = sum_of_squares;
++      __syncthreads();
++      if (warp_id == 0) {
++        const auto tx = threadIdx.x;
++        const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
++        sum_of_squares = warp::reduce_sum(local_sum);
++        smem[tx] = math::rsqrt(sum_of_squares / kGroupSize + params.eps);
++      }
++      __syncthreads();
++      norm_factor = smem[warp_id];
++    }
++
++#pragma unroll
++    for (uint32_t j = 0; j < kNumLoads; ++j) {
++      Storage output_vec;
++#pragma unroll
++      for (uint32_t i = 0; i < kVecLen; ++i) {
++        const auto [ix, iy] = cast<fp32x2_t>(hyper_vec[j][i]);
++        const auto [wx, wy] = cast<fp32x2_t>(norm_w_vec[j][i]);
++        output_vec[i] = cast<Float2>(fp32x2_t{ix * norm_factor * (1.0f + wx), iy * norm_factor * (1.0f + wy)});
++      }
++      gmem.store(normed_ptr, output_vec, j);
++    }
++  }
++
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType, bool kShared, bool kNorm>
++struct HcFusedTailKernel {
++  static_assert(sizeof(DType) == 2, "HcFusedTail only supports 2-byte dtypes");
++  static_assert(kHiddenSize % 512 == 0, "kHiddenSize must be a multiple of 512 (grouped rmsnorm layout)");
++  static constexpr auto kernel = hc_fused_tail_kernel<kHcCount, kHiddenSize, kUsePDL, DType, kShared, kNorm>;
++  static constexpr auto kBlockSize = static_cast<uint32_t>(kHiddenSize / 16);
++
++  static void
++  run(const tvm::ffi::TensorView y,
++      const tvm::ffi::TensorView s,
++      const tvm::ffi::TensorView h,
++      const tvm::ffi::TensorView w_sg,
++      const tvm::ffi::TensorView residual,
++      const tvm::ffi::TensorView logits,
++      const tvm::ffi::TensorView norm_w,
++      const tvm::ffi::TensorView out_hyper,
++      const tvm::ffi::TensorView out_normed,
++      float eps) {
++    using namespace host;
++    auto M = SymbolicSize{"num_tokens"};
++    auto device = SymbolicDevice{};
++    device.set_options<kDLCUDA>();
++
++    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(y);
++    TensorMatcher({M, kHcCount * kHiddenSize})
++        .with_dtype<DType>()
++        .with_device(device)
++        .verify(residual)
++        .verify(out_hyper);
++    TensorMatcher({M, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(logits);
++    if constexpr (kShared) {
++      TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(s).verify(h);
++      TensorMatcher({kHiddenSize}).with_dtype<DType>().with_device(device).verify(w_sg);
++    }
++    if constexpr (kNorm) {
++      TensorMatcher({M, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(out_normed);
++      TensorMatcher({kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(norm_w);
++    }
++
++    const auto params = HcFusedTailParams{
++        .y = y.data_ptr(),
++        .s = s.data_ptr(),
++        .h = h.data_ptr(),
++        .w_sg = w_sg.data_ptr(),
++        .residual = residual.data_ptr(),
++        .logits = static_cast<const float*>(logits.data_ptr()),
++        .norm_w = norm_w.data_ptr(),
++        .out_hyper = out_hyper.data_ptr(),
++        .out_normed = out_normed.data_ptr(),
++        .eps = eps,
++    };
++    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
++    if (num_tokens == 0) return;
++    LaunchKernel(num_tokens * static_cast<uint32_t>(kHcCount), kBlockSize, device.unwrap())
++        .enable_pdl(kUsePDL)(kernel, params);
++  }
++};
++
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/elementwise/hc_fused_tail.py b/python/sglang/kernels/ops/elementwise/hc_fused_tail.py
+new file mode 100644
+index 0000000..638e74c
+--- /dev/null
++++ b/python/sglang/kernels/ops/elementwise/hc_fused_tail.py
+@@ -0,0 +1,125 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""qwen-opt fuse: HyperConnection combine tail in one launch.
++
++    [shared]  y = Float(sigmoid(h . w_sg) * s + f)          (MoE shared-expert epilogue)
++    hyper     = Float(R + y (x) 2*sigmoid(logits / hc))      (hc_combine_apply)
++    [norm]    normed = grouped_gemma_rmsnorm(hyper, w_next)  (next sublayer's hc_norm)
++
++``logits`` are the combine-gate dot products emitted by
++``sglang.kernels.ops.gemm.hc_mix.fused_hc_mix_gate``. Kernel: hc_fused_tail.cuh (next to
++this file). Only reached with SGLANG_QWENOPT_FUSE_HC=1.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
++
++import torch
++
++from sglang.kernels.jit.utils import (
++    cache_once,
++    is_arch_support_pdl,
++    load_jit,
++    make_cpp_args,
++)
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++_CUH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hc_fused_tail.cuh")
++
++
++class DeferredSharedAdd(NamedTuple):
++    """MoE block output with the shared-expert gate/add left for the HC tail.
++
++    Materialised value: ``routed + sigmoid(gate_input . gate_weight) * shared``.
++    """
++
++    routed: torch.Tensor  # [M, H]
++    shared: torch.Tensor  # [M, H] ungated shared-expert output
++    gate_input: torch.Tensor  # [M, H] MoE block input
++    gate_weight: torch.Tensor  # [H]
++
++    def materialize(self) -> torch.Tensor:
++        from sglang.kernels.ops.elementwise.elementwise import (
++            fused_gate_sigmoid_mul_add,
++        )
++
++        fused_gate_sigmoid_mul_add(
++            self.gate_input, self.gate_weight, self.shared, self.routed
++        )
++        return self.routed
++
++
++@cache_once
++def _jit_hc_fused_tail_module(
++    hc_count: int, hidden_size: int, dtype: torch.dtype, shared: bool, norm: bool
++) -> Module:
++    if dtype not in (torch.bfloat16, torch.float16):
++        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
++    if hidden_size <= 0 or hidden_size % 512 != 0:
++        raise RuntimeError(f"Unsupported hidden_size {hidden_size}: multiple of 512")
++    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype, shared, norm)
++    return load_jit(
++        "qwenopt_hc_fused_tail",
++        *args,
++        cuda_files=[_CUH],
++        cuda_wrappers=[("hc_fused_tail", f"HcFusedTailKernel<{args}>::run")],
++    )
++
++
++def hc_fused_tail_supported(hc_count: int, hidden_size: int, dtype: torch.dtype) -> bool:
++    return dtype in (torch.bfloat16, torch.float16) and hidden_size % 512 == 0 and hc_count > 0
++
++
++def hc_fused_tail(
++    block_output,
++    residual: torch.Tensor,
++    logits: torch.Tensor,
++    hc_count: int,
++    hidden_size: int,
++    norm_weight: Optional[torch.Tensor] = None,
++    eps: float = 1e-6,
++) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++    """Returns ``(hyper [M, hc*H], normed [M, hc*H] or None)``.
++
++    ``block_output`` is a [M, H] tensor or a :class:`DeferredSharedAdd`.
++    """
++    shared = isinstance(block_output, DeferredSharedAdd)
++    if shared:
++        y = block_output.routed.reshape(-1, hidden_size).contiguous()
++        s = block_output.shared.reshape(-1, hidden_size).contiguous()
++        h = block_output.gate_input.reshape(-1, hidden_size).contiguous()
++        w_sg = block_output.gate_weight.reshape(hidden_size).contiguous()
++    else:
++        y = block_output.reshape(-1, hidden_size).contiguous()
++    r = residual.reshape(-1, hc_count * hidden_size)
++    if not shared:
++        s = h = y
++        w_sg = r  # unused, not verified
++    lg = logits.reshape(-1, hc_count).contiguous()
++    out_hyper = torch.empty_like(r)
++    norm = norm_weight is not None
++    if norm:
++        out_normed = torch.empty_like(r)
++        nw = norm_weight
++    else:
++        out_normed = None
++    module = _jit_hc_fused_tail_module(hc_count, hidden_size, r.dtype, shared, norm)
++    module.hc_fused_tail(
++        y,
++        s,
++        h,
++        w_sg,
++        r,
++        lg,
++        nw if norm else r,
++        out_hyper,
++        out_normed if norm else out_hyper,
++        float(eps),
++    )
++    return out_hyper.reshape(residual.shape), (
++        out_normed.reshape(residual.shape) if norm else None
++    )
+diff --git a/python/sglang/kernels/ops/gemm/hc_mix.py b/python/sglang/kernels/ops/gemm/hc_mix.py
+index abe8735..40c8efe 100644
+--- a/python/sglang/kernels/ops/gemm/hc_mix.py
++++ b/python/sglang/kernels/ops/gemm/hc_mix.py
+@@ -403,3 +403,444 @@ def fused_hc_mix(
+         num_warps=8,
+     )
+     return out
++
++
++# ---------------------------------------------------------------------------------------
++# qwen-opt fuse: HC mix + combine-gate logits in one launch.
++# Used only when SGLANG_QWENOPT_FUSE_HC=1 (see srt/layers/hyperconnection.py); the kernels
++# above are untouched. The combine gate 2*sigmoid(normed . W_inject^T / hc) depends only on
++# the mix input, so its dot products ride along phase 1 of the mix (same x tiles, 4 extra
++# weight rows) and the [rows, hc] fp32 logits are handed to the combine, which then needs
++# no gate launch. Summation order of the logits differs from hc_combine_gate (atomics over
++# K chunks), exactly like the mix's own low-rank accumulator.
++# ---------------------------------------------------------------------------------------
++_GATE_PAD = 16  # inject rows padded to the minimum tl.dot N
++
++
++@triton.jit
++def _hc_gate_tile(
++    x_ptr,
++    w_inj_ptr,
++    g_raw_ptr,
++    kc,
++    K,
++    offs_m,
++    mask_m,
++    HC: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GP: tl.constexpr,
++):
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_c = tl.arange(0, GP)
++    mask_c = offs_c < HC
++    k = kc * BLOCK_K + offs_k
++    xt = tl.load(x_ptr + offs_m[:, None] * K + k[None, :], mask=mask_m[:, None], other=0.0)
++    wi = tl.load(
++        w_inj_ptr + offs_c[:, None] * K + k[None, :],
++        mask=mask_c[:, None],
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    acc = tl.dot(xt, tl.trans(wi))
++    tl.atomic_add(
++        g_raw_ptr + offs_m[:, None] * GP + offs_c[None, :],
++        acc,
++        mask=mask_c[None, :],
++        sem="relaxed",
++        scope="gpu",
++    )
++
++
++@triton.jit
++def _hc_gate_emit(g_raw_ptr, logits_ptr, offs_m, mask_m, HC: tl.constexpr, GP: tl.constexpr):
++    offs_c = tl.arange(0, GP)
++    mask_c = offs_c < HC
++    g = tl.load(
++        g_raw_ptr + offs_m[:, None] * GP + offs_c[None, :], cache_modifier=".cg"
++    )
++    tl.store(
++        logits_ptr + offs_m[:, None] * HC + offs_c[None, :],
++        g,
++        mask=mask_m[:, None] & mask_c[None, :],
++    )
++
++
++@triton.jit
++def _hc_mix_prefetch_gate_kernel(
++    x_ptr,
++    w_down_ptr,
++    w_up_ptr,
++    w_inj_ptr,
++    t_raw_ptr,
++    g_raw_ptr,
++    out_ptr,
++    logits_ptr,
++    counters_ptr,
++    K,
++    HS,
++    num_rows,
++    num_ctas,
++    inv_hc,
++    LOWRANK: tl.constexpr,
++    RA: tl.constexpr,
++    RB: tl.constexpr,
++    ROWS: tl.constexpr,
++    HC: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_J: tl.constexpr,
++    GP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs_m = tl.arange(0, ROWS)
++    mask_m = offs_m < num_rows
++
++    j_blocks = tl.cdiv(HS, BLOCK_J)
++    offs_j = tl.arange(0, BLOCK_J)
++    offs_g = tl.arange(0, HC)
++    j = pid * BLOCK_J + offs_j
++    mask_j = j < HS
++    gj = offs_g[:, None] * HS + j[None, :]
++    gj_flat = tl.reshape(gj, (HC * BLOCK_J,))
++    mask_gj = tl.reshape(tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,))
++    offs_ra = tl.arange(0, RA)
++    offs_rb = tl.arange(0, RB)
++    w_a = tl.load(
++        w_up_ptr + gj_flat[:, None] * LOWRANK + offs_ra[None, :],
++        mask=mask_gj[:, None],
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    w_b = tl.load(
++        w_up_ptr + gj_flat[:, None] * LOWRANK + RA + offs_rb[None, :],
++        mask=mask_gj[:, None],
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    xg = tl.load(
++        x_ptr + offs_m[:, None, None] * (HC * HS) + offs_g[None, :, None] * HS + j[None, None, :],
++        mask=mask_m[:, None, None] & mask_j[None, None, :],
++        other=0.0,
++    ).to(tl.float32)
++
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_n = tl.arange(0, BLOCK_N)
++    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
++    k_chunks = tl.cdiv(K, BLOCK_K)
++    n_tiles = n_blocks * k_chunks
++    for tile in range(pid, n_tiles, num_ctas):
++        nb = tile % n_blocks
++        kc = tile // n_blocks
++        n = nb * BLOCK_N + offs_n
++        k = kc * BLOCK_K + offs_k
++        mask_n = n < LOWRANK
++        xt = tl.load(x_ptr + offs_m[:, None] * K + k[None, :], mask=mask_m[:, None], other=0.0)
++        w = tl.load(
++            w_down_ptr + n[:, None] * K + k[None, :],
++            mask=mask_n[:, None],
++            other=0.0,
++            eviction_policy="evict_first",
++        )
++        acc = tl.dot(xt, tl.trans(w))
++        tl.atomic_add(
++            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
++            acc,
++            mask=mask_n[None, :],
++            sem="relaxed",
++            scope="gpu",
++        )
++    # Gate tiles go to the CTAs that follow the main tiles round-robin, i.e. gate tile g runs on
++    # CTA (n_tiles + g) % num_ctas: the ones with one main tile fewer. A separate loop keeps the
++    # main loop's body (and its software pipelining) identical to the original kernel.
++    g_first = (pid - n_tiles % num_ctas + num_ctas) % num_ctas
++    for g in range(g_first, k_chunks, num_ctas):
++        _hc_gate_tile(x_ptr, w_inj_ptr, g_raw_ptr, g, K, offs_m, mask_m, HC, BLOCK_K, GP)
++    _grid_barrier(counters_ptr + 1, num_ctas)
++
++    # The last CTA runs the fewest phase-2 J blocks, so it has slack for the logits copy-out.
++    if pid == num_ctas - 1:
++        _hc_gate_emit(g_raw_ptr, logits_ptr, offs_m, mask_m, HC, GP)
++
++    if pid < j_blocks:
++        a = tl.load(t_raw_ptr + offs_m[:, None] * LOWRANK + offs_ra[None, :], cache_modifier=".cg") * inv_hc
++        ta = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
++        b = tl.load(t_raw_ptr + offs_m[:, None] * LOWRANK + RA + offs_rb[None, :], cache_modifier=".cg") * inv_hc
++        tb = (b * tl.sigmoid(b)).to(x_ptr.dtype.element_ty)
++        acc = tl.dot(ta, tl.trans(w_a))
++        acc = tl.dot(tb, tl.trans(w_b), acc)
++        gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
++        out = tl.sum(gate * xg, axis=1) * inv_hc
++        tl.store(out_ptr + offs_m[:, None] * HS + j[None, :], out.to(out_ptr.dtype.element_ty),
++                 mask=mask_m[:, None] & mask_j[None, :])
++        for jb in range(pid + num_ctas, j_blocks, num_ctas):
++            j2 = jb * BLOCK_J + offs_j
++            mask_j2 = j2 < HS
++            gj2 = tl.reshape(offs_g[:, None] * HS + j2[None, :], (HC * BLOCK_J,))
++            mask_gj2 = tl.reshape(tl.broadcast_to(mask_j2[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,))
++            wa2 = tl.load(w_up_ptr + gj2[:, None] * LOWRANK + offs_ra[None, :], mask=mask_gj2[:, None], other=0.0)
++            wb2 = tl.load(w_up_ptr + gj2[:, None] * LOWRANK + RA + offs_rb[None, :], mask=mask_gj2[:, None], other=0.0)
++            acc2 = tl.dot(ta, tl.trans(wa2))
++            acc2 = tl.dot(tb, tl.trans(wb2), acc2)
++            gate2 = tl.sigmoid(tl.reshape(acc2, (ROWS, HC, BLOCK_J)))
++            xg2 = tl.load(
++                x_ptr + offs_m[:, None, None] * (HC * HS) + offs_g[None, :, None] * HS + j2[None, None, :],
++                mask=mask_m[:, None, None] & mask_j2[None, None, :], other=0.0,
++            ).to(tl.float32)
++            out2 = tl.sum(gate2 * xg2, axis=1) * inv_hc
++            tl.store(out_ptr + offs_m[:, None] * HS + j2[None, :], out2.to(out_ptr.dtype.element_ty),
++                     mask=mask_m[:, None] & mask_j2[None, :])
++
++    # Same exit protocol as _hc_mix_prefetch_kernel, plus the gate accumulator.
++    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
++    if ticket == num_ctas - 1:
++        offs_z = tl.arange(0, 1024)
++        for z0 in range(0, ROWS * LOWRANK, 1024):
++            idx = z0 + offs_z
++            tl.store(t_raw_ptr + idx, 0.0, mask=idx < ROWS * LOWRANK)
++        offs_zg = tl.arange(0, ROWS * GP)
++        tl.store(g_raw_ptr + offs_zg, 0.0)
++        tl.store(counters_ptr + 1, 0)
++        tl.store(counters_ptr + 2, 0)
++
++
++@triton.jit
++def _hc_mix_persistent_gate_kernel(
++    x_ptr,
++    w_down_ptr,
++    w_up_ptr,
++    w_inj_ptr,
++    t_raw_ptr,
++    g_raw_ptr,
++    out_ptr,
++    logits_ptr,
++    counters_ptr,
++    K,
++    LOWRANK,
++    HS,
++    num_rows,
++    num_ctas,
++    inv_hc,
++    ROWS: tl.constexpr,
++    HC: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_J: tl.constexpr,
++    BLOCK_R: tl.constexpr,
++    GP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs_m = tl.arange(0, ROWS)
++    mask_m = offs_m < num_rows
++
++    zero_span = ROWS * LOWRANK
++    offs_z = tl.arange(0, 256)
++    for z0 in range(pid * 256, zero_span, num_ctas * 256):
++        idx = z0 + offs_z
++        tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
++    if pid == 0:
++        tl.store(g_raw_ptr + tl.arange(0, ROWS * GP), 0.0)
++    _grid_barrier(counters_ptr + 0, num_ctas)
++
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_n = tl.arange(0, BLOCK_N)
++    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
++    k_chunks = tl.cdiv(K, BLOCK_K)
++    n_tiles = n_blocks * k_chunks
++    for tile in range(pid, n_tiles, num_ctas):
++        nb = tile % n_blocks
++        kc = tile // n_blocks
++        n = nb * BLOCK_N + offs_n
++        k = kc * BLOCK_K + offs_k
++        mask_n = n < LOWRANK
++        xt = tl.load(
++            x_ptr + offs_m[:, None] * K + k[None, :],
++            mask=mask_m[:, None],
++            other=0.0,
++        )
++        w = tl.load(
++            w_down_ptr + n[:, None] * K + k[None, :],
++            mask=mask_n[:, None],
++            other=0.0,
++        )
++        acc = tl.dot(xt, tl.trans(w))
++        tl.atomic_add(
++            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
++            acc,
++            mask=mask_n[None, :],
++            sem="relaxed",
++            scope="gpu",
++        )
++    # Gate tiles go to the CTAs that follow the main tiles round-robin, i.e. gate tile g runs on
++    # CTA (n_tiles + g) % num_ctas: the ones with one main tile fewer. A separate loop keeps the
++    # main loop's body (and its software pipelining) identical to the original kernel.
++    g_first = (pid - n_tiles % num_ctas + num_ctas) % num_ctas
++    for g in range(g_first, k_chunks, num_ctas):
++        _hc_gate_tile(x_ptr, w_inj_ptr, g_raw_ptr, g, K, offs_m, mask_m, HC, BLOCK_K, GP)
++    _grid_barrier(counters_ptr + 1, num_ctas)
++
++    # The last CTA runs the fewest phase-2 J blocks, so it has slack for the logits copy-out.
++    if pid == num_ctas - 1:
++        _hc_gate_emit(g_raw_ptr, logits_ptr, offs_m, mask_m, HC, GP)
++
++    offs_j = tl.arange(0, BLOCK_J)
++    offs_r = tl.arange(0, BLOCK_R)
++    offs_g = tl.arange(0, HC)
++    j_blocks = tl.cdiv(HS, BLOCK_J)
++    for jb in range(pid, j_blocks, num_ctas):
++        j = jb * BLOCK_J + offs_j
++        mask_j = j < HS
++        gj = offs_g[:, None] * HS + j[None, :]
++        gj_flat = tl.reshape(gj, (HC * BLOCK_J,))
++        mask_gj = tl.reshape(
++            tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,)
++        )
++        acc = tl.zeros((ROWS, HC * BLOCK_J), dtype=tl.float32)
++        for r0 in range(0, LOWRANK, BLOCK_R):
++            r = r0 + offs_r
++            mask_r = r < LOWRANK
++            a = tl.load(
++                t_raw_ptr + offs_m[:, None] * LOWRANK + r[None, :],
++                mask=mask_r[None, :],
++                other=0.0,
++            )
++            a = a * inv_hc
++            t = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
++            w = tl.load(
++                w_up_ptr + gj_flat[:, None] * LOWRANK + r[None, :],
++                mask=mask_gj[:, None] & mask_r[None, :],
++                other=0.0,
++            )
++            acc = tl.dot(t, tl.trans(w), acc)
++        gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
++        xg = tl.load(
++            x_ptr
++            + offs_m[:, None, None] * (HC * HS)
++            + offs_g[None, :, None] * HS
++            + j[None, None, :],
++            mask=mask_m[:, None, None] & mask_j[None, None, :],
++            other=0.0,
++        ).to(tl.float32)
++        out = tl.sum(gate * xg, axis=1) * inv_hc
++        tl.store(
++            out_ptr + offs_m[:, None] * HS + j[None, :],
++            out.to(out_ptr.dtype.element_ty),
++            mask=mask_m[:, None] & mask_j[None, :],
++        )
++
++    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
++    if ticket == num_ctas - 1:
++        tl.store(counters_ptr + 0, 0)
++        tl.store(counters_ptr + 1, 0)
++        tl.store(counters_ptr + 2, 0)
++
++
++_gacc_cache = {}
++
++
++def _get_gacc(device: torch.device) -> torch.Tensor:
++    buf = _gacc_cache.get(device)
++    if buf is None:
++        buf = torch.zeros((16, _GATE_PAD), dtype=torch.float32, device=device)
++        _gacc_cache[device] = buf
++    return buf
++
++
++def fused_hc_mix_gate_supported(
++    hyper_input_normed: torch.Tensor,
++    w_down: torch.Tensor,
++    w_up: torch.Tensor,
++    w_inject: torch.Tensor,
++    hc: int,
++) -> bool:
++    return (
++        fused_hc_mix_supported(hyper_input_normed, w_down, w_up)
++        and w_inject.dtype == hyper_input_normed.dtype
++        and w_inject.is_contiguous()
++        and w_inject.dim() == 2
++        and w_inject.shape[0] == hc
++        and w_inject.shape[1] == hyper_input_normed.shape[1]
++        and hc <= _GATE_PAD
++    )
++
++
++def fused_hc_mix_gate(
++    hyper_input_normed: torch.Tensor,
++    w_down: torch.Tensor,
++    w_up: torch.Tensor,
++    w_inject: torch.Tensor,
++    hc: int,
++    hs: int,
++):
++    """``fused_hc_mix`` plus the combine-gate logits.
++
++    Returns ``(mixed [rows, hs], logits [rows, hc] fp32)`` where
++    ``logits[m, c] = dot(hyper_input_normed[m], w_inject[c])`` accumulated in fp32
++    (the combine applies ``2 * sigmoid(logit / hc)``).
++    """
++    rows, k = hyper_input_normed.shape
++    lowrank = w_down.shape[0]
++    rows_pad = 16
++    device = hyper_input_normed.device
++    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
++    out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
++    logits = torch.empty((rows, hc), dtype=torch.float32, device=device)
++    if rows == 0:
++        return out, logits
++    block_k = 256
++    split = _split_lowrank(lowrank) if _PREFETCH_ENABLED else None
++    if split is not None:
++        _hc_mix_prefetch_gate_kernel[(num_ctas,)](
++            hyper_input_normed,
++            w_down,
++            w_up,
++            w_inject,
++            _get_acc(device, lowrank),
++            _get_gacc(device),
++            out,
++            logits,
++            _get_counters(device),
++            k,
++            hs,
++            rows,
++            num_ctas,
++            1.0 / hc,
++            LOWRANK=lowrank,
++            RA=split[0],
++            RB=split[1],
++            ROWS=rows_pad,
++            HC=hc,
++            BLOCK_N=32,
++            BLOCK_K=block_k,
++            BLOCK_J=_PREFETCH_BLOCK_J,
++            GP=_GATE_PAD,
++            num_warps=8,
++        )
++        return out, logits
++    t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
++    g_raw = torch.empty((rows_pad, _GATE_PAD), dtype=torch.float32, device=device)
++    _hc_mix_persistent_gate_kernel[(num_ctas,)](
++        hyper_input_normed,
++        w_down,
++        w_up,
++        w_inject,
++        t_raw,
++        g_raw,
++        out,
++        logits,
++        _get_counters(device),
++        k,
++        lowrank,
++        hs,
++        rows,
++        num_ctas,
++        1.0 / hc,
++        ROWS=rows_pad,
++        HC=hc,
++        BLOCK_N=32,
++        BLOCK_K=block_k,
++        BLOCK_J=32,
++        BLOCK_R=64,
++        GP=_GATE_PAD,
++        num_warps=8,
++    )
++    return out, logits
+diff --git a/python/sglang/srt/layers/hyperconnection.py b/python/sglang/srt/layers/hyperconnection.py
+index cac970b..a83a712 100644
+--- a/python/sglang/srt/layers/hyperconnection.py
++++ b/python/sglang/srt/layers/hyperconnection.py
+@@ -1,3 +1,4 @@
++import os
+ from typing import Optional
+ 
+ import msgspec
+@@ -7,6 +8,11 @@ import torch.nn.functional as F
+ 
+ from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+ 
++# qwen-opt fuse: fold the combine gate into the mix kernel and the
++# combine apply + next sublayer's grouped RMSNorm (+ MoE shared-expert gate/add) into one
++# tail kernel. Off by default; with the flag unset every method below runs its original body.
++_QWENOPT_FUSE_HC = os.environ.get("SGLANG_QWENOPT_FUSE_HC", "0") == "1"
++
+ 
+ class HyperConnectionConfig(msgspec.Struct, frozen=True):
+     hc_count: int = 4
+@@ -218,8 +224,14 @@ class GatedResidual(HyperConnectionBase):
+ 
+         self._mix_compute = torch.compile(_mix_compute)
+         self._combine_compute = torch.compile(_combine_compute)
++        # qwen-opt fuse: the GatedResidual whose hc_norm follows this combine (set by the
++        # model, never registered as a submodule) and the normed input it pre-computed.
++        self._qwenopt_next = None
++        self._qwenopt_prenormed = None
+ 
+     def mix(self, hyper_input: torch.Tensor):
++        if _QWENOPT_FUSE_HC:
++            return self._qwenopt_mix(hyper_input)
+         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+         if hyper_input.shape[0] == 0:
+             mixed_input = hyper_input.new_empty(
+@@ -278,6 +290,12 @@ class GatedResidual(HyperConnectionBase):
+         return mixed_input, (hyper_input, hyper_input_normed)
+ 
+     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
++        if _QWENOPT_FUSE_HC:
++            block_output, residuals, fused = self._qwenopt_combine(
++                block_output, residuals
++            )
++            if fused is not None:
++                return fused
+         hyper_input, hyper_input_normed = residuals
+         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+         assert block_output.shape[-1] == self.hidden_size
+@@ -327,6 +345,157 @@ class GatedResidual(HyperConnectionBase):
+         return updated_residuals
+ 
+ 
++    # ---------------- qwen-opt fuse (SGLANG_QWENOPT_FUSE_HC=1) ----------------
++    def _qwenopt_mix(self, hyper_input: torch.Tensor):
++        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
++        stash = self._qwenopt_prenormed
++        self._qwenopt_prenormed = None
++        if hyper_input.shape[0] == 0:
++            mixed_input = hyper_input.new_empty(
++                (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
++            )
++            return mixed_input, (hyper_input, hyper_input)
++
++        if stash is not None and stash[0] is hyper_input:
++            # Normed by the previous sublayer's fused tail (bit-identical to hc_norm).
++            hyper_input_normed = stash[1]
++        elif self.config.hc_per_branch_norm:
++            hyper_input_normed = self.hc_norm(hyper_input)
++        else:
++            hyper_input_normed = self.hc_norm(
++                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
++            ).flatten(-2)
++
++        inject = getattr(self, "block_inject_weight", None)
++        use_sm100_mix = (
++            self._jit_mix_ok
++            and hyper_input_normed.is_cuda
++            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
++            and hyper_input_normed.shape[0] <= 24
++        )
++        if inject is not None and not use_sm100_mix:
++            from sglang.kernels.ops.gemm.hc_mix import (
++                fused_hc_mix_gate,
++                fused_hc_mix_gate_supported,
++            )
++
++            if fused_hc_mix_gate_supported(
++                hyper_input_normed,
++                self.input_mix_weight_down.weight,
++                self.input_mix_weight_up.weight,
++                inject.weight,
++                self.hc_count,
++            ):
++                mixed_input, gate_logits = fused_hc_mix_gate(
++                    hyper_input_normed,
++                    self.input_mix_weight_down.weight,
++                    self.input_mix_weight_up.weight,
++                    inject.weight,
++                    self.hc_count,
++                    self.hidden_size,
++                )
++                return mixed_input.to(self.params_dtype), (
++                    hyper_input,
++                    hyper_input_normed,
++                    gate_logits,
++                )
++
++        # Same dispatch as mix(), on the (possibly pre-computed) normed input.
++        if use_sm100_mix:
++            from sglang.kernels.ops.elementwise.hc_mix import (
++                hc_mix,
++                permute_pad_up_weight,
++            )
++
++            if self._mix_up_weight_padded is None:
++                self._mix_up_weight_padded = permute_pad_up_weight(
++                    self.input_mix_weight_up.weight, self.hc_count
++                )
++            mixed_input = hc_mix(
++                hyper_input_normed,
++                self.input_mix_weight_down.weight.data,
++                self._mix_up_weight_padded,
++                self.hc_count,
++                self.hidden_size,
++            ).to(self.params_dtype)
++        elif fused_hc_mix_supported(
++            hyper_input_normed,
++            self.input_mix_weight_down.weight,
++            self.input_mix_weight_up.weight,
++        ):
++            mixed_input = fused_hc_mix(
++                hyper_input_normed,
++                self.input_mix_weight_down.weight,
++                self.input_mix_weight_up.weight,
++                self.hc_count,
++                self.hidden_size,
++            ).to(self.params_dtype)
++        else:
++            mixed_input = self._mix_compute(
++                hyper_input_normed,
++                self.input_mix_weight_down.weight,
++                self.input_mix_weight_up.weight,
++                self.hc_count,
++                self.hidden_size,
++            ).to(self.params_dtype)
++        return mixed_input, (hyper_input, hyper_input_normed)
++
++    def _qwenopt_combine(self, block_output, residuals):
++        """Returns ``(block_output, residuals, fused_or_None)``; on None the caller runs
++        the original combine on the returned (materialised, 2-tuple) operands."""
++        from sglang.kernels.ops.elementwise.hc_fused_tail import (
++            DeferredSharedAdd,
++            hc_fused_tail,
++            hc_fused_tail_supported,
++        )
++
++        deferred = isinstance(block_output, DeferredSharedAdd)
++        if len(residuals) == 3:
++            hyper_input, hyper_input_normed, gate_logits = residuals
++            y_dtype = (block_output.routed if deferred else block_output).dtype
++            y_cuda = (block_output.routed if deferred else block_output).is_cuda
++            if (
++                hyper_input.shape[0] > 0
++                and y_cuda
++                and hyper_input.dtype == y_dtype
++                and hc_fused_tail_supported(
++                    self.hc_count, self.hidden_size, hyper_input.dtype
++                )
++                and hyper_input.is_contiguous()
++            ):
++                nxt = self._qwenopt_next
++                norm_w, eps = None, 0.0
++                if (
++                    nxt is not None
++                    and nxt.hc_count == self.hc_count
++                    and nxt.config.hc_per_branch_norm
++                    and nxt.hc_norm._jit_group_size == self.hidden_size
++                    and nxt.hc_norm.weight.dtype == hyper_input.dtype
++                ):
++                    norm_w = nxt.hc_norm.weight
++                    eps = nxt.hc_norm.variance_epsilon
++                hyper, normed = hc_fused_tail(
++                    block_output,
++                    hyper_input,
++                    gate_logits,
++                    self.hc_count,
++                    self.hidden_size,
++                    norm_weight=norm_w,
++                    eps=eps,
++                )
++                if normed is not None:
++                    nxt._qwenopt_prenormed = (hyper, normed)
++                return block_output, residuals, hyper
++            residuals = (hyper_input, hyper_input_normed)
++        if deferred:
++            block_output = block_output.materialize()
++        return block_output, residuals, None
++
++    def qwenopt_set_next(self, nxt: Optional["GatedResidual"]) -> None:
++        # object.__setattr__: keep the neighbour out of this module's submodule tree.
++        object.__setattr__(self, "_qwenopt_next", nxt)
++
++
+ HYPERCONNECTION_CLASS_DICT = {
+     "hyperconnection_average": HyperConnectionBase,
+     "gated_residual_simple": GatedResidual,
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 0ef780b..2aa1df7 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -812,6 +812,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+         defer_finalize: bool = False,
++        defer_shared_add: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -875,6 +876,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+                 reduce=reduce_moe_output,
+             )
+ 
++        if (
++            defer_shared_add
++            and shared_output is not None
++            and use_fused_gate
++            and get_parallel().tp_size == 1
++        ):
++            # qwen-opt fuse (qwen-opt, SGLANG_QWENOPT_FUSE_HC=1 only): hand the
++            # shared-expert gate/add to the hyper-connection tail kernel, which computes
++            # routed + sigmoid(h . w_sg) * shared in-register. tp_size == 1, so
++            # reduce_moe_output below would be the identity.
++            from sglang.kernels.ops.elementwise.hc_fused_tail import DeferredSharedAdd
++
++            return DeferredSharedAdd(
++                routed=final_hidden_states.view(num_tokens, hidden_dim),
++                shared=shared_output,
++                gate_input=hidden_states,
++                gate_weight=self.shared_expert_gate.weight.squeeze(),
++            )
+         if shared_output is not None:
+             if use_fused_gate:
+                 fused_gate_sigmoid_mul_add(
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index a9be1d6..494b832 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -1,5 +1,6 @@
+ """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
+ 
++import os
+ import math
+ from contextlib import nullcontext
+ from typing import Any, Iterable, Optional, Set, Tuple, Union
+@@ -33,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
+     is_allocation_symmetric,
+     is_dp_attention_enabled,
+ )
++from sglang.srt.layers import hyperconnection as _hyperconnection
+ from sglang.srt.layers.hyperconnection import (
+     GatedResidual,
+     HyperConnectionConfig,
+@@ -59,6 +61,7 @@ from sglang.srt.model_executor.forward_context import (
+ )
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+ from sglang.srt.models.qwen3_5 import (
+     Qwen3_5AttentionDecoderLayer,
+     Qwen3_5ForCausalLM,
+@@ -79,6 +82,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+ # Decode/verify-sized batches only: at prefill sizes both chains are compute
+ # bound and serializing them on one stream is faster than contending.
+ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
++# qwen-opt fuse: with SGLANG_QWENOPT_FUSE_HC=1, also fold the MoE
++# shared-expert gate/add into the HC tail kernel (set =0 to keep it in the MoE block).
++_QWENOPT_FUSE_HC_SHARED = os.environ.get("SGLANG_QWENOPT_FUSE_HC_SHARED", "1") != "0"
+ 
+ 
+ def _ple_table_is_fp8(
+@@ -1468,6 +1474,12 @@ class Qwen4ExpLayerExtensionMixin:
+             hidden_states = attn_tp_all_reduce(hidden_states)
+         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
++        if _hyperconnection._QWENOPT_FUSE_HC:
++            # The mix emitted the combine-gate logits, so the MLP combine runs the fused
++            # tail and can absorb the shared-expert gate/add.
++            self._qwenopt_defer_shared_add = (
++                isinstance(residual, tuple) and len(residual) == 3
++            )
+         return hidden_states, residual
+ 
+     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
+@@ -1504,6 +1516,16 @@ class Qwen4ExpLayerExtensionMixin:
+             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
+             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
+ 
++        if (
++            _hyperconnection._QWENOPT_FUSE_HC
++            and getattr(self, "_qwenopt_defer_shared_add", False)
++            and not use_dp_moe_gather
++            and not use_attn_tp_a2a_scatter
++            and _QWENOPT_FUSE_HC_SHARED
++            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
++        ):
++            # May return a DeferredSharedAdd; mlp_hyper_connection.combine consumes it.
++            return self.mlp(hidden_states, forward_batch, defer_shared_add=True)
+         hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+         if use_dp_moe_gather:
+@@ -1777,6 +1799,25 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
+             if self.pp_group.is_last_rank
+             else PPMissingLayer()
+         )
++        if _hyperconnection._QWENOPT_FUSE_HC:
++            self._qwenopt_link_hc_tails()
++
++    def _qwenopt_link_hc_tails(self) -> None:
++        """qwen-opt fuse: tell every combine whose hc_norm follows it,
++        so the fused tail kernel can emit that sublayer's normed input. A layer with PLE adds
++        to the hyper state before its mix, so the combine feeding it gets no successor (its
++        tail then skips the norm and the PLE layer normalises as before)."""
++        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
++        for idx, layer in enumerate(layers):
++            layer.attn_hyper_connection.qwenopt_set_next(layer.mlp_hyper_connection)
++            if idx + 1 < len(layers):
++                nxt = layers[idx + 1]
++                target = nxt.attn_hyper_connection if nxt.ple is None else None
++            elif isinstance(self.hyper_connection_mixer, GatedResidual):
++                target = self.hyper_connection_mixer
++            else:
++                target = None
++            layer.mlp_hyper_connection.qwenopt_set_next(target)
+ 
+     def forward(
+         self,
+diff --git a/test/registered/kernels/ops/elementwise/test_hc_fused_tail.py b/test/registered/kernels/ops/elementwise/test_hc_fused_tail.py
+new file mode 100644
+index 0000000..a190e04
+--- /dev/null
++++ b/test/registered/kernels/ops/elementwise/test_hc_fused_tail.py
+@@ -0,0 +1,74 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""qwen-opt fuse: hc_fused_tail + fused_hc_mix_gate vs the unfused kernels.
++
++Correctness test on arbitrary tensors. Real-weight / real-activation checks and
++end-to-end timing run separately against a loaded engine, and are not part of
++this file.
++"""
++import pytest
++import torch
++
++from sglang.kernels.ops.elementwise import hc_combine as hcc
++from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
++from sglang.kernels.ops.elementwise.hc_fused_tail import DeferredSharedAdd, hc_fused_tail
++from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_gate
++from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
++
++HC, HS, LR, EPS = 4, 2560, 320, 1e-6
++
++
++def _inputs(T, seed=0):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    rn = lambda *s, sc=1.0: (torch.randn(*s, generator=g, device="cuda") * sc).to(torch.bfloat16)
++    return dict(
++        hyper=rn(T, HC * HS, sc=0.7), y=rn(T, HS, sc=0.7), routed=rn(T, HS, sc=0.7), shared=rn(T, HS, sc=0.7),
++        norm_w=rn(HC * HS, sc=0.1), next_w=rn(HC * HS, sc=0.1), inj=rn(HC, HC * HS, sc=0.01),
++        wd=rn(LR, HC * HS, sc=0.02), wu=rn(HC * HS, LR, sc=0.02), sg=rn(HS, sc=0.02),
++    )
++
++
++def _split_logits(T, device):
++    p = hcc._get_partials(HC, device, T)[:T]
++    tot = p[:, 0, :].clone()
++    for s in range(1, p.shape[1]):
++        tot = tot + p[:, s, :]
++    return tot.contiguous()
++
++
++@pytest.mark.parametrize("T", [1, 2, 4, 8, 16])
++def test_tail_bitwise_vs_apply_and_norm(T):
++    d = _inputs(T, T)
++    normed = grouped_gemma_rmsnorm(d["hyper"], d["norm_w"], HS, EPS)
++    ref = hcc.hc_combine_split(d["y"], d["hyper"], normed, d["inj"], HC, HS)
++    lg = _split_logits(T, d["hyper"].device)
++    new, nn_ = hc_fused_tail(d["y"], d["hyper"], lg, HC, HS, norm_weight=d["next_w"], eps=EPS)
++    assert torch.equal(new, ref)
++    assert torch.equal(nn_, grouped_gemma_rmsnorm(ref, d["next_w"], HS, EPS))
++    new2, none = hc_fused_tail(d["y"], d["hyper"], lg, HC, HS)
++    assert none is None and torch.equal(new2, ref)
++
++
++@pytest.mark.parametrize("T", [1, 4, 16])
++def test_tail_shared_within_one_ulp(T):
++    d = _inputs(T, 100 + T)
++    normed = grouped_gemma_rmsnorm(d["hyper"], d["norm_w"], HS, EPS)
++    h = d["y"]
++    yb = d["routed"].clone()
++    fused_gate_sigmoid_mul_add(h, d["sg"], d["shared"], yb)
++    ref = hcc.hc_combine_split(yb, d["hyper"], normed, d["inj"], HC, HS)
++    lg = _split_logits(T, d["hyper"].device)
++    new, _ = hc_fused_tail(DeferredSharedAdd(d["routed"].clone(), d["shared"], h, d["sg"]), d["hyper"], lg, HC, HS)
++    # shared-gate dot is summed in a different order: allow 1 bf16 ulp of the magnitude
++    torch.testing.assert_close(new.float(), ref.float(), rtol=2**-7, atol=2**-7 * float(ref.float().abs().max()))
++
++
++@pytest.mark.parametrize("T", [1, 4, 16])
++def test_mix_gate(T):
++    d = _inputs(T, 200 + T)
++    x = grouped_gemma_rmsnorm(d["hyper"], d["norm_w"], HS, EPS)
++    m_ref = fused_hc_mix(x, d["wd"], d["wu"], HC, HS)
++    m, lg = fused_hc_mix_gate(x, d["wd"], d["wu"], d["inj"], HC, HS)
++    torch.testing.assert_close(m.float(), m_ref.float(), rtol=1e-2, atol=5e-3)
++    ref64 = x.double() @ d["inj"].double().t()
++    assert (lg.double() - ref64).abs().max() < 1e-4 * max(1.0, float(ref64.abs().max()))

@@ -1,0 +1,210 @@
+From 00ba7049bcd1067a47afe1919745f174c93dec21 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:50:14 +0000
+Subject: [PATCH 10/32] fix(qsa): one max-width MTP selection buffer serves
+ every adaptive state
+
+index_share_for_mtp_iteration was switched off entirely under adaptive speculation,
+on the grounds that a state swap between the draft-extend capture and the decode
+lookup would leave per-state index buffers mismatched. The premise is right; the
+conclusion is stronger than it needs to be. Two changes make the feature adaptive-safe:
+
+1. ONE shared QSAMTPSharedSparseIndices, cached on the draft worker and reused by
+   every state's backends, so capture and lookup address the same buffer across a
+   swap. init_attention_backend runs once per state, which is why the buffer has
+   to be cached rather than rebuilt.
+2. Its tail is sized from the DEEPEST reachable tier
+   (max_speculative_num_draft_tokens under adaptive) rather than the launch width.
+   A tail wider than the active window costs nothing and is already handled:
+   lookup writes -1 into every tail slot past the current position and downstream
+   drops those. A fixed buffer width is also what keeps the per-state CUDA graphs
+   capturing one selection shape.
+
+Shallow tiers (at most 1 draft decode step) still do not REUSE the selection -- there
+is nothing to amortise -- but they now CAPTURE on draft-extend. Without that, a swap
+from a shallow tier back to a deep one read a buffer holding an older position's
+top-k and captured_len: a silent acceptance loss, not an error.
+
+The d76fed293a guard is kept and now compares against the deepest reachable width,
+so a config that widens the window without widening the chain still raises at startup.
+
+Off by default: the flag lives on the checkpoint's text_config (absent from the
+flash-next checkpoint) or --json-model-override-args, so this changes nothing unless
+index sharing is deliberately turned on.
+---
+ .../sglang/srt/speculative/eagle_worker_v2.py | 124 +++++++++++++-----
+ 1 file changed, 90 insertions(+), 34 deletions(-)
+
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index f761b7f..3f69a0f 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import (
+     get_parallel,
+     get_schedule,
+     get_spec,
++    max_speculative_num_draft_tokens,
+ )
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.adaptive_runtime_state import (
+@@ -182,6 +183,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+             get_spec().speculative_algorithm
+         )
++        # One shared QSA MTP selection buffer for every adaptive runtime state:
++        # init_attention_backend() runs once per state, and capture (draft-extend)
++        # and lookup (draft decode) must address the SAME buffer across a swap.
++        self._qsa_mtp_shared_indices: Optional[QSAMTPSharedSparseIndices] = None
+ 
+         self._rebuild_topk1_chain_buffers()
+ 
+@@ -404,27 +409,59 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         self._configure_qsa_mtp_index_share()
+         self.tree_mask_mode = default_tree_mask_mode()
+ 
++    def qsa_mtp_index_share_tail_width(self) -> int:
++        """Tail columns the shared selection must carry.
++
++        The tail is the only cover for positions drafted since the capture, so it
++        has to reach the whole verify window. Chain speculation gives
++        ``W == num_steps + 1``; a config that widens the window without widening
++        the chain would silently drop the newest positions from every MTP decode
++        step's selection, which reads as a quiet acceptance loss.
++
++        Under adaptive speculation the active window changes after this runs, so
++        the width is the DEEPEST reachable tier's. A tail wider than the active
++        window is harmless -- ``QSAMTPSharedSparseIndices.lookup`` marks every
++        tail slot past the current position -1 and downstream drops those -- so
++        one max-width buffer serves every state, and keeping a single buffer
++        (rather than one per state) is what makes capture and lookup agree
++        across a state swap.
++        """
++        widths = [
++            get_spec().speculative_num_steps + 1,
++            self.speculative_num_draft_tokens or 0,
++            max_speculative_num_draft_tokens() or 0,
++        ]
++        return max(widths)
++
+     def _configure_qsa_mtp_index_share(self) -> None:
+         """Reuse the draft-extend QSA selection across the MTP decode steps;
+         chain speculation only: with topk > 1 decode rows are not request-major."""
+         from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+ 
+         hf_config = self.draft_runner.model_config.hf_config
+-        if (
+-            not _qsa_index_share_requested(hf_config)
+-            or self.topk != 1
+-            or self.speculative_num_steps <= 1
+-            or not isinstance(self.draft_attn_backend, QwenSparseMultiStepDraftBackend)
+-            or not isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
+-        ):
++        if not _qsa_index_share_requested(hf_config) or self.topk != 1:
++            return
++        # Adaptive tiers shallower than 2 steps have nothing to reuse, but their
++        # draft-extend must still CAPTURE: a later swap back to a deep tier reads
++        # the shared buffer, and a cycle that skipped the capture would leave it
++        # holding an older position's selection (stale top-k, stale captured_len)
++        # -- silent acceptance loss, not an error.
++        reuse_on_decode = self.speculative_num_steps > 1 and isinstance(
++            self.draft_attn_backend, QwenSparseMultiStepDraftBackend
++        )
++        can_capture = isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
++        if not can_capture:
+             return
+-        if get_spec().speculative_adaptive:
+-            # Adaptive speculation switches SpecRuntimeState between the draft-extend
+-            # capture and the decode lookup; per-state index buffers would not match.
+-            logger.warning(
+-                "index_share_for_mtp_iteration is disabled under adaptive "
+-                "speculative decoding"
++        deepest_steps = max(
++            [get_spec().speculative_num_steps, self.speculative_num_steps]
++            + (
++                [s for s in self._adaptive_candidate_steps()]
++                if get_spec().speculative_adaptive
++                else []
+             )
++        )
++        if deepest_steps <= 1:
++            # No reachable tier ever runs more than one draft decode step.
+             return
+         layer_ids = sorted(
+             {
+@@ -435,17 +472,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         )
+         if not layer_ids:
+             return
+-        pool = self.draft_runner.token_to_kv_pool
+-        # The expansion emits token_topk + ratio - 1 columns (top-k blocks
+-        # plus the uncompressed tail of the capture position).
+-        expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
+-        # The tail is the only cover for positions drafted since the capture, so
+-        # it has to reach the whole verify window. Chain speculation gives
+-        # W == num_steps + 1; a config that widens the window without widening
+-        # the chain would silently drop the newest positions from every MTP
+-        # decode step's selection, which reads as a quiet acceptance loss.
+-        tail_width = get_spec().speculative_num_steps + 1
+-        if tail_width < self.speculative_num_draft_tokens:
++        tail_width = self.qsa_mtp_index_share_tail_width()
++        if tail_width < (self.speculative_num_draft_tokens or 0):
+             raise ValueError(
+                 "QSA MTP index sharing needs speculative_num_steps + 1 >= "
+                 "speculative_num_draft_tokens so the shared selection covers the "
+@@ -453,18 +481,46 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                 f"num_draft_tokens={self.speculative_num_draft_tokens}. Raise "
+                 "--speculative-num-steps with --speculative-num-draft-tokens."
+             )
+-        state = QSAMTPSharedSparseIndices(
+-            layer_ids=layer_ids,
+-            num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
+-            token_topk=expanded_width,
+-            tail_width=tail_width,
+-            device=self.draft_runner.device,
+-        )
+-        for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
+-            backend.set_mtp_shared_sparse_indices(state)
++        shared = self._qsa_mtp_shared_indices
++        if shared is None:
++            pool = self.draft_runner.token_to_kv_pool
++            # The expansion emits token_topk + ratio - 1 columns (top-k blocks
++            # plus the uncompressed tail of the capture position).
++            expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
++            shared = QSAMTPSharedSparseIndices(
++                layer_ids=layer_ids,
++                num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
++                token_topk=expanded_width,
++                tail_width=tail_width,
++                device=self.draft_runner.device,
++            )
++            self._qsa_mtp_shared_indices = shared
++        elif shared.tail_width < tail_width:
++            # Every state asks for the same deepest-tier width, so this cannot
++            # happen; fail loudly rather than reuse a too-narrow tail.
++            raise ValueError(
++                f"QSA MTP shared selection tail {shared.tail_width} is narrower "
++                f"than the requested {tail_width}"
++            )
++        self.draft_extend_attn_backend.set_mtp_shared_sparse_indices(shared)
++        if reuse_on_decode:
++            self.draft_attn_backend.set_mtp_shared_sparse_indices(shared)
+         logger.info(
+             "QSA MTP index sharing enabled: draft decode steps reuse the "
+-            f"draft-extend selection for layers {layer_ids}"
++            f"draft-extend selection for layers {layer_ids} "
++            f"(tail_width={shared.tail_width}, reuse_on_decode={reuse_on_decode})"
++        )
++
++    def _adaptive_candidate_steps(self) -> list[int]:
++        """Candidate step counts the adaptive policy may activate (empty if off)."""
++        if not get_spec().speculative_adaptive:
++            return []
++        from sglang.srt.speculative.adaptive_spec_params import (
++            resolve_candidate_steps_from_config,
++        )
++
++        return resolve_candidate_steps_from_config(
++            get_spec().speculative_adaptive_config
+         )
+ 
+     def _capture_cuda_graphs(self):

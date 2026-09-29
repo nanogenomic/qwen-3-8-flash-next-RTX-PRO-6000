@@ -1,0 +1,547 @@
+From 6fa59512c5da12fccdcca67c2a1d81d926c50b3b Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:24:16 +0000
+Subject: [PATCH 15/32] feat(moe): dynamic expert count (fixed-k / cumprob /
+ learned) fused into the Triton router, off by default
+
+Dropped slots become id -1 with weight 0; kept slots keep their top-K weight
+(k2=K normalisation). flashinfer cutlass_fused_moe skips -1 slots (GATE 1,
+bitwise vs narrow reference, time tracks the expert union). Selected via
+SGLANG_QWENOPT_DYNK / SGLANG_QWENOPT_DYNK_FILE; separate target/draft arms;
+per-slot tau is a device tensor (graph-safe live knob). EPLB and packed topk
+are refused; duplicate expert ids asserted absent (SGLANG_QWENOPT_DYNK_CHECK).
+---
+ .../sglang/kernels/ops/moe/moe_fused_gate.py  | 131 ++++++++++-
+ python/sglang/srt/layers/moe/dynk.py          | 216 ++++++++++++++++++
+ python/sglang/srt/layers/moe/topk.py          |  38 +++
+ python/sglang/srt/models/qwen2_moe.py         |   7 +
+ 4 files changed, 391 insertions(+), 1 deletion(-)
+ create mode 100644 python/sglang/srt/layers/moe/dynk.py
+
+diff --git a/python/sglang/kernels/ops/moe/moe_fused_gate.py b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+index 2a7e17f..a97689d 100644
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -138,6 +138,18 @@ def _router_triton_kernel(
+     stride_ik,
+     stride_pm,
+     stride_pk,
++    # --- qwenopt dynamic-k; DYNK_MODE == 0 compiles all of it out ---
++    dynk_tau_ptr,  # [64] fp32 per-slot tau (cumprob) / log10 error budget (learned)
++    dynk_mlp_ptr,  # [64, P] fp32 packed learned-gate params (DYNK_MODE == 3)
++    dynk_slot,
++    dynk_k,
++    dynk_kmin,
++    dynk_kmax,
++    DYNK_MODE: tl.constexpr,  # 0 off, 1 fixed-k, 2 cumulative-prob, 3 learned gate
++    DYNK_TOPN: tl.constexpr,  # router probs fed to the learned gate (16)
++    DYNK_F: tl.constexpr,  # learned-gate input features (20, padded to 32 in-kernel)
++    DYNK_H: tl.constexpr,  # hidden width (32)
++    DYNK_OUT: tl.constexpr,  # outputs: predicted log10 rel. error for k = 3 .. 3+OUT-1
+ ) -> None:
+     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
+     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
+@@ -261,6 +273,9 @@ def _router_triton_kernel(
+ 
+     cur = biased  # [BLOCK_M, BLOCK_N]
+     remaining = tl.broadcast_to(mask_n[None, :], (BLOCK_M, BLOCK_N))
++    if DYNK_MODE == 3:
++        offs_f = tl.arange(0, 32)
++        feat = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+     for k in tl.static_range(K_ROUTED):
+         max_val = tl.max(cur, axis=1)[:, None]  # [BLOCK_M, 1]
+         is_max = remaining & (cur == max_val)
+@@ -274,6 +289,21 @@ def _router_triton_kernel(
+         selected_idx = tl.where(slot, win_lane, selected_idx)
+         remaining = remaining & (offs_n[None, :] != win_lane)
+         cur = tl.where(remaining, cur, -float("inf"))
++        if DYNK_MODE == 3:
++            feat = tl.where(offs_f[None, :] == k, win_activated, feat)
++
++    if DYNK_MODE == 3:
++        # Continue ranking to the top-DYNK_TOPN probabilities (features only; the
++        # selection itself is unchanged).
++        for k2 in tl.static_range(K_ROUTED, DYNK_TOPN):
++            max_val2 = tl.max(cur, axis=1)[:, None]
++            is_max2 = remaining & (cur == max_val2)
++            lane2 = tl.where(is_max2, offs_n[None, :], N + 1)
++            win2 = tl.min(lane2, axis=1)[:, None].to(tl.int32)
++            act2 = tl.sum(tl.where(offs_n[None, :] == win2, activated, 0.0), axis=1)[:, None]
++            feat = tl.where(offs_f[None, :] == k2, act2, feat)
++            remaining = remaining & (offs_n[None, :] != win2)
++            cur = tl.where(remaining, cur, -float("inf"))
+ 
+     routed_sum = tl.sum(tl.where(mask_k_routed[None, :], selected_vals, 0.0), axis=1)[
+         :, None
+@@ -299,6 +329,67 @@ def _router_triton_kernel(
+         selected_vals = selected_vals / norm
+     if APPLY_SCALE:
+         selected_vals = selected_vals * routed_scaling_factor
++    if DYNK_MODE != 0:
++        # Drop tail slots: id -1, weight 0; kept slots keep their top-K weight
++        # (no renormalisation). Slots are in descending weight order here.
++        if DYNK_MODE == 1:
++            keep = offs_k[None, :] < dynk_k
++        elif DYNK_MODE == 2:
++            tau = tl.load(dynk_tau_ptr + dynk_slot)
++            rv = tl.where(mask_k_routed[None, :], selected_vals, 0.0)
++            tot = tl.sum(rv, axis=1)[:, None]
++            cum_excl = tl.cumsum(rv, axis=1) - rv
++            keep = (cum_excl < tau * tot) | (offs_k[None, :] < dynk_kmin)
++            keep = keep & (offs_k[None, :] < dynk_kmax)
++        else:
++            # Learned per-slot gate: features -> MLP -> predicted log10 rel. error
++            # for each k; choose the smallest k in [kmin, kmax] under the budget.
++            p1 = tl.sum(tl.where(offs_f[None, :] == 0, feat, 0.0), axis=1)[:, None]
++            p2 = tl.sum(tl.where(offs_f[None, :] == 1, feat, 0.0), axis=1)[:, None]
++            top_mass = tl.sum(tl.where(offs_f[None, :] < K_ROUTED, feat, 0.0), axis=1)[:, None]
++            top_n = tl.where(offs_f[None, :] < DYNK_TOPN, feat, 0.0)
++            qn = top_n / tl.maximum(tl.sum(top_n, axis=1)[:, None], 1e-20)
++            ent = -tl.sum(tl.where(qn > 0.0, qn * tl.log(tl.maximum(qn, 1e-20)), 0.0), axis=1)[:, None]
++            feat = tl.where(offs_f[None, :] == DYNK_TOPN, top_mass, feat)
++            feat = tl.where(offs_f[None, :] == DYNK_TOPN + 1, ent, feat)
++            feat = tl.where(offs_f[None, :] == DYNK_TOPN + 2, tl.log(tl.maximum(p1, 1e-20)), feat)
++            feat = tl.where(
++                offs_f[None, :] == DYNK_TOPN + 3,
++                tl.log(tl.maximum(p1, 1e-20)) - tl.log(tl.maximum(p2, 1e-20)),
++                feat,
++            )
++            feat = tl.where(offs_f[None, :] < DYNK_F, feat, 0.0)
++            base = dynk_mlp_ptr + dynk_slot * (DYNK_H * DYNK_F + DYNK_H + DYNK_OUT * DYNK_H + DYNK_OUT)
++            offs_h = tl.arange(0, DYNK_H)
++            w1 = tl.load(
++                base + offs_h[:, None] * DYNK_F + offs_f[None, :],
++                mask=offs_f[None, :] < DYNK_F,
++                other=0.0,
++            )  # [H, 32]
++            b1 = tl.load(base + DYNK_H * DYNK_F + offs_h)  # [H]
++            hid = tl.sum(feat[:, None, :] * w1[None, :, :], axis=2) + b1[None, :]
++            hid = tl.maximum(hid, 0.0)  # [BLOCK_M, H]
++            offs_o = tl.arange(0, 8)
++            w2 = tl.load(
++                base + DYNK_H * DYNK_F + DYNK_H + offs_o[:, None] * DYNK_H + offs_h[None, :],
++                mask=offs_o[:, None] < DYNK_OUT,
++                other=0.0,
++            )  # [8, H]
++            b2 = tl.load(
++                base + DYNK_H * DYNK_F + DYNK_H + DYNK_OUT * DYNK_H + offs_o,
++                mask=offs_o < DYNK_OUT,
++                other=0.0,
++            )
++            pred = tl.sum(hid[:, None, :] * w2[None, :, :], axis=2) + b2[None, :]  # [BLOCK_M, 8]
++            budget = tl.load(dynk_tau_ptr + dynk_slot)
++            kval = offs_o[None, :] + 3  # k represented by output o
++            ok = (pred <= budget) & (kval >= dynk_kmin) & (kval <= dynk_kmax) & (offs_o[None, :] < DYNK_OUT)
++            k_sel = tl.min(tl.where(ok, kval, dynk_kmax), axis=1)[:, None]  # [BLOCK_M, 1]
++            keep = offs_k[None, :] < k_sel
++        keep = keep | (offs_k[None, :] >= K_ROUTED)  # never drop fused shared slots
++        selected_vals = tl.where(keep, selected_vals, 0.0)
++        selected_idx = tl.where(keep, selected_idx, -1)
++
+     if HAS_PADDING:
+         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
+         selected_idx = tl.where(live_m[:, None], selected_idx, -1)
+@@ -354,6 +445,7 @@ def moe_fused_gate(
+     renormalize_epsilon: float = 0.0,
+     packed_out: Optional[torch.Tensor] = None,
+     sqrtsoftplus_log1p: bool = False,
++    dynk=None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
+ 
+@@ -436,7 +528,7 @@ def moe_fused_gate(
+             routed_scaling_factor,
+             apply_routed_scaling_factor_on_output,
+         )
+-        if moe_route_radix.covered(scores, bias, topk):
++        if dynk is None and moe_route_radix.covered(scores, bias, topk):
+             return moe_route_radix.route_radix(*radix_args, sorted=False)
+ 
+     M, N = scores.shape
+@@ -476,6 +568,42 @@ def moe_fused_gate(
+     # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
+     # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
+     _unused_i32 = _dummy_i32(scores.device)
++    if dynk is not None:
++        # qwenopt dynamic-k: dropped slots become id -1 (never duplicates); the
++        # packed FlashInfer form would encode -1 << 16, so refuse that combination.
++        assert packed_out is None, "dynamic-k is not supported with packed_out"
++        from sglang.srt.layers.moe import dynk as _dynk_mod
++
++        if dynk.mode == _dynk_mod.MODE_LEARNED:
++            assert K - num_fused_shared_experts <= _dynk_mod.LEARNED_TOPN
++            assert dynk.mlp is not None, "learned dynamic-k gate weights not loaded"
++        dynk_args = dict(
++            dynk_tau_ptr=dynk.tau,
++            dynk_mlp_ptr=dynk.mlp if dynk.mlp is not None else dynk.tau,
++            dynk_slot=int(dynk.slot),
++            dynk_k=int(dynk.k),
++            dynk_kmin=int(dynk.k_min),
++            dynk_kmax=int(dynk.k_max),
++            DYNK_MODE=int(dynk.mode),
++            DYNK_TOPN=_dynk_mod.LEARNED_TOPN,
++            DYNK_F=_dynk_mod.LEARNED_F_IN,
++            DYNK_H=_dynk_mod.LEARNED_H,
++            DYNK_OUT=_dynk_mod.LEARNED_OUT,
++        )
++    else:
++        dynk_args = dict(
++            dynk_tau_ptr=_unused_i32,
++            dynk_mlp_ptr=_unused_i32,
++            dynk_slot=0,
++            dynk_k=0,
++            dynk_kmin=0,
++            dynk_kmax=0,
++            DYNK_MODE=0,
++            DYNK_TOPN=16,
++            DYNK_F=20,
++            DYNK_H=32,
++            DYNK_OUT=8,
++        )
+     _router_triton_kernel[grid](
+         scores,
+         bias if bias is not None else scores,
+@@ -522,6 +650,7 @@ def moe_fused_gate(
+         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
+         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+         num_warps=num_warps,
++        **dynk_args,
+         **extra,
+     )
+     return weights, indices
+diff --git a/python/sglang/srt/layers/moe/dynk.py b/python/sglang/srt/layers/moe/dynk.py
+new file mode 100644
+index 0000000..61f7d7a
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/dynk.py
+@@ -0,0 +1,216 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""Dynamic expert count (dynamic-k) for softmax top-k MoE routing.
++
++Off by default. Enabled only by ``SGLANG_QWENOPT_DYNK`` (inline JSON) or
++``SGLANG_QWENOPT_DYNK_FILE`` (path to JSON). Schema::
++
++    {"target": ARM, "draft": ARM}          # either key may be omitted (= off)
++    ARM = {"mode": "off"}
++        | {"mode": "fixed",   "k": 8}                                   # top-k truncation
++        | {"mode": "cumprob", "tau": 0.9 | [tau_0 .. tau_47], "k_min": 4, "k_max": 10}
++        | {"mode": "learned", "weights": "/path/gate.pt", "k_min": 4, "k_max": 10}
++
++Semantics (all modes): the router still selects the model's full top-K (K=10) and
++normalises weights over that top-K exactly as today. Dynamic-k then DROPS the tail
++slots: dropped slots get id -1 and weight 0, kept slots keep their ORIGINAL top-K
++weight (no renormalisation, the "k2 = K" rule of arXiv 2609.04575). The output shape
++stays [M, K], so CUDA graphs are unchanged. flashinfer cutlass_fused_moe treats id -1
++as "expert not on this rank": the slot is excluded from the permutation, the grouped
++GEMM and finalize, so dropped experts cost zero bytes (GATE 1, skip_check.json).
++
++cumprob: keep the shortest prefix of the (descending) top-K weights whose mass is
++>= tau * (top-K mass), clamped to [k_min, k_max]. tau is per layer (slot) and lives in
++a device tensor, so it can be changed between steps without recapturing graphs.
++
++Slots: target MoE layers use their layer id (0..62); the MTP/draft MoE uses slot 63.
++Duplicate expert ids within a token are a correctness hazard for cutlass_fused_moe
++(the duplicate's unpermuted->permuted row is never written; measured wrong by up to
++15.5 abs). Dynamic-k only ever writes -1, never a duplicate; ``check_no_duplicates``
++asserts it outside graph capture when ``SGLANG_QWENOPT_DYNK_CHECK=1``.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++from dataclasses import dataclass
++from typing import Dict, Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++MODE_OFF, MODE_FIXED, MODE_CUMPROB, MODE_LEARNED = 0, 1, 2, 3
++_MODE_NAMES = {"off": MODE_OFF, "fixed": MODE_FIXED, "cumprob": MODE_CUMPROB, "learned": MODE_LEARNED}
++NUM_SLOTS = 64
++DRAFT_SLOT = NUM_SLOTS - 1
++# Learned gate: per-slot MLP  F_IN -> H -> (K_MAX_CLASSES) logits over k in [k_min .. k_max].
++LEARNED_TOPN = 16  # sorted top-16 router probabilities (softmax over all experts)
++LEARNED_F_IN = 20  # 16 probs + top-10 mass + entropy(top-16 renorm) + p1/p2 + 1 (bias feature)
++LEARNED_H = 32
++LEARNED_OUT = 8  # k in 3..10 (k = k_lo + argmax), k_lo = 3
++
++
++@dataclass
++class DynKArm:
++    mode: int
++    k: int = 10
++    k_min: int = 1
++    k_max: int = 10
++    tau: Optional[list] = None
++    weights_path: Optional[str] = None
++
++
++@dataclass
++class DynKCallParams:
++    """What one router call needs. Tensors are device-resident and allocated once."""
++
++    mode: int
++    slot: int
++    k: int
++    k_min: int
++    k_max: int
++    tau: torch.Tensor  # [NUM_SLOTS] fp32
++    mlp: Optional[torch.Tensor]  # [NUM_SLOTS, P] fp32 packed learned-gate params
++
++
++_cfg: Optional[Dict[str, DynKArm]] = None
++_dev_tau: Dict[tuple, torch.Tensor] = {}
++_dev_mlp: Dict[tuple, torch.Tensor] = {}
++
++
++def _parse_arm(d: Optional[dict], name: str) -> DynKArm:
++    if not d:
++        return DynKArm(MODE_OFF)
++    mode = _MODE_NAMES[d.get("mode", "off")]
++    arm = DynKArm(mode)
++    if mode == MODE_FIXED:
++        arm.k = int(d["k"])
++        assert 1 <= arm.k <= 16, f"dynk {name}: k={arm.k}"
++    elif mode in (MODE_CUMPROB, MODE_LEARNED):
++        arm.k_min = int(d.get("k_min", 4))
++        arm.k_max = int(d.get("k_max", 10))
++        assert 1 <= arm.k_min <= arm.k_max, f"dynk {name}: k_min/k_max"
++        if mode == MODE_CUMPROB:
++            tau = d["tau"]
++            arm.tau = [float(tau)] * NUM_SLOTS if not isinstance(tau, list) else [float(t) for t in tau]
++            assert all(0.0 < t <= 1.0 for t in arm.tau), f"dynk {name}: tau in (0,1]"
++        else:
++            arm.weights_path = d["weights"]
++    return arm
++
++
++def get_config() -> Dict[str, DynKArm]:
++    global _cfg
++    if _cfg is None:
++        raw = os.environ.get("SGLANG_QWENOPT_DYNK", "").strip()
++        path = os.environ.get("SGLANG_QWENOPT_DYNK_FILE", "").strip()
++        if not raw and path:
++            with open(path) as f:
++                raw = f.read()
++        d = json.loads(raw) if raw else {}
++        _cfg = {"target": _parse_arm(d.get("target"), "target"), "draft": _parse_arm(d.get("draft"), "draft")}
++        if any(a.mode != MODE_OFF for a in _cfg.values()):
++            logger.warning("qwenopt dynamic-k ENABLED (lossy): %s", d)
++    return _cfg
++
++
++def is_enabled() -> bool:
++    return any(a.mode != MODE_OFF for a in get_config().values())
++
++
++def _arm_for_slot(slot: int) -> DynKArm:
++    return get_config()["draft" if slot == DRAFT_SLOT else "target"]
++
++
++def slot_for_layer(layer_id: Optional[int], is_draft: bool) -> Optional[int]:
++    if is_draft:
++        return DRAFT_SLOT
++    if layer_id is None:
++        return None
++    assert 0 <= layer_id < DRAFT_SLOT, f"dynk: layer_id {layer_id} out of slot range"
++    return layer_id
++
++
++def prepare(slot: Optional[int], device: torch.device) -> None:
++    """Allocate the device tensors for ``slot`` eagerly (model init, before graph capture)."""
++    if slot is None or not is_enabled():
++        return
++    arm = _arm_for_slot(slot)
++    key = (str(device), "draft" if slot == DRAFT_SLOT else "target")
++    if key not in _dev_tau:
++        tau = arm.tau if arm.tau is not None else [1.0] * NUM_SLOTS
++        if len(tau) < NUM_SLOTS:  # per-layer list for the target; pad
++            tau = list(tau) + [tau[-1]] * (NUM_SLOTS - len(tau))
++        _dev_tau[key] = torch.tensor(tau[:NUM_SLOTS], dtype=torch.float32, device=device)
++    if arm.mode == MODE_LEARNED and key not in _dev_mlp:
++        blob = torch.load(arm.weights_path, map_location="cpu", weights_only=True)
++        packed = blob["packed"].to(torch.float32)  # [NUM_SLOTS or L, P]
++        assert packed.shape[1] == learned_param_count(), "learned gate: packed width mismatch"
++        if packed.shape[0] < NUM_SLOTS:
++            pad = packed[-1:].expand(NUM_SLOTS - packed.shape[0], -1)
++            packed = torch.cat([packed, pad], 0)
++        _dev_mlp[key] = packed.contiguous().to(device)
++
++
++def learned_param_count() -> int:
++    # W1 [H, F_IN] + b1 [H] + W2 [OUT, H] + b2 [OUT]
++    return LEARNED_H * LEARNED_F_IN + LEARNED_H + LEARNED_OUT * LEARNED_H + LEARNED_OUT
++
++
++def call_params(slot: Optional[int], device: torch.device) -> Optional[DynKCallParams]:
++    if slot is None or not is_enabled():
++        return None
++    arm = _arm_for_slot(slot)
++    if arm.mode == MODE_OFF:
++        return None
++    key = (str(device), "draft" if slot == DRAFT_SLOT else "target")
++    if key not in _dev_tau:
++        # Not prepared at init: allocating now would be illegal inside graph capture.
++        assert not torch.cuda.is_current_stream_capturing(), (
++            "dynk: device params were not prepared before CUDA graph capture"
++        )
++        prepare(slot, device)
++    return DynKCallParams(
++        mode=arm.mode, slot=slot, k=arm.k, k_min=arm.k_min, k_max=arm.k_max,
++        tau=_dev_tau[key], mlp=_dev_mlp.get(key),
++    )
++
++
++def apply_torch(topk_weights: torch.Tensor, topk_ids: torch.Tensor, p: DynKCallParams,
++                k_routed: int) -> None:
++    """Reference / fallback (in place) for router paths other than the fused Triton gate.
++    Matches the kernel for fixed and cumprob. Learned mode is kernel-only."""
++    K = topk_ids.shape[1]
++    ar = torch.arange(K, device=topk_ids.device)[None, :]
++    routed = ar < k_routed
++    if p.mode == MODE_FIXED:
++        keep = ar < p.k
++    elif p.mode == MODE_CUMPROB:
++        # rank by weight descending (the fused kernel emits slots already sorted)
++        w = torch.where(routed, topk_weights, torch.zeros_like(topk_weights))
++        order = torch.argsort(w, dim=1, descending=True)
++        ws = torch.gather(w, 1, order)
++        tot = ws.sum(1, keepdim=True)
++        cum_excl = ws.cumsum(1) - ws
++        keep_sorted = (cum_excl < p.tau[p.slot] * tot) | (ar < p.k_min)
++        keep_sorted = keep_sorted & (ar < p.k_max)
++        keep = torch.zeros_like(keep_sorted)
++        keep.scatter_(1, order, keep_sorted)
++    else:
++        raise NotImplementedError("learned dynamic-k exists only in the fused router kernel")
++    keep = keep | ~routed
++    topk_weights.masked_fill_(~keep, 0.0)
++    topk_ids.masked_fill_(~keep, -1)
++
++
++def check_no_duplicates(topk_ids: torch.Tensor) -> None:
++    if os.environ.get("SGLANG_QWENOPT_DYNK_CHECK", "0") != "1":
++        return
++    if torch.cuda.is_current_stream_capturing() or topk_ids.numel() == 0:
++        return
++    ids = topk_ids.to(torch.int64)
++    s, _ = torch.sort(ids, dim=1)
++    dup = (s[:, 1:] == s[:, :-1]) & (s[:, 1:] >= 0)
++    assert not bool(dup.any()), "dynk: duplicate expert id within a token (cutlass_fused_moe drops it)"
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a4b6541..71e79ee 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -267,6 +267,9 @@ class TopKConfig:
+     # Draft-side MoE blocks set this False so they never write the target's
+     # process-global routed-experts capture buffer.
+     allow_routed_experts_capture: bool = True
++    # qwenopt dynamic-k slot (layer id, or dynk.DRAFT_SLOT for the MTP draft MoE);
++    # None = never apply dynamic-k. Off unless SGLANG_QWENOPT_DYNK is set.
++    dynk_slot: Optional[int] = None
+     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
+         default=None, init=False, repr=False, compare=False
+     )
+@@ -1007,10 +1010,12 @@ def fused_topk(
+     num_fused_shared_experts: int = 0,
+     packed_out: Optional[torch.Tensor] = None,
+     num_token_non_padded: Optional[torch.Tensor] = None,
++    dynk=None,
+ ):
+     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+ 
+     M, _ = hidden_states.shape
++    dynk_done = dynk is None
+ 
+     topk_weights = torch.empty(
+         M, topk, dtype=torch.float32, device=hidden_states.device
+@@ -1065,7 +1070,9 @@ def fused_topk(
+                 topk,
+                 scoring_func="softmax",
+                 renormalize=renormalize,
++                **({"dynk": dynk} if dynk is not None else {}),
+             )
++            dynk_done = True
+         else:
+             topk_softmax(
+                 topk_weights,
+@@ -1137,6 +1144,12 @@ def fused_topk(
+     else:
+         raise ValueError(f"Invalid scoring function: {scoring_func}")
+ 
++    if not dynk_done:
++        from sglang.srt.layers.moe import dynk as _dynk_mod
++
++        _dynk_mod.apply_torch(
++            topk_weights, topk_ids, dynk, topk - num_fused_shared_experts
++        )
+     return topk_weights, topk_ids
+ 
+ 
+@@ -2477,6 +2490,14 @@ def select_experts(
+ 
+     scoring_func = topk_config.scoring_func
+ 
++    # qwenopt dynamic-k (lossy, off by default): drop tail slots to id -1.
++    _dynk_params = None
++    if topk_config.dynk_slot is not None:
++        from sglang.srt.layers.moe import dynk as _dynk_mod
++
++        _dynk_params = _dynk_mod.call_params(topk_config.dynk_slot, router_logits.device)
++    _dynk_done = _dynk_params is None
++
+     # Set by the fused-gating+pack branches below; None everywhere else.
+     packed_topk = None
+     # True when the router itself masked rows >= num_token_non_padded.
+@@ -2679,6 +2700,9 @@ def select_experts(
+                     num_token_non_padded=num_token_non_padded,
+                 )
+             # ===== END TO BE REFACTORED ====
++            if _dynk_params is not None and packed_topk is None:
++                _fused_topk_kwargs["dynk"] = _dynk_params
++                _dynk_done = True
+             topk_weights, topk_ids = fused_topk(
+                 hidden_states=hidden_states,
+                 gating_output=router_logits,
+@@ -2704,6 +2728,20 @@ def select_experts(
+             renormalize=renormalize,
+         )
+ 
++    if _dynk_params is not None:
++        from sglang.srt.layers.moe import dynk as _dynk_mod
++
++        # A logical->physical remap table indexed by -1 aliases its last entry.
++        assert expert_location_dispatch_info is None, (
++            "dynamic-k (-1 slots) is incompatible with EPLB expert remapping"
++        )
++        assert not routing_overridden, "dynamic-k with simulated routing is meaningless"
++        if not _dynk_done:
++            _dynk_mod.apply_torch(
++                topk_weights, topk_ids, _dynk_params, top_k - num_fused_shared_experts
++            )
++        _dynk_mod.check_no_duplicates(topk_ids)
++
+     if routing_overridden:
+         # Benchmark-only: override gating with a balanced expert assignment (so
+         # dummy/random benchmark tokens don't skew MoE load) via a single fused
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 91a9d6e..0ef780b 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -304,6 +304,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             renormalize=config.norm_topk_prob,
+             layer_id=layer_id,
+         )
++        # qwenopt dynamic-k: off unless SGLANG_QWENOPT_DYNK is set.
++        from sglang.srt.layers.moe import dynk as _dynk_mod
++
++        if _dynk_mod.is_enabled():
++            _slot = _dynk_mod.slot_for_layer(layer_id, is_nextn)
++            self.topk.topk_config.dynk_slot = _slot
++            _dynk_mod.prepare(_slot, torch.device("cuda", torch.cuda.current_device()))
+ 
+         # Disable inplace MoE when fused gate will need hidden_states after experts
+         _needs_hidden_after_experts = (

@@ -1,0 +1,64 @@
+From 2c365e7fcecaaaf6b0620622cfc0011a0a00fcbf Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:54:50 +0000
+Subject: [PATCH 24/32] perf(moe): SGLANG_QWENOPT_FUSE_MOE_FINALIZE alias for
+ flashinfer fused finalize
+
+Off by default; unset returns the original envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE value.
+GPU2 proxy, real layer-20 NVFP4 experts, autotuned: finalizeMoeRoutingKernel (7-13 us) is
+replaced by a <1 us memset; wall -5.3 us/call at T=4. LOSSY and NON-DETERMINISTIC (bf16
+red.global.add scatter): max |d| 4 bf16 ulps of row max, ~63% elements differ. Needs the gate.
+---
+ .../moe/moe_runner/flashinfer_cutlass.py       | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+index 8e21077..11514ae 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -8,6 +8,7 @@ small quant_info payload and route through ``MoeRunner``.
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -155,6 +156,19 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+     padded_hidden: Optional[int] = None
+ 
+ 
++# qwen-opt fuse lever: SGLANG_QWENOPT_FUSE_MOE_FINALIZE=1 folds
++# finalizeMoeRoutingKernel into the GEMM2 epilogue (FINALIZE tactics enter the autotuner).
++# LOSSY + NON-DETERMINISTIC: the epilogue scatters with bf16 red.global.add into a zeroed
++# output (sm90_visitor_scatter.hpp), so the top-k sum is rounded per add in arbitrary order.
++# Unset -> the original expression below, unchanged.
++_QWENOPT_FUSE_MOE_FINALIZE = os.environ.get("SGLANG_QWENOPT_FUSE_MOE_FINALIZE", "0") == "1"
++
++
++def _use_fused_finalize() -> bool:
++    if _QWENOPT_FUSE_MOE_FINALIZE and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
++        return True
++    return envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
++
+ def _flashinfer_cutlass_fused_moe():
+     if not is_flashinfer_available():
+         raise RuntimeError(
+@@ -325,7 +339,7 @@ def _run_flashinfer_cutlass(
+         tune_max_num_tokens=next_power_of_2(x.shape[0]),
+         activation_type=_activation_type(runner_config),
+         enable_alltoall=enable_alltoall,
+-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
++        use_fused_finalize=_use_fused_finalize(),
+     )[0]
+ 
+     if quant_info.quant_type in ("bf16", "fp8"):
+@@ -538,7 +552,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+         ),
+         tune_max_num_tokens=next_power_of_2(x.shape[0]),
+         output=out,
+-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
++        use_fused_finalize=_use_fused_finalize(),
+         **humming_kwargs,
+     )
+ 

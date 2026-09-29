@@ -1,0 +1,212 @@
+From dca918e58ce5f147bc07ceadd3d68f840db931ae Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:28:11 +0000
+Subject: [PATCH 17/32] test(gemm): CPU dispatch + CLI coverage for the SM120
+ skinny BF16/MXFP8 GEMM
+
+---
+ .../unit/kernels/test_sm120_gemm_dispatch.py  | 195 ++++++++++++++++++
+ 1 file changed, 195 insertions(+)
+ create mode 100644 test/registered/unit/kernels/test_sm120_gemm_dispatch.py
+
+diff --git a/test/registered/unit/kernels/test_sm120_gemm_dispatch.py b/test/registered/unit/kernels/test_sm120_gemm_dispatch.py
+new file mode 100644
+index 0000000..6c44236
+--- /dev/null
++++ b/test/registered/unit/kernels/test_sm120_gemm_dispatch.py
+@@ -0,0 +1,195 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""CPU dispatch tests for the SM120 skinny GEMM levers.
++
++The kernels themselves need an SM12x device, but the *dispatch predicates*
++``use_sm120_skinny_gemm`` / ``use_sm120_mxfp8_skinny_gemm`` read only dtype, rank,
++stride and shape, so the rule that decides Triton-vs-cuBLAS is exercisable on CPU.
++These are the production functions, not re-implementations. The CLI surface
++(``--bf16-gemm-backend sm120gemv``) is checked through the real argument parser.
++
++Nothing here imports ``torch.cuda`` state or creates a CUDA context.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++from sglang.kernels.ops.gemm.sm120_bf16_skinny_gemm import (
++    MAX_M,
++    use_sm120_skinny_gemm,
++)
++from sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm import (
++    use_sm120_mxfp8_skinny_gemm,
++)
++
++# (N, K) of every BF16 dense GEMM the flash-next decode/verify graphs issue, from the
++# RadixArk checkpoint headers. The last column is whether an M=1 call should stay on
++# cuBLAS gemv (weight below the 8M-element floor).
++SHAPES = [
++    ("gdn_in_proj_qkvzba", 16480, 2560, False),
++    ("out_proj_o_proj", 2560, 6144, False),
++    ("qsa_qkv", 13312, 2560, False),
++    ("shared_gate_up", 1280, 2560, True),
++    ("shared_down", 2560, 640, True),
++    ("router_gate", 512, 2560, True),
++    ("qsa_indexer_qk", 640, 2560, True),
++    ("gdn_in_proj_a_b", 48, 2560, True),
++]
++
++SMALL_WEIGHT_FLOOR = 8 << 20
++
++
++def _x(m: int, k: int) -> torch.Tensor:
++    return torch.zeros((m, k), dtype=torch.bfloat16)
++
++
++def _w(n: int, k: int) -> torch.Tensor:
++    return torch.zeros((n, k), dtype=torch.bfloat16)
++
++
++@pytest.mark.parametrize("name,n,k,gemv_small", SHAPES)
++@pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16, 24, 32, 33, 48, 64, 4096])
++def test_bf16_dispatch_matches_the_documented_rule(name, n, k, gemv_small, m):
++    """1 <= M <= 32, K%128==0, 16 <= N <= 65536, and not (M==1 and N*K < 8M)."""
++    want = 1 <= m <= MAX_M and not (m == 1 and n * k < SMALL_WEIGHT_FLOOR)
++    assert use_sm120_skinny_gemm(_x(m, k), _w(n, k)) is want, (name, m)
++
++
++@pytest.mark.parametrize("name,n,k,gemv_small", SHAPES)
++def test_bf16_m1_floor_is_exactly_the_weight_element_count(name, n, k, gemv_small):
++    assert use_sm120_skinny_gemm(_x(1, k), _w(n, k)) is (not gemv_small)
++    assert (n * k < SMALL_WEIGHT_FLOOR) is gemv_small
++
++
++def test_bf16_verify_widths_for_every_running_batch():
++    """bs 1/2/4/8 x a W=4 verify window, and W=8 at bs 1/2/4, stay on the kernel;
++    the bs8 W=8 row count (64) falls back to cuBLAS."""
++    n, k = 16480, 2560
++    for bs in (1, 2, 4, 8):
++        for w in (4, 8):
++            rows = bs * w
++            assert use_sm120_skinny_gemm(_x(rows, k), _w(n, k)) is (rows <= MAX_M)
++
++
++def test_bf16_rejects_wrong_dtype_rank_and_stride():
++    n, k = 2560, 6144
++    w = _w(n, k)
++    assert not use_sm120_skinny_gemm(torch.zeros((4, k), dtype=torch.float32), w)
++    assert not use_sm120_skinny_gemm(_x(4, k), torch.zeros((n, k), dtype=torch.float32))
++    assert not use_sm120_skinny_gemm(_x(4, k), torch.zeros((2, n, k), dtype=torch.bfloat16))
++    # weight rows must be K-contiguous
++    assert not use_sm120_skinny_gemm(_x(4, k), _w(k, n).t())
++    # activation last dim must be contiguous
++    assert not use_sm120_skinny_gemm(_x(k, 4).t(), w)
++
++
++def test_bf16_rejects_out_of_range_k_and_n():
++    assert not use_sm120_skinny_gemm(_x(4, 2560 + 64), _w(2560, 2560 + 64))  # K % 128
++    assert not use_sm120_skinny_gemm(_x(4, 2560), _w(8, 2560))  # N < 16
++    assert not use_sm120_skinny_gemm(_x(4, 2560), _w(65536 + 128, 2560))  # N > 65536
++
++
++def test_bf16_lm_head_stays_on_cublas():
++    """vocab 248320 is above the N ceiling: lm_head is already at the bandwidth ceiling."""
++    assert not use_sm120_skinny_gemm(_x(4, 2560), _w(248320, 2560))
++    assert not use_sm120_skinny_gemm(_x(1, 2560), _w(248320, 2560))
++    # the 24k-map draft head is under the ceiling, so it does use the kernel
++    assert use_sm120_skinny_gemm(_x(1, 2560), _w(24576, 2560))
++
++
++def test_bf16_three_dimensional_activation_uses_the_row_product():
++    n, k = 13312, 2560
++    x = torch.zeros((2, 8, k), dtype=torch.bfloat16)  # 16 rows
++    assert use_sm120_skinny_gemm(x, _w(n, k))
++    x = torch.zeros((2, 32, k), dtype=torch.bfloat16)  # 64 rows
++    assert not use_sm120_skinny_gemm(x, _w(n, k))
++
++
++# ---------------------------------------------------------------- MXFP8 (QAD overlay)
++
++
++def _wq(n: int, k: int):
++    return (
++        torch.zeros((n, k), dtype=torch.float8_e4m3fn),
++        torch.zeros((n, k // 32), dtype=torch.uint8),
++    )
++
++
++@pytest.mark.parametrize("name,n,k,gemv_small", SHAPES)
++@pytest.mark.parametrize("m", [1, 4, 16, 32, 33, 64])
++def test_mxfp8_dispatch_covers_m_le_32_with_no_weight_floor(name, n, k, gemv_small, m):
++    """Unlike the BF16 path there is no M==1 cuBLAS carve-out: FlashInfer CUTLASS is
++    slower than BF16 at every decode M, so the skinny kernel takes all of M <= 32."""
++    w, ws = _wq(n, k)
++    assert use_sm120_mxfp8_skinny_gemm(_x(m, k), w, ws) is (1 <= m <= MAX_M)
++
++
++def test_mxfp8_serves_the_narrow_shapes_cutlass_rejects():
++    """in_proj_a / in_proj_b are N=48; the CUTLASS MXFP8 path requires N >= 128."""
++    w, ws = _wq(48, 2560)
++    assert use_sm120_mxfp8_skinny_gemm(_x(4, 2560), w, ws)
++
++
++def test_mxfp8_rejects_wrong_scale_shape_dtype_and_stride():
++    n, k = 16480, 2560
++    w, ws = _wq(n, k)
++    assert not use_sm120_mxfp8_skinny_gemm(_x(4, k), w, ws.to(torch.int8))
++    assert not use_sm120_mxfp8_skinny_gemm(
++        _x(4, k), w, torch.zeros((n, k // 16), dtype=torch.uint8)
++    )
++    assert not use_sm120_mxfp8_skinny_gemm(
++        _x(4, k), w, torch.zeros((k // 32, n), dtype=torch.uint8).t()
++    )
++    assert not use_sm120_mxfp8_skinny_gemm(_x(4, k), w.to(torch.bfloat16), ws)
++    assert not use_sm120_mxfp8_skinny_gemm(
++        torch.zeros((4, k), dtype=torch.float16), w, ws
++    )
++
++
++def test_mxfp8_rejects_k_not_multiple_of_128():
++    w, ws = _wq(2560, 2560 + 32)
++    assert not use_sm120_mxfp8_skinny_gemm(_x(4, 2560 + 32), w, ws)
++
++
++# ------------------------------------------------------------------- CLI surface
++
++
++def test_cli_accepts_sm120gemv_and_still_accepts_the_stock_backends():
++    from sglang.srt.server_args import prepare_server_args
++
++    base = [
++        "--model-path",
++        "/nonexistent-model",
++        "--tokenizer-path",
++        "/nonexistent-model",
++        "--skip-server-warmup",
++    ]
++    for backend in ("auto", "cutedsl", "gemv", "sm120gemv", "torch"):
++        args = prepare_server_args(base + ["--bf16-gemm-backend", backend])
++        assert args.bf16_gemm_backend == backend
++
++
++def test_cli_rejects_an_unknown_bf16_gemm_backend():
++    from sglang.srt.server_args import prepare_server_args
++
++    with pytest.raises(SystemExit):
++        prepare_server_args(
++            [
++                "--model-path",
++                "/nonexistent-model",
++                "--tokenizer-path",
++                "/nonexistent-model",
++                "--bf16-gemm-backend",
++                "sm120gemvv",
++            ]
++        )
++
++
++def test_sm120gemv_is_a_real_backend_enum_member():
++    from sglang.srt.layers.quantization.unquant import Bf16GemmBackend
++
++    b = Bf16GemmBackend("sm120gemv")
++    assert b.is_sm120gemv()
++    assert not b.is_auto() and not b.is_cutedsl() and not b.is_gemv()

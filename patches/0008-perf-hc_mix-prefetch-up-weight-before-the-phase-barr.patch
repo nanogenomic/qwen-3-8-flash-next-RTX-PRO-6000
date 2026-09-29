@@ -1,0 +1,234 @@
+From 94e88ef47f8a9391f642a1149606c74689ede265 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:49:45 +0000
+Subject: [PATCH 08/32] perf(hc_mix): prefetch up-weight before the phase
+ barrier, drop zeroing barrier
+
+Phase 2 of the persistent HC low-rank mix does not depend on phase 1's result
+for its weight tile, so it is loaded before the barrier and overlaps phase 1.
+The fp32 accumulator is persistent and re-zeroed by the last CTA, removing
+the zeroing grid barrier. BLOCK_J=8 gives one J block per CTA on 188 SMs.
+GPU2 (sm_120), arbitrary tensors: 13.5 -> 10.2 us/call with N scaled to the
+RTX PRO 6000's per-SM work, 28.3 -> 27.9 us native; error identical to the
+original kernel. SGLANG_HC_MIX_PREFETCH=0 restores the original kernel.
+---
+ python/sglang/kernels/ops/gemm/hc_mix.py | 186 +++++++++++++++++++++++
+ 1 file changed, 186 insertions(+)
+
+diff --git a/python/sglang/kernels/ops/gemm/hc_mix.py b/python/sglang/kernels/ops/gemm/hc_mix.py
+index 325369d..abe8735 100644
+--- a/python/sglang/kernels/ops/gemm/hc_mix.py
++++ b/python/sglang/kernels/ops/gemm/hc_mix.py
+@@ -9,11 +9,18 @@ Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ _FUSED_MIX_MAX_ROWS = 16
++# Prefetch variant: phase 2's up-weight tile is loaded before the phase barrier and the
++# fp32 accumulator is persistent (re-zeroed by the last CTA), so there is no zeroing
++# barrier. SGLANG_HC_MIX_PREFETCH=0 restores the original kernel.
++_PREFETCH_ENABLED = os.environ.get("SGLANG_HC_MIX_PREFETCH", "1") != "0"
++_PREFETCH_BLOCK_J = 8
+ 
+ 
+ @triton.jit
+@@ -137,7 +144,156 @@ def _hc_mix_persistent_kernel(
+         tl.store(counters_ptr + 2, 0)
+ 
+ 
++@triton.jit
++def _hc_mix_prefetch_kernel(
++    x_ptr,
++    w_down_ptr,
++    w_up_ptr,
++    t_raw_ptr,
++    out_ptr,
++    counters_ptr,
++    K,
++    HS,
++    num_rows,
++    num_ctas,
++    inv_hc,
++    LOWRANK: tl.constexpr,
++    RA: tl.constexpr,
++    RB: tl.constexpr,
++    ROWS: tl.constexpr,
++    HC: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_J: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs_m = tl.arange(0, ROWS)
++    mask_m = offs_m < num_rows
++
++    # ---- prefetch phase-2 operands for this CTA's first J block (independent of phase 1)
++    j_blocks = tl.cdiv(HS, BLOCK_J)
++    offs_j = tl.arange(0, BLOCK_J)
++    offs_g = tl.arange(0, HC)
++    j = pid * BLOCK_J + offs_j
++    mask_j = j < HS
++    gj = offs_g[:, None] * HS + j[None, :]
++    gj_flat = tl.reshape(gj, (HC * BLOCK_J,))
++    mask_gj = tl.reshape(tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,))
++    offs_ra = tl.arange(0, RA)
++    offs_rb = tl.arange(0, RB)
++    w_a = tl.load(
++        w_up_ptr + gj_flat[:, None] * LOWRANK + offs_ra[None, :],
++        mask=mask_gj[:, None],
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    w_b = tl.load(
++        w_up_ptr + gj_flat[:, None] * LOWRANK + RA + offs_rb[None, :],
++        mask=mask_gj[:, None],
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    xg = tl.load(
++        x_ptr + offs_m[:, None, None] * (HC * HS) + offs_g[None, :, None] * HS + j[None, None, :],
++        mask=mask_m[:, None, None] & mask_j[None, None, :],
++        other=0.0,
++    ).to(tl.float32)
++
++    # ---- phase 0 removed: t_raw is persistent and all-zero on entry (see exit)
++
++    # ---- phase 1: t_raw += x @ Wd^T, tiles over (N block, K chunk)
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_n = tl.arange(0, BLOCK_N)
++    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
++    k_chunks = tl.cdiv(K, BLOCK_K)
++    for tile in range(pid, n_blocks * k_chunks, num_ctas):
++        nb = tile % n_blocks
++        kc = tile // n_blocks
++        n = nb * BLOCK_N + offs_n
++        k = kc * BLOCK_K + offs_k
++        mask_n = n < LOWRANK
++        xt = tl.load(x_ptr + offs_m[:, None] * K + k[None, :], mask=mask_m[:, None], other=0.0)
++        w = tl.load(
++            w_down_ptr + n[:, None] * K + k[None, :],
++            mask=mask_n[:, None],
++            other=0.0,
++            eviction_policy="evict_first",
++        )
++        acc = tl.dot(xt, tl.trans(w))
++        tl.atomic_add(
++            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
++            acc,
++            mask=mask_n[None, :],
++            sem="relaxed",
++            scope="gpu",
++        )
++    _grid_barrier(counters_ptr + 1, num_ctas)
++
++    # ---- phase 2: first J block uses the prefetched operands
++    if pid < j_blocks:
++        a = tl.load(t_raw_ptr + offs_m[:, None] * LOWRANK + offs_ra[None, :], cache_modifier=".cg") * inv_hc
++        ta = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
++        b = tl.load(t_raw_ptr + offs_m[:, None] * LOWRANK + RA + offs_rb[None, :], cache_modifier=".cg") * inv_hc
++        tb = (b * tl.sigmoid(b)).to(x_ptr.dtype.element_ty)
++        acc = tl.dot(ta, tl.trans(w_a))
++        acc = tl.dot(tb, tl.trans(w_b), acc)
++        gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
++        out = tl.sum(gate * xg, axis=1) * inv_hc
++        tl.store(out_ptr + offs_m[:, None] * HS + j[None, :], out.to(out_ptr.dtype.element_ty),
++                 mask=mask_m[:, None] & mask_j[None, :])
++        # remaining J blocks (only when j_blocks > num_ctas)
++        for jb in range(pid + num_ctas, j_blocks, num_ctas):
++            j2 = jb * BLOCK_J + offs_j
++            mask_j2 = j2 < HS
++            gj2 = tl.reshape(offs_g[:, None] * HS + j2[None, :], (HC * BLOCK_J,))
++            mask_gj2 = tl.reshape(tl.broadcast_to(mask_j2[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,))
++            wa2 = tl.load(w_up_ptr + gj2[:, None] * LOWRANK + offs_ra[None, :], mask=mask_gj2[:, None], other=0.0)
++            wb2 = tl.load(w_up_ptr + gj2[:, None] * LOWRANK + RA + offs_rb[None, :], mask=mask_gj2[:, None], other=0.0)
++            acc2 = tl.dot(ta, tl.trans(wa2))
++            acc2 = tl.dot(tb, tl.trans(wb2), acc2)
++            gate2 = tl.sigmoid(tl.reshape(acc2, (ROWS, HC, BLOCK_J)))
++            xg2 = tl.load(
++                x_ptr + offs_m[:, None, None] * (HC * HS) + offs_g[None, :, None] * HS + j2[None, None, :],
++                mask=mask_m[:, None, None] & mask_j2[None, None, :], other=0.0,
++            ).to(tl.float32)
++            out2 = tl.sum(gate2 * xg2, axis=1) * inv_hc
++            tl.store(out_ptr + offs_m[:, None] * HS + j2[None, :], out2.to(out_ptr.dtype.element_ty),
++                     mask=mask_m[:, None] & mask_j2[None, :])
++
++    # every CTA has finished reading t_raw once it takes a ticket; the last one re-zeroes
++    # the accumulator and the counters, restoring the entry invariant for the next call
++    # (and for CUDA-graph replay).
++    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
++    if ticket == num_ctas - 1:
++        offs_z = tl.arange(0, 1024)
++        for z0 in range(0, ROWS * LOWRANK, 1024):
++            idx = z0 + offs_z
++            tl.store(t_raw_ptr + idx, 0.0, mask=idx < ROWS * LOWRANK)
++        tl.store(counters_ptr + 1, 0)
++        tl.store(counters_ptr + 2, 0)
++
++
+ _counters_cache = {}
++_acc_cache = {}
++
++
++def _split_lowrank(r: int):
++    """LOWRANK = RA + RB with both powers of two (320 = 256 + 64), else None."""
++    ra = 1 << (r.bit_length() - 1)
++    rb = r - ra
++    if rb == 0:
++        return ra // 2, ra // 2
++    if rb < 16 or rb & (rb - 1):
++        return None
++    return ra, rb
++
++
++def _get_acc(device: torch.device, lowrank: int) -> torch.Tensor:
++    buf = _acc_cache.get((device, lowrank))
++    if buf is None:
++        buf = torch.zeros((16, lowrank), dtype=torch.float32, device=device)
++        _acc_cache[(device, lowrank)] = buf
++    return buf
+ 
+ 
+ def _get_counters(device: torch.device) -> torch.Tensor:
+@@ -191,6 +347,36 @@ def fused_hc_mix(
+     rows_pad = 16
+     device = hyper_input_normed.device
+     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
++    split = _split_lowrank(lowrank) if _PREFETCH_ENABLED else None
++    if split is not None:
++        out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
++        if rows == 0:
++            return out
++        # Same stream-ordering contract as the original kernel's shared counters:
++        # calls on one device must not run concurrently.
++        _hc_mix_prefetch_kernel[(num_ctas,)](
++            hyper_input_normed,
++            w_down,
++            w_up,
++            _get_acc(device, lowrank),
++            out,
++            _get_counters(device),
++            k,
++            hs,
++            rows,
++            num_ctas,
++            1.0 / hc,
++            LOWRANK=lowrank,
++            RA=split[0],
++            RB=split[1],
++            ROWS=rows_pad,
++            HC=hc,
++            BLOCK_N=32,
++            BLOCK_K=256,
++            BLOCK_J=_PREFETCH_BLOCK_J,
++            num_warps=8,
++        )
++        return out
+     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
+     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
+     if rows == 0:

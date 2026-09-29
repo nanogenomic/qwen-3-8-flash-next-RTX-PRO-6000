@@ -1,0 +1,121 @@
+From e2f3eca145dbfcf0bdd04620705d2fee5e4c2aa2 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:57:08 +0000
+Subject: [PATCH 26/32] test(qsa): correct the selection width --
+ qsa_token_topk IS the budget
+
+The byte budget was pinned at a 515-column selection (budget // ratio + ratio - 1).
+It is 2051: kv_cache_configurator.py:1936 passes qsa_token_topk=qsa_profile.budget
+(2048) and qsa_kv_pool.py:125 derives qsa_block_topk = token_topk // ratio (512),
+so the 512 is the BLOCK top-k; the gather sees the expanded token selection,
+qsa/kernel.py:211 final_topk = token_topk + ratio - 1. Page-aligned that is 33
+pages of 64 = a 2112-row run per query row, not 576.
+
+Restated at B3c-4 (max_bs 4, kv heads 2, head_dim 256, bf16):
+  per QSA backend instance, packed-KV k+v at W=8 = 132 MiB (was stated 36)
+  unshared across tiers {1,3,5,7}: 20 instances, 2560 MiB workspace + 858 MiB gather
+  shared: 128 + 132 MiB  ->  3158 MiB recovered overall,
+  2675 MiB across the three EXTRA tiers = 105354 bf16 KV tokens at 26 KB.
+
+This now matches the executor's measured per-state mem= lines, which the old
+numbers did not: predicted unshared steps=1 = 0.31 GiB [measured 0.35], steps=5 =
+1.01 GiB [measured 1.10], the residual being graph-pool growth and the static
+input/metadata buffers. Same correction applied to the GPU2 equivalence script,
+which re-passes: 4 tiers plus an A->B->A interleave bitwise equal to private
+scratch, 1 allocation of 138412032 bytes, peak 0.29 GiB, 5.1 s.
+---
+ .../speculative/test_adaptive_shared_ws.py    | 48 +++++++++++++------
+ 1 file changed, 33 insertions(+), 15 deletions(-)
+
+diff --git a/test/registered/unit/speculative/test_adaptive_shared_ws.py b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+index 7e1010e..a10e790 100644
+--- a/test/registered/unit/speculative/test_adaptive_shared_ws.py
++++ b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+@@ -92,9 +92,13 @@ KV_HEADS = 2
+ HEAD_DIM = 256
+ DTYPE = torch.bfloat16
+ ELEM = 2
+-QSA_TOKEN_TOPK = 512  # indexer_budget // compress_ratio
++# qsa_token_topk IS the indexer budget, not budget//ratio: kv_cache_configurator.py:1936
++# passes ``qsa_token_topk=qsa_profile.budget``; qsa_kv_pool.py:125 then derives
++# ``qsa_block_topk = token_topk // ratio`` (512). The selection the gather sees is
++# the EXPANDED one, kernel.py:211 ``final_topk = token_topk + compress_ratio - 1``.
++QSA_TOKEN_TOPK = 2048  # indexer_budget
+ RATIO = 4
+-EXPANDED_TOPK = QSA_TOKEN_TOPK + RATIO - 1  # 515: top-k blocks + uncompressed tail
++EXPANDED_TOPK = QSA_TOKEN_TOPK + RATIO - 1  # 2051: expanded token selection
+ MAX_BS = 4
+ CANDIDATE_STEPS = [1, 3, 5, 7]
+ LAUNCH_STEPS = 3
+@@ -145,11 +149,11 @@ def _import_or_skip(mod_name: str):
+ 
+ 
+ def test_expanded_topk_and_stride_match_the_backend_expression():
+-    assert expanded_topk_from_pool(_FakePool()) == EXPANDED_TOPK == 515
+-    # 515 columns pack to 9 pages of 64 -> a 576-row run per query row.
+-    assert _stride() == 576
+-    assert packed_kv_rows(1, EXPANDED_TOPK) == 576
+-    assert packed_kv_rows(32, EXPANDED_TOPK) == 32 * 576
++    assert expanded_topk_from_pool(_FakePool()) == EXPANDED_TOPK == 2051
++    # 2051 columns pack to 33 pages of 64 -> a 2112-row run per query row.
++    assert _stride() == 2112
++    assert packed_kv_rows(1, EXPANDED_TOPK) == 2112
++    assert packed_kv_rows(32, EXPANDED_TOPK) == 32 * 2112
+ 
+ 
+ def test_trtllm_page_size_and_workspace_match_the_backend_constants():
+@@ -172,7 +176,7 @@ def test_deepest_rows_is_tier_independent(steps):
+         expanded_topk=EXPANDED_TOPK,
+         widest_num_draft_tokens=WIDEST_W,
+     )
+-    assert rows == MAX_BS * WIDEST_W * _stride() == 4 * 8 * 576
++    assert rows == MAX_BS * WIDEST_W * _stride() == 4 * 8 * 2112 == 67584
+ 
+ 
+ def test_draft_decode_backends_reserve_the_same_rows():
+@@ -367,13 +371,27 @@ def test_shipped_tier_set_byte_budget():
+     mib = 1024 * 1024
+     assert round(unshared_ws / mib) == 2560
+     assert round(shared_ws / mib) == 128
+-    assert round(unshared_packed / mib) == 234
+-    assert round(shared_packed / mib) == 36
++    assert round(unshared_packed / mib) == 858
++    assert round(shared_packed / mib) == 132
++    # Per-tier unshared cost, against the executor's measured per-state mem= line:
++    #   steps=1 -> 2 ws + 66 MiB = 0.31 GiB   [measured 0.35]
++    #   steps=5 -> 6 ws + 264 MiB = 1.01 GiB  [measured 1.10]
++    per_tier = {}
++    for steps in CANDIDATE_STEPS:
++        w = _w(steps)
++        per_tier[steps] = round(
++            (
++                2 * _pair_bytes(MAX_BS * w * stride)
++                + max(0, steps - 1) * _pair_bytes(MAX_BS * stride)
++            )
++            / mib
++        )
++    assert per_tier == {1: 66, 3: 165, 5: 264, 7: 363}
+ 
+     saved = (unshared_ws + unshared_packed) - (shared_ws + shared_packed)
+     # >= 2.5 GiB recovered across the four tiers.
+-    assert round(saved / mib) == 2630
+-    assert round(saved / (1024**3), 2) == 2.57
++    assert round(saved / mib) == 3158
++    assert round(saved / (1024**3), 2) == 3.08
+ 
+     # The three EXTRA tiers are what the OOM was paying for; the launch tier's
+     # cost is the pre-adaptive baseline.
+@@ -392,10 +410,10 @@ def test_shipped_tier_set_byte_budget():
+         + extra_packed
+         - (shared_packed - launch_packed)
+     )
+-    assert round(extra_saved / mib) == 2219
+-    assert round(extra_saved / (1024**3), 2) == 2.17
++    assert round(extra_saved / mib) == 2675
++    assert round(extra_saved / (1024**3), 2) == 2.61
+     # Priced as bf16 KV pool tokens at 26 KB/token.
+-    assert round(extra_saved / (26 * 1024)) == 87394
++    assert round(extra_saved / (26 * 1024)) == 105354
+ 
+ 
+ def test_describe_reports_what_the_boot_log_prints():

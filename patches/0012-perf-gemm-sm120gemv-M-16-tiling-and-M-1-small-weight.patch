@@ -1,0 +1,58 @@
+From 8e123db7a67823ee624bdbcb1c852395221a7af3 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:52:49 +0000
+Subject: [PATCH 12/32] perf(gemm): sm120gemv M>16 tiling and M=1 small-weight
+ fallback
+
+32-row tiles split to >= 1 CTA/SM (was 2), which removes the M=32 out_proj
+regression (1.10x -> 0.99x of cuBLAS time in the 188-SM emulation). Single-row
+GEMMs on weights under 8M elements stay on cuBLAS gemv, which matches or beats
+the skinny kernel there. GPU2 correctness, graph and wiring tests pass.
+---
+ .../kernels/ops/gemm/sm120_bf16_skinny_gemm.py      | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
+index 06a9d93..a2669dc 100644
+--- a/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
+@@ -29,6 +29,7 @@ import triton.language as tl
+ MAX_M = 32
+ _MAX_N = 65536  # lm_head-sized N stays on cuBLAS (already at the bandwidth ceiling)
+ _MIN_BLOCK_K = 128
++_MIN_GEMV_WEIGHT_ELEMS = 8 << 20  # M=1 below this stays on cuBLAS gemv
+ _WS_FLOATS = 1 << 20  # 4 MiB fp32 split-K workspace per stream
+ _N_TICKETS = 1 << 14
+ 
+@@ -129,15 +130,18 @@ def pick_config(m: int, n: int, k: int, num_sms: int) -> Tuple[int, int, int, in
+ 
+     Measured on sm_120 (RTX PRO 4000, 70 SMs) at native N and with N scaled by
+     70/188 to reproduce the RTX PRO 6000's per-SM work: a weight strip of
+-    BLOCK_M rows per CTA (square MMA tile), split-K doubled until there are >= 2 CTAs per SM while each split keeps
+-    >= 256 K elements, and the partial workspace fits.
++    BLOCK_M rows per CTA (square MMA tile), split-K doubled until there are >= 2
++    (16-row tiles) or >= 1 (32-row tiles) CTAs per SM while each split keeps >= 256
++    K elements, and the partial workspace fits.
+     """
+     block_m = 16 if m <= 16 else 32
+     bn = block_m
+     tiles = triton.cdiv(n, bn)
++    # CTAs per SM to reach before splitting stops: 2 for 16-row tiles, 1 for 32-row
++    target = 2 if block_m == 16 else 1
+     split = 1
+     while (
+-        tiles * split < 2 * num_sms
++        tiles * split < target * num_sms
+         and split < 8
+         and k % (split * 2 * _MIN_BLOCK_K) == 0
+         and k // (split * 2) >= 256
+@@ -157,6 +161,9 @@ def use_sm120_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> bool:
+         return False
+     k = weight.shape[1]
+     m = x.numel() // k if k else 0
++    n = weight.shape[0]
++    if m == 1 and n * k < _MIN_GEMV_WEIGHT_ELEMS:
++        return False  # cuBLAS gemv is as fast for small single-row GEMMs
+     return (
+         1 <= m <= MAX_M
+         and x.shape[-1] == k

@@ -1,0 +1,554 @@
+From 5910baf4b7a6d9550a3caef7f9e3c3ad3f64dbf3 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:46:21 +0000
+Subject: [PATCH 21/32] perf(qsa): one shared trtllm workspace + packed-KV
+ scratch across QSA backends
+
+Adaptive speculation builds one runtime state per candidate step count, and each
+state constructs its own QSA backends: target verify, draft-extend, and
+num_steps-1 draft decode steps. Every instance owned a private 128 MiB trtllm-gen
+workspace and a private packed-KV gather buffer sized from its own verify window,
+so the per-tier cost grew with tier depth. At candidate steps {1,3,5,7} that is
+20 instances = 2560 MiB of workspace plus 234 MiB of gather buffers, and the deep
+tiers ran the device out of memory while building the states.
+
+Both regions are pure scratch with no state crossing a forward boundary: the
+workspace is consumed inside one trtllm decode launch, and packed_k/packed_v are
+fully rewritten (zero_fill_cols=stride, so the padding columns too) by the
+extraction kernel immediately before the decode kernel reads them. One tier is
+active at a time and the state swap happens between forwards, so one max-size set
+serves all of them. This is the idiom the DSV4 and DSA backends already use for
+the same kernel family via runtime_context.get_buffer; QSA was the outlier.
+
+The gather buffer is planned before it is allocated: a captured graph bakes in its
+address, so growing it after a capture would free the block an earlier tier
+replays from. init_cuda_graph_state reserves at the DEEPEST reachable verify
+window (max_speculative_num_draft_tokens), the first use allocates at the max of
+every reservation, and a later reservation that would grow it raises. An eager
+request above the plan (max_running_requests wider than any captured graph batch)
+falls back to this backends private buffer, which no graph has captured.
+
+Sharing is off under two-batch overlap and PDMux, the only paths that put a model
+forward on a second stream, and behind SGLANG_QSA_SHARE_SCRATCH as an escape
+hatch. The CUDA graph memory pool needed no change: every runner already resolves
+its capture backend through resolve_decode_backend, which takes the one process
+handle from get_or_create_global_graph_memory_pool. Routing is untouched, so the
+duplicate-expert-id hazard in the fused MoE does not apply.
+
+Recovered across the three extra tiers: 2219 MiB [arithmetic], about 87k bf16 KV
+pool tokens at 26 KB/token.
+---
+ python/sglang/srt/environ.py                  |   6 +
+ .../layers/attention/qsa/shared_scratch.py    | 316 ++++++++++++++++++
+ .../attention/qwen_sparse_attn_backend.py     |  77 ++++-
+ .../sglang/srt/speculative/eagle_worker_v2.py |  27 +-
+ 4 files changed, 420 insertions(+), 6 deletions(-)
+ create mode 100644 python/sglang/srt/layers/attention/qsa/shared_scratch.py
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index fbd02c7..af7d5c3 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1435,6 +1435,12 @@ class Envs:
+     # raising max_running_requests. Off = original locking + ratio (escape hatch).
+     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+ 
++    # Adaptive speculation builds one QSA backend set per tier; each instance
++    # otherwise owns a private 128 MiB trtllm workspace and a private packed-KV
++    # gather buffer. On = one max-size set shared process-wide (auto-off under
++    # two-batch overlap / PDMux, the only paths with a second forward stream).
++    SGLANG_QSA_SHARE_SCRATCH = EnvBool(True)
++
+     # ===================================================================
+     # CUDA graphs and execution buffers
+     # ===================================================================
+diff --git a/python/sglang/srt/layers/attention/qsa/shared_scratch.py b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+new file mode 100644
+index 0000000..2c4ed7c
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+@@ -0,0 +1,316 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""One max-size QSA scratch set shared by every ``QwenSparseAttnBackend``.
++
++Why this exists
++---------------
++Adaptive speculation builds one ``SpecRuntimeState`` per candidate step count
++(``eagle_worker_v2.build_adaptive_runtime_state``), and each state constructs its
++own QSA backends: one for target verify, one for draft-extend, and
++``speculative_num_steps - 1`` for the draft decode chain
++(``QwenSparseMultiStepDraftBackend.__init__``). Every one of those instances used
++to own
++
++  * a private 128 MiB trtllm-gen workspace, and
++  * a private packed-KV gather buffer sized from *its own* verify window,
++
++so the runtime-state cost grew with tier depth and the deep tiers ran the GPU out
++of memory before the KV pool was even sized. Only one tier is active at a time
++and the state swap happens between forwards, so a single max-size set of scratch
++serves all of them.
++
++This mirrors what the DSV4 / DSA backends already do for the same kernel family
++(``deepseek_v4_trtllm_backend._get_trtllm_workspace_buffer``,
++``dsa_backend`` ``"dsa_trtllm_workspace"``): one named persistent buffer per
++process via ``runtime_context.get_buffer``. The QSA backend was the outlier.
++
++The non-aliasing argument
++-------------------------
++Both shared regions are **pure scratch with no state that crosses a forward
++boundary**:
++
++  * the trtllm workspace is written and consumed inside one
++    ``trtllm_batch_decode_with_kv_cache`` launch;
++  * ``packed_k`` / ``packed_v`` are fully rewritten by
++    ``qwen_sparse_kv_extraction_compact_triton`` (with ``zero_fill_cols=stride``,
++    so even the padding columns are re-established) immediately before the decode
++    kernel reads them.
++
++A single backend already reuses both across every QSA layer of a forward and
++across every forward, so reuse across *instances* is the same access pattern with
++a different owner — provided no two QSA forwards are in flight at once. Two
++things could break that, and both disable sharing here
++(:func:`qsa_scratch_sharing_enabled`): two-batch overlap and PDMux, which are the
++only mechanisms that put model forwards on more than one stream.
++
++The pointer-stability rule
++--------------------------
++A captured CUDA graph bakes in the *address* of the packed-KV buffer. Growing the
++buffer after a capture would free the block the earlier tier's graph still points
++at — a use-after-free that reads as silent corruption, not an error. So the
++buffer is **planned before it is allocated**: every backend calls
++:func:`qsa_reserve_packed_kv_rows` from ``init_cuda_graph_state`` with the row
++count the *deepest reachable* tier needs, the first real use allocates at the max
++of every reservation, and a later request that exceeds the allocation raises
++instead of reallocating.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Dict, Optional, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++# Page size the sparse gather packs to; must match
++# ``qwen_sparse_attn_backend._TRTLLM_SPARSE_PAGE_SIZE``.
++TRTLLM_SPARSE_PAGE_SIZE = 64
++# trtllm-gen scratch size, same constant DSV4 uses.
++TRTLLM_SPARSE_WORKSPACE_BYTES = 128 * 1024 * 1024
++
++_PLAN_KEY = "qsa_shared_scratch_plan"
++_WORKSPACE_KEY = "qsa_trtllm_sparse_workspace"
++
++
++def qsa_scratch_sharing_enabled() -> bool:
++    """False when a second stream could run a QSA forward concurrently.
++
++    Sharing is only safe while QSA forwards are serialized. Two-batch overlap and
++    PDMux are the two features that put model forwards on more than one stream;
++    under either, each backend keeps its own scratch.
++    """
++    from sglang.srt.environ import envs
++
++    if not envs.SGLANG_QSA_SHARE_SCRATCH.get():
++        return False
++    try:
++        from sglang.srt.runtime_context import get_disagg, get_exec
++
++        if get_exec().overlap.enable_two_batch_overlap:
++            return False
++        # PDMux replays on one attention backend per stream. Adaptive spec
++        # already refuses it (adaptive_spec_params.py:84-86); the guard is here
++        # so a non-adaptive PDMux boot keeps private scratch regardless.
++        if get_disagg().enable_pdmux:
++            return False
++    except Exception:
++        # No runtime context (unit harnesses, tooling): nothing to overlap with.
++        return True
++    return True
++
++
++def packed_kv_rows(num_tokens: int, expanded_topk: int) -> int:
++    """Rows the packed-KV gather needs for ``num_tokens`` query rows.
++
++    The gather writes one page-aligned run of ``pages_per_row * page`` rows per
++    query row; this is the same expression ``_forward_trtllm_sparse`` uses to
++    size its request.
++    """
++    pages_per_row = (
++        expanded_topk + TRTLLM_SPARSE_PAGE_SIZE - 1
++    ) // TRTLLM_SPARSE_PAGE_SIZE
++    return int(num_tokens) * pages_per_row * TRTLLM_SPARSE_PAGE_SIZE
++
++
++class QSASharedScratchPlan:
++    """Reservations, allocations and the pointer-stability invariant.
++
++    Held as one named persistent buffer so every backend in the process — across
++    every adaptive runtime state — addresses the same instance.
++    """
++
++    def __init__(self) -> None:
++        self.reserved_rows: int = 0
++        # (num_kv_heads, head_dim, dtype, device) -> (k, v) at allocated_rows
++        self._packed: Dict[Tuple[int, int, torch.dtype, torch.device], Tuple] = {}
++        self._allocated_rows: Dict[Tuple[int, int, torch.dtype, torch.device], int] = {}
++        # (batch, pages_per_row, device) -> (cu_strided, block_tables)
++        self._sparse_tables: Dict[Tuple[int, int, torch.device], Tuple] = {}
++        self.reserve_calls: int = 0
++        self.packed_allocations: int = 0
++        self.handout_calls: int = 0
++        self.overflow_calls: int = 0
++
++    # -- planning -------------------------------------------------------
++    def reserve_rows(self, rows: int) -> int:
++        """Record a row requirement. Safe to call any number of times."""
++        rows = int(rows)
++        self.reserve_calls += 1
++        if rows > self.reserved_rows:
++            if self._allocated_rows:
++                # A backend asked for more than an already-captured buffer holds.
++                # Growing it would strand the graphs that baked in the old
++                # pointer, so refuse here where it is still a config error.
++                raise ValueError(
++                    "QSA shared packed-KV scratch was already allocated at "
++                    f"{max(self._allocated_rows.values())} rows when a backend "
++                    f"reserved {rows}. Reservations must be made at the deepest "
++                    "reachable speculative width before the first CUDA graph "
++                    "capture (see QwenSparseAttnBackend.init_cuda_graph_state)."
++                )
++            self.reserved_rows = rows
++        return self.reserved_rows
++
++    # -- handout --------------------------------------------------------
++    def packed_kv(
++        self,
++        capacity: int,
++        num_kv_heads: int,
++        head_dim: int,
++        dtype: torch.dtype,
++        device: torch.device,
++    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
++        """Views over the shared buffer, or None when it is too small.
++
++        None is the signal to the caller that this request cannot be served from
++        shared storage. The shared buffer is never grown: a captured graph holds
++        its address, so growing it would free the block that graph replays from.
++        """
++        capacity = int(capacity)
++        key = (int(num_kv_heads), int(head_dim), dtype, device)
++        self.handout_calls += 1
++        buffers = self._packed.get(key)
++        if buffers is None:
++            rows = max(capacity, self.reserved_rows)
++            shape = (rows, int(num_kv_heads), int(head_dim))
++            buffers = (
++                torch.empty(shape, dtype=dtype, device=device),
++                torch.empty(shape, dtype=dtype, device=device),
++            )
++            self._packed[key] = buffers
++            self._allocated_rows[key] = rows
++            self.packed_allocations += 1
++            logger.info(
++                "QSA shared packed-KV scratch allocated: %d rows x %d heads x %d "
++                "dim %s (%.1f MiB for k+v), reserved=%d requested=%d",
++                rows,
++                num_kv_heads,
++                head_dim,
++                dtype,
++                2 * rows * num_kv_heads * head_dim * buffers[0].element_size() / 2**20,
++                self.reserved_rows,
++                capacity,
++            )
++        elif capacity > self._allocated_rows[key]:
++            self.overflow_calls += 1
++            return None
++        return buffers[0][:capacity], buffers[1][:capacity]
++
++    def sparse_tables(
++        self, batch: int, pages_per_row: int, page: int, device: torch.device
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Read-only arange block tables — a pure function of the key."""
++        key = (int(batch), int(pages_per_row), device)
++        cached = self._sparse_tables.get(key)
++        if cached is None:
++            stride = pages_per_row * page
++            cu = torch.arange(batch + 1, dtype=torch.int32, device=device) * stride
++            block_tables = (
++                torch.arange(batch, dtype=torch.int32, device=device)[:, None]
++                * pages_per_row
++                + torch.arange(pages_per_row, dtype=torch.int32, device=device)[None, :]
++            ).contiguous()
++            cached = (cu, block_tables)
++            self._sparse_tables[key] = cached
++        return cached
++
++    # -- introspection (tests, boot log) --------------------------------
++    def describe(self) -> dict:
++        return {
++            "reserved_rows": self.reserved_rows,
++            "reserve_calls": self.reserve_calls,
++            "packed_allocations": self.packed_allocations,
++            "handout_calls": self.handout_calls,
++            "overflow_calls": self.overflow_calls,
++            "allocated_rows": dict(self._allocated_rows),
++            "packed_bytes": sum(
++                2 * k.numel() * k.element_size() for k, _ in self._packed.values()
++            ),
++            "sparse_table_keys": len(self._sparse_tables),
++        }
++
++
++def qsa_shared_scratch_plan() -> QSASharedScratchPlan:
++    from sglang.srt.runtime_context import get_buffer
++
++    return get_buffer(_PLAN_KEY, QSASharedScratchPlan)
++
++
++def qsa_reserve_packed_kv_rows(rows: int) -> int:
++    """Reserve ``rows`` of packed-KV scratch before any graph capture."""
++    if not qsa_scratch_sharing_enabled():
++        return 0
++    return qsa_shared_scratch_plan().reserve_rows(rows)
++
++
++def qsa_packed_kv(
++    capacity: int,
++    num_kv_heads: int,
++    head_dim: int,
++    dtype: torch.dtype,
++    device: torch.device,
++) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
++    """Shared packed-KV views, or None when the request exceeds the plan."""
++    return qsa_shared_scratch_plan().packed_kv(
++        capacity, num_kv_heads, head_dim, dtype, device
++    )
++
++
++def qsa_sparse_block_tables(
++    batch: int, pages_per_row: int, page: int, device: torch.device
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    return qsa_shared_scratch_plan().sparse_tables(batch, pages_per_row, page, device)
++
++
++def qsa_trtllm_workspace(device: torch.device) -> torch.Tensor:
++    """The one trtllm-gen scratch buffer every QSA backend hands the kernel."""
++    from sglang.srt.runtime_context import get_buffer
++
++    return get_buffer(
++        _WORKSPACE_KEY,
++        lambda: torch.zeros(
++            TRTLLM_SPARSE_WORKSPACE_BYTES, dtype=torch.uint8, device=device
++        ),
++    )
++
++
++def reset_qsa_shared_scratch() -> None:
++    """Drop the shared plan and workspace (tests only)."""
++    from sglang.srt.runtime_context import get_context
++
++    buffers = get_context().resources.buffers
++    buffers.pop(_PLAN_KEY, None)
++    buffers.pop(_WORKSPACE_KEY, None)
++
++
++def deepest_packed_kv_rows(
++    *,
++    max_bs: int,
++    max_num_tokens: int,
++    expanded_topk: int,
++    widest_num_draft_tokens: Optional[int] = None,
++) -> int:
++    """Packed-KV rows the DEEPEST reachable tier needs.
++
++    ``init_cuda_graph_state`` is called once per backend with that backend's own
++    verify window, which under adaptive speculation is the *active* tier's, not
++    the widest one. Scaling ``max_num_tokens`` back up to the widest reachable
++    window is what lets the first allocation be the last one.
++    """
++    max_bs = max(1, int(max_bs))
++    max_num_tokens = max(1, int(max_num_tokens))
++    per_req = max(1, max_num_tokens // max_bs)
++    widest = max(per_req, int(widest_num_draft_tokens or 0))
++    tokens = max(max_num_tokens, max_bs * widest)
++    return packed_kv_rows(tokens, expanded_topk)
++
++
++def expanded_topk_from_pool(pool) -> int:
++    """Selection columns the gather sees: top-k blocks plus the uncompressed tail."""
++    token_topk = int(getattr(pool, "qsa_token_topk", 0) or 0)
++    ratio = int(getattr(pool, "qsa_compress_ratio", 1) or 1)
++    if token_topk <= 0:
++        raise ValueError("QSA pool does not publish qsa_token_topk")
++    return token_topk + ratio - 1
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 2d5db3d..db5e096 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -29,6 +29,16 @@ from sglang.srt.layers.attention.qsa.metadata import (
+     build_rope_position_matrix,
+     compressed_decode_view,
+ )
++from sglang.srt.layers.attention.qsa.shared_scratch import (
++    TRTLLM_SPARSE_WORKSPACE_BYTES,
++    deepest_packed_kv_rows,
++    expanded_topk_from_pool,
++    qsa_packed_kv,
++    qsa_reserve_packed_kv_rows,
++    qsa_scratch_sharing_enabled,
++    qsa_sparse_block_tables,
++    qsa_trtllm_workspace,
++)
+ from sglang.srt.layers.attention.qsa.sparse_attn import (
+     qwen_sparse_fa2_cu_seqlens_triton,
+     qwen_sparse_kv_extraction_compact_triton,
+@@ -222,6 +232,13 @@ class QwenSparseAttnBackend(AttentionBackend):
+         self._trtllm_sparse_tables = {}
+         self._mtp_shared_sparse_indices = None
+         self._trtllm_workspace = None
++        # Adaptive speculation constructs one of these per tier (target verify,
++        # draft-extend, and num_steps-1 draft decode steps). The gather buffer,
++        # the arange block tables and the 128 MiB trtllm workspace are pure
++        # scratch, so one max-size set serves every instance; see
++        # qsa/shared_scratch.py for the non-aliasing and pointer-stability
++        # arguments and for what turns this off.
++        self._share_scratch = qsa_scratch_sharing_enabled()
+         self._graph_extend_lens = None
+         self._graph_extend_lens_pin = None
+ 
+@@ -862,6 +879,37 @@ class QwenSparseAttnBackend(AttentionBackend):
+             torch.zeros(max_bs, dtype=torch.int32, pin_memory=True) for _ in range(2)
+         ]
+         self._extend_lens_pin_idx = 0
++        self._reserve_shared_packed_kv(max_bs, max_num_tokens)
++
++    def _reserve_shared_packed_kv(self, max_bs: int, max_num_tokens: int) -> None:
++        """Claim packed-KV scratch at the DEEPEST reachable verify window.
++
++        Called before this backend's graphs are captured. ``max_num_tokens`` is
++        the ACTIVE tier's window under adaptive speculation, so the reservation
++        scales it up to the widest reachable one: the shared buffer must be
++        allocated at its final size before the first capture bakes in its
++        address."""
++        if not self._share_scratch:
++            return
++        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
++
++        try:
++            expanded_topk = expanded_topk_from_pool(self.token_to_kv_pool)
++        except (AttributeError, ValueError):
++            # No QSA pool attached (unit harnesses); nothing to size from.
++            return
++        try:
++            widest = max_speculative_num_draft_tokens()
++        except Exception:
++            widest = None
++        qsa_reserve_packed_kv_rows(
++            deepest_packed_kv_rows(
++                max_bs=max_bs,
++                max_num_tokens=max_num_tokens,
++                expanded_topk=expanded_topk,
++                widest_num_draft_tokens=widest,
++            )
++        )
+ 
+     def _capture_cuda_graph_metadata(
+         self,
+@@ -1425,6 +1473,19 @@ class QwenSparseAttnBackend(AttentionBackend):
+         dtype: torch.dtype,
+         device: torch.device,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
++        if self._share_scratch:
++            shared = qsa_packed_kv(capacity, num_kv_heads, head_dim, dtype, device)
++            if shared is not None:
++                return shared
++            # An eager (non-graph) verify wider than anything captured: no graph
++            # holds a pointer into the private buffer below, so growing it is
++            # safe. This is the pre-sharing behaviour, reached only when
++            # max_running_requests exceeds the widest captured graph batch.
++            logger.warning_once(
++                "QSA packed-KV request of %d rows exceeds the shared plan; "
++                "falling back to this backend's private scratch",
++                capacity,
++            )
+         key = (num_kv_heads, head_dim, dtype, device)
+         buffers = self._fa2_scratch.get(key)
+         if buffers is None or buffers[0].shape[0] < capacity:
+@@ -1437,6 +1498,8 @@ class QwenSparseAttnBackend(AttentionBackend):
+         return buffers[0][:capacity], buffers[1][:capacity]
+ 
+     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
++        if self._share_scratch:
++            return qsa_sparse_block_tables(batch, pages_per_row, page, device)
+         key = (batch, pages_per_row, device)
+         cached = self._trtllm_sparse_tables.get(key)
+         if cached is None:
+@@ -1522,14 +1585,18 @@ class QwenSparseAttnBackend(AttentionBackend):
+             .view(-1, page, num_kv_heads, head_dim)
+             .permute(0, 2, 1, 3)
+         )
+-        if self._trtllm_workspace is None:
+-            self._trtllm_workspace = torch.zeros(
+-                128 * 1024 * 1024, dtype=torch.uint8, device=device
+-            )
++        if self._share_scratch:
++            workspace = qsa_trtllm_workspace(device)
++        else:
++            if self._trtllm_workspace is None:
++                self._trtllm_workspace = torch.zeros(
++                    TRTLLM_SPARSE_WORKSPACE_BYTES, dtype=torch.uint8, device=device
++                )
++            workspace = self._trtllm_workspace
+         output = trtllm_decode(
+             query=q.contiguous(),
+             kv_cache=(kc, vc),
+-            workspace_buffer=self._trtllm_workspace,
++            workspace_buffer=workspace,
+             block_tables=block_tables,
+             seq_lens=valid_counts,
+             max_seq_len=stride,
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 3f69a0f..28e2153 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1818,11 +1818,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
+             logger,
+             f"Built adaptive runtime state steps={speculative_num_steps}: "
+             f"elapsed={time.perf_counter() - tic:.2f}s, "
+-            f"mem={(before_mem - after_mem):.2f}GB",
++            f"mem={(before_mem - after_mem):.2f}GB"
++            f"{self._shared_scratch_suffix()}",
+         )
+ 
+         return state
+ 
++    @staticmethod
++    def _shared_scratch_suffix() -> str:
++        """Shared-QSA-scratch counters, so a boot log shows sharing took effect.
++
++        ``packed_allocations`` must stay at 1 across every tier: a second
++        allocation means a tier reserved late and is paying for its own gather
++        buffer, and ``overflow>0`` means an eager batch fell back to private
++        scratch."""
++        try:
++            from sglang.srt.layers.attention.qsa.shared_scratch import (
++                qsa_scratch_sharing_enabled,
++                qsa_shared_scratch_plan,
++            )
++
++            if not qsa_scratch_sharing_enabled():
++                return ", qsa_shared_scratch=off"
++            plan = qsa_shared_scratch_plan().describe()
++        except Exception:
++            return ""
++        return (
++            ", qsa_shared_scratch: rows={reserved_rows} allocs={packed_allocations} "
++            "bytes={packed_bytes} overflow={overflow_calls}".format(**plan)
++        )
++
+     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+         """Apply a pre-built runtime state to this worker."""
+         if self.speculative_num_steps == state.speculative_num_steps:

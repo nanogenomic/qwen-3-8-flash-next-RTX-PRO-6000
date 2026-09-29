@@ -1,0 +1,96 @@
+From 0847fe5ae525d1079dd3e27b6a94f5861546d01d Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 12:28:16 -0400
+Subject: [PATCH 32/32] feat(spec): ship the adaptive-speculation tier configs
+ in-tree
+
+test_adaptive_wide.py resolves its two tier configs relative to
+adaptive_spec_params.py, so they belong in the tree rather than in whatever
+directory happened to hold them during development. QWENOPT_ADAPTIVE_CONFIG_DIR
+overrides the location to test a hand-tuned pair.
+
+adaptive_flashnext.json  -- 4 tiers; bs1 candidate steps [3, 5, 7].
+adaptive_flashnext_lean.json -- VRAM-lean fallback; bs1 [3, 7], union {3,7} = 2
+  runtime states and 9 batch-size captures, against 13 for the 4-state config
+  and 8 for a static one. Boot this first if the 4-state config runs out of
+  VRAM during graph capture.
+
+Hysteresis in both is DERIVED, not tuned: for a slot whose candidates are
+[.. c, next ..] the engine steps up when ema_accept_len > c - 0.5 +
+up_hysteresis, so up_hysteresis = ema* - c + 0.5 places the step-up exactly at
+the tok/s break-even ema*, and down_hysteresis places the step-down 0.25
+ema-tokens below it. Re-derive after any change to the draft head.
+
+Adaptive speculation stays OFF in every shipping configuration: it is the only
+thing measured to raise accept length above 4.0, and it cost -3.8% throughput
+and -67% of the KV pool.
+---
+ .../configs/adaptive_flashnext.json           | 35 +++++++++++++++++++
+ .../configs/adaptive_flashnext_lean.json      | 16 +++++++++
+ 2 files changed, 51 insertions(+)
+ create mode 100644 python/sglang/srt/speculative/configs/adaptive_flashnext.json
+ create mode 100644 python/sglang/srt/speculative/configs/adaptive_flashnext_lean.json
+
+diff --git a/python/sglang/srt/speculative/configs/adaptive_flashnext.json b/python/sglang/srt/speculative/configs/adaptive_flashnext.json
+new file mode 100644
+index 0000000..b68a595
+--- /dev/null
++++ b/python/sglang/srt/speculative/configs/adaptive_flashnext.json
+@@ -0,0 +1,35 @@
++{
++  "_comment": "qwen38-flash-next adaptive speculation tiers. Hysteresis is DERIVED, not tuned: for a slot whose candidates are [.. c, next ..], the engine fires a step-up when ema_accept_len > c - 0.5 + up_hysteresis, so up_hysteresis = ema* - c + 0.5 places the step-up exactly at the tok/s break-even ema* from twox_model.py --calibrated; down_hysteresis places the step-down 0.25 ema-tokens below it, which is the hysteresis band. Break-evens used (priors A0=7.16ms U=0.8, the NVFP4 checkpoint + a 24k hot-token map, q=0.695/step): bs1 n3->n5 ema*=1.29, bs2 n3->n5 ema*=1.50. RE-DERIVE after the executor sweep lands and after the trained draft head lands.",
++  "tier_stats_log_interval": 200,
++  "1": {
++    "candidate_steps": [3, 5, 7],
++    "up_hysteresis": -1.21,
++    "down_hysteresis": -1.46,
++    "ema_alpha": 0.15,
++    "update_interval": 8,
++    "warmup_batches": 10,
++    "ceiling_coeff": 0
++  },
++  "2": {
++    "candidate_steps": [3, 5],
++    "up_hysteresis": -1.0,
++    "down_hysteresis": -1.25,
++    "ema_alpha": 0.15,
++    "update_interval": 8,
++    "warmup_batches": 10,
++    "ceiling_coeff": 0
++  },
++  "4": {
++    "candidate_steps": [3],
++    "_why": "FIXED at the static width. bs 4..7 route here, so listing a second candidate would make the steps=1 state capture 5 batch sizes instead of 1 (+0.3-0.4 GB of graph VRAM against 2.82 GB spare [measured, config B boot log]), and the hard constraint at conc 4 is >= config B, which IS static n=3 -- pinning reproduces it by construction."
++  },
++  "8": {
++    "candidate_steps": [1, 3],
++    "up_hysteresis": 0.0,
++    "down_hysteresis": 0.0,
++    "ema_alpha": 0.2,
++    "update_interval": 5,
++    "warmup_batches": 10,
++    "ceiling_coeff": 0
++  }
++}
+diff --git a/python/sglang/srt/speculative/configs/adaptive_flashnext_lean.json b/python/sglang/srt/speculative/configs/adaptive_flashnext_lean.json
+new file mode 100644
+index 0000000..d675b78
+--- /dev/null
++++ b/python/sglang/srt/speculative/configs/adaptive_flashnext_lean.json
+@@ -0,0 +1,16 @@
++{
++  "_comment": "VRAM-lean fallback: union {3,7} = 2 runtime states, 9 bs-captures (vs 13 for adaptive_flashnext.json, 8 for the static config). Boot this first if the 4-state config runs out of VRAM during graph capture. up/down hysteresis place the bs1 n3->n7 step-up at its own break-even ema*=1.50 (not n3->n5's).",
++  "tier_stats_log_interval": 200,
++  "1": {
++    "candidate_steps": [3, 7],
++    "up_hysteresis": -1.0,
++    "down_hysteresis": -1.25,
++    "ema_alpha": 0.15,
++    "update_interval": 8,
++    "warmup_batches": 10,
++    "ceiling_coeff": 0
++  },
++  "2": {"candidate_steps": [3]},
++  "4": {"candidate_steps": [3]},
++  "8": {"candidate_steps": [3]}
++}

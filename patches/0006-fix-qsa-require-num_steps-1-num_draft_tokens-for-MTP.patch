@@ -1,0 +1,46 @@
+From 8ecb24611f127570bcbe096f02019c1632f08f20 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 20:32:53 +0000
+Subject: [PATCH 06/32] fix(qsa): require num_steps + 1 >= num_draft_tokens for
+ MTP index sharing
+
+The shared sparse-index tail is the only cover for positions drafted since the
+capture, so it must reach the whole verify window. Chain speculation gives
+W == num_steps + 1, but nothing enforced it: widening the window without widening
+the chain dropped the newest positions from every MTP decode steps selection, which
+reads as a quiet acceptance loss rather than an error. Raise instead.
+---
+ python/sglang/srt/speculative/eagle_worker_v2.py | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index d7f66bf..f761b7f 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -439,11 +439,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         # The expansion emits token_topk + ratio - 1 columns (top-k blocks
+         # plus the uncompressed tail of the capture position).
+         expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
++        # The tail is the only cover for positions drafted since the capture, so
++        # it has to reach the whole verify window. Chain speculation gives
++        # W == num_steps + 1; a config that widens the window without widening
++        # the chain would silently drop the newest positions from every MTP
++        # decode step's selection, which reads as a quiet acceptance loss.
++        tail_width = get_spec().speculative_num_steps + 1
++        if tail_width < self.speculative_num_draft_tokens:
++            raise ValueError(
++                "QSA MTP index sharing needs speculative_num_steps + 1 >= "
++                "speculative_num_draft_tokens so the shared selection covers the "
++                f"whole verify window: num_steps={get_spec().speculative_num_steps}, "
++                f"num_draft_tokens={self.speculative_num_draft_tokens}. Raise "
++                "--speculative-num-steps with --speculative-num-draft-tokens."
++            )
+         state = QSAMTPSharedSparseIndices(
+             layer_ids=layer_ids,
+             num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
+             token_topk=expanded_width,
+-            tail_width=get_spec().speculative_num_steps + 1,
++            tail_width=tail_width,
+             device=self.draft_runner.device,
+         )
+         for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):

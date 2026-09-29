@@ -1,0 +1,140 @@
+From a7b7916ddd4a75888d6722b9cb908a8367497b5d Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:38:21 +0000
+Subject: [PATCH 20/32] perf(moe): learned dynamic-k gate features from the
+ top-10 rounds only (F=16), +0.9 us/call on GPU2
+
+---
+ .../sglang/kernels/ops/moe/moe_fused_gate.py  | 60 ++++++++-----------
+ python/sglang/srt/layers/moe/dynk.py          |  7 ++-
+ 2 files changed, 30 insertions(+), 37 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/moe/moe_fused_gate.py b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+index bbdc0c2..65f2a50 100644
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -147,8 +147,8 @@ def _router_triton_kernel(
+     dynk_cnt_ptr,  # [64, 2] int32 (kept slots, live rows) per slot, DYNK_COUNT only
+     DYNK_COUNT: tl.constexpr,
+     DYNK_MODE: tl.constexpr,  # 0 off, 1 fixed-k, 2 cumulative-prob, 3 learned gate
+-    DYNK_TOPN: tl.constexpr,  # router probs fed to the learned gate (16)
+-    DYNK_F: tl.constexpr,  # learned-gate input features (20, padded to 32 in-kernel)
++    DYNK_TOPN: tl.constexpr,  # unused (kept for signature stability)
++    DYNK_F: tl.constexpr,  # learned-gate input features (16, power of 2)
+     DYNK_H: tl.constexpr,  # hidden width (32)
+     DYNK_OUT: tl.constexpr,  # outputs: predicted log10 rel. error for k = 3 .. 3+OUT-1
+ ) -> None:
+@@ -275,8 +275,8 @@ def _router_triton_kernel(
+     cur = biased  # [BLOCK_M, BLOCK_N]
+     remaining = tl.broadcast_to(mask_n[None, :], (BLOCK_M, BLOCK_N))
+     if DYNK_MODE == 3:
+-        offs_f = tl.arange(0, 32)
+-        feat = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
++        offs_f = tl.arange(0, DYNK_F)
++        feat = tl.zeros([BLOCK_M, DYNK_F], dtype=tl.float32)
+     for k in tl.static_range(K_ROUTED):
+         max_val = tl.max(cur, axis=1)[:, None]  # [BLOCK_M, 1]
+         is_max = remaining & (cur == max_val)
+@@ -293,18 +293,6 @@ def _router_triton_kernel(
+         if DYNK_MODE == 3:
+             feat = tl.where(offs_f[None, :] == k, win_activated, feat)
+ 
+-    if DYNK_MODE == 3:
+-        # Continue ranking to the top-DYNK_TOPN probabilities (features only; the
+-        # selection itself is unchanged).
+-        for k2 in tl.static_range(K_ROUTED, DYNK_TOPN):
+-            max_val2 = tl.max(cur, axis=1)[:, None]
+-            is_max2 = remaining & (cur == max_val2)
+-            lane2 = tl.where(is_max2, offs_n[None, :], N + 1)
+-            win2 = tl.min(lane2, axis=1)[:, None].to(tl.int32)
+-            act2 = tl.sum(tl.where(offs_n[None, :] == win2, activated, 0.0), axis=1)[:, None]
+-            feat = tl.where(offs_f[None, :] == k2, act2, feat)
+-            remaining = remaining & (offs_n[None, :] != win2)
+-            cur = tl.where(remaining, cur, -float("inf"))
+ 
+     routed_sum = tl.sum(tl.where(mask_k_routed[None, :], selected_vals, 0.0), axis=1)[
+         :, None
+@@ -348,28 +336,30 @@ def _router_triton_kernel(
+         else:
+             # Learned per-slot gate: features -> MLP -> predicted log10 rel. error
+             # for each k; choose the smallest k in [kmin, kmax] under the budget.
++            # Features (F=16), all from the K_ROUTED argmax rounds already done:
++            #  0..9  sorted top-10 probs (softmax over all experts)
++            #  10    tail mass beyond top-10 (= 1 - top-10 mass; no extra ranking rounds)
++            #  11    entropy of the top-10 renormalised
++            #  12    log p1      13 log(p1/p2)      14 log(tail)      15 top-5 share of top-10
+             p1 = tl.sum(tl.where(offs_f[None, :] == 0, feat, 0.0), axis=1)[:, None]
+             p2 = tl.sum(tl.where(offs_f[None, :] == 1, feat, 0.0), axis=1)[:, None]
+-            top_mass = tl.sum(tl.where(offs_f[None, :] < K_ROUTED, feat, 0.0), axis=1)[:, None]
+-            top_n = tl.where(offs_f[None, :] < DYNK_TOPN, feat, 0.0)
+-            qn = top_n / tl.maximum(tl.sum(top_n, axis=1)[:, None], 1e-20)
++            top_n = tl.where(offs_f[None, :] < K_ROUTED, feat, 0.0)
++            top_mass = tl.sum(top_n, axis=1)[:, None]
++            top5 = tl.sum(tl.where(offs_f[None, :] < 5, feat, 0.0), axis=1)[:, None]
++            tail = tl.maximum(1.0 - top_mass, 0.0)
++            qn = top_n / tl.maximum(top_mass, 1e-20)
+             ent = -tl.sum(tl.where(qn > 0.0, qn * tl.log(tl.maximum(qn, 1e-20)), 0.0), axis=1)[:, None]
+-            feat = tl.where(offs_f[None, :] == DYNK_TOPN, top_mass, feat)
+-            feat = tl.where(offs_f[None, :] == DYNK_TOPN + 1, ent, feat)
+-            feat = tl.where(offs_f[None, :] == DYNK_TOPN + 2, tl.log(tl.maximum(p1, 1e-20)), feat)
+-            feat = tl.where(
+-                offs_f[None, :] == DYNK_TOPN + 3,
+-                tl.log(tl.maximum(p1, 1e-20)) - tl.log(tl.maximum(p2, 1e-20)),
+-                feat,
+-            )
+-            feat = tl.where(offs_f[None, :] < DYNK_F, feat, 0.0)
++            lp1 = tl.log(tl.maximum(p1, 1e-20))
++            feat = top_n
++            feat = tl.where(offs_f[None, :] == K_ROUTED, tail, feat)
++            feat = tl.where(offs_f[None, :] == K_ROUTED + 1, ent, feat)
++            feat = tl.where(offs_f[None, :] == K_ROUTED + 2, lp1, feat)
++            feat = tl.where(offs_f[None, :] == K_ROUTED + 3, lp1 - tl.log(tl.maximum(p2, 1e-20)), feat)
++            feat = tl.where(offs_f[None, :] == K_ROUTED + 4, tl.log(tail + 1e-6), feat)
++            feat = tl.where(offs_f[None, :] == K_ROUTED + 5, top5 / tl.maximum(top_mass, 1e-20), feat)
+             base = dynk_mlp_ptr + dynk_slot * (DYNK_H * DYNK_F + DYNK_H + DYNK_OUT * DYNK_H + DYNK_OUT)
+             offs_h = tl.arange(0, DYNK_H)
+-            w1 = tl.load(
+-                base + offs_h[:, None] * DYNK_F + offs_f[None, :],
+-                mask=offs_f[None, :] < DYNK_F,
+-                other=0.0,
+-            )  # [H, 32]
++            w1 = tl.load(base + offs_h[:, None] * DYNK_F + offs_f[None, :])  # [H, F]
+             b1 = tl.load(base + DYNK_H * DYNK_F + offs_h)  # [H]
+             hid = tl.sum(feat[:, None, :] * w1[None, :, :], axis=2) + b1[None, :]
+             hid = tl.maximum(hid, 0.0)  # [BLOCK_M, H]
+@@ -587,7 +577,7 @@ def moe_fused_gate(
+         from sglang.srt.layers.moe import dynk as _dynk_mod
+ 
+         if dynk.mode == _dynk_mod.MODE_LEARNED:
+-            assert K - num_fused_shared_experts <= _dynk_mod.LEARNED_TOPN
++            assert K - num_fused_shared_experts == 10, "learned gate features assume top-10"
+             assert dynk.mlp is not None, "learned dynamic-k gate weights not loaded"
+         dynk_args = dict(
+             dynk_tau_ptr=dynk.tau,
+@@ -614,7 +604,7 @@ def moe_fused_gate(
+             DYNK_COUNT=False,
+             DYNK_MODE=0,
+             DYNK_TOPN=16,
+-            DYNK_F=20,
++            DYNK_F=16,
+             DYNK_H=32,
+             DYNK_OUT=8,
+         )
+diff --git a/python/sglang/srt/layers/moe/dynk.py b/python/sglang/srt/layers/moe/dynk.py
+index cd59454..bab36a0 100644
+--- a/python/sglang/srt/layers/moe/dynk.py
++++ b/python/sglang/srt/layers/moe/dynk.py
+@@ -59,8 +59,11 @@ NUM_SLOTS = 64
+ DRAFT_SLOT = NUM_SLOTS - 1
+ TARGET_SLOTS = range(0, DRAFT_SLOT)
+ # Learned gate: per-slot MLP  F_IN -> H -> OUT predicted log10 rel. error for k = 3..10.
+-LEARNED_TOPN = 16  # sorted top-16 router probabilities (softmax over all experts)
+-LEARNED_F_IN = 20  # 16 probs + top-10 mass + entropy(top-16) + log p1 + log(p1/p2)
++# Features (all from the router's own top-10 rounds, no extra ranking):
++#   p1..p10 (softmax over all experts, sorted), tail = 1 - sum(p1..p10), entropy of the
++#   renormalised top-10, log p1, log(p1/p2), log(tail + 1e-6), top-5 share of top-10.
++LEARNED_TOPN = 10
++LEARNED_F_IN = 16
+ LEARNED_H = 32
+ LEARNED_OUT = 8
+ 

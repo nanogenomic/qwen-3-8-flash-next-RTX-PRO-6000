@@ -1,0 +1,86 @@
+From 1a0b03d73e0df393c199f7e3cd694c6bb2f367c5 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 20:29:34 +0000
+Subject: [PATCH 05/32] feat(spec): KEEP_FROM tail-window control for the MTP
+ hidden dump
+
+Dumping every position of a 16k-context sequence is 320 MB per sequence and
+1.67 TB for the whole build fold. The training rows only need the generated
+span plus enough preceding context to rebuild the MTP own KV (2048 tokens
+covers the QSA indexer budget exactly, so dense == sparse there).
+
+The client writes {dump_dir}/KEEP_FROM before each request; the dumper re-reads
+it whenever a record starts at position 0 and drops rows below it. The client
+is strictly serial, so there is no race. Absent or 0 keeps everything, which is
+what the equivalence-gate run uses.
+---
+ .../sglang/srt/debug_utils/mtp_hidden_dump.py | 37 ++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/debug_utils/mtp_hidden_dump.py b/python/sglang/srt/debug_utils/mtp_hidden_dump.py
+index 742153c..d5cf3ba 100644
+--- a/python/sglang/srt/debug_utils/mtp_hidden_dump.py
++++ b/python/sglang/srt/debug_utils/mtp_hidden_dump.py
+@@ -30,6 +30,14 @@ Enable with:
+   SGLANG_MTP_HIDDEN_DUMP_MAX_TOKENS=N     (stop after N tokens, 0 = unlimited)
+   SGLANG_MTP_HIDDEN_DUMP_SHARD_GIB=8      (shard rotation size)
+ 
++Tail-window control.  Dumping every position of a 16k-context sequence costs
++20 KB x 16k = 320 MB per sequence; the training rows only need the generated
++span plus enough preceding context to rebuild the MTP's own KV.  The client
++writes the integer file {dump_dir}/KEEP_FROM before each request and the dumper
++drops every row with position < that value.  The client is strictly serial (it
++waits for each response), so there is no race.  KEEP_FROM absent or 0 keeps
++everything, which is what the equivalence-gate run uses.
++
+ Layout under the dump dir:
+   target-00000.bf16   raw little-endian bfloat16, row-major [T, hc_dim]
+   target-00000.i32    raw int32, [T] input_ids then [T] positions per record
+@@ -120,9 +128,33 @@ class _Dumper:
+     def enabled(self) -> bool:
+         return not self.stopped
+ 
++    def _keep_from(self, first_pos: int) -> int:
++        """Re-read KEEP_FROM at each sequence start (position 0)."""
++        if first_pos == 0:
++            self._keep = 0
++            try:
++                with open(os.path.join(self.dir, "KEEP_FROM")) as fh:
++                    self._keep = int(fh.read().strip() or 0)
++            except (OSError, ValueError):
++                self._keep = 0
++        return getattr(self, "_keep", 0)
++
+     def submit_target(self, input_ids, positions, hc, extend_seq_lens, bs):
+         if self.stopped:
+             return
++        positions = positions.reshape(-1)
++        input_ids = input_ids.reshape(-1)
++        first_pos = int(positions[0].item())
++        keep = self._keep_from(first_pos)
++        last_pos = int(positions[-1].item())
++        if keep and last_pos < keep:
++            self._step += 1  # keep step ids aligned with the MTP records
++            return
++        if keep and first_pos < keep:
++            cut = keep - first_pos
++            positions = positions[cut:]
++            input_ids = input_ids[cut:]
++            hc = hc[cut:]
+         n = hc.shape[0]
+         self._step += 1
+         rec = {
+@@ -136,10 +168,11 @@ class _Dumper:
+                 if extend_seq_lens is not None else None
+             ),
+         }
++        rec["p0"] = int(positions[0].item())
+         payload = (
+             hc.detach().to(torch.bfloat16).cpu(),
+-            input_ids.detach().to(torch.int32).reshape(-1).cpu(),
+-            positions.detach().to(torch.int32).reshape(-1).cpu(),
++            input_ids.detach().to(torch.int32).cpu(),
++            positions.detach().to(torch.int32).cpu(),
+             None,
+         )
+         self._enqueue(rec, payload)

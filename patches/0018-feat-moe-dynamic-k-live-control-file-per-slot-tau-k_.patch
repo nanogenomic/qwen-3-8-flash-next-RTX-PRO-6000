@@ -1,0 +1,420 @@
+From 9793449d223bf2bd2f3745736401ec540435e500 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:29:52 +0000
+Subject: [PATCH 18/32] feat(moe): dynamic-k live control file (per-slot
+ tau/k_min/k_max on device) for one-boot arm sweeps
+
+---
+ .../sglang/kernels/ops/moe/moe_fused_gate.py  |  12 +-
+ python/sglang/srt/layers/moe/dynk.py          | 271 +++++++++++-------
+ 2 files changed, 180 insertions(+), 103 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/moe/moe_fused_gate.py b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+index 3b517a1..bbdc0c2 100644
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -143,8 +143,7 @@ def _router_triton_kernel(
+     dynk_mlp_ptr,  # [64, P] fp32 packed learned-gate params (DYNK_MODE == 3)
+     dynk_slot,
+     dynk_k,
+-    dynk_kmin,
+-    dynk_kmax,
++    dynk_kk_ptr,  # [64, 2] int32 per-slot (k_min, k_max), device-resident (modes 2, 3)
+     dynk_cnt_ptr,  # [64, 2] int32 (kept slots, live rows) per slot, DYNK_COUNT only
+     DYNK_COUNT: tl.constexpr,
+     DYNK_MODE: tl.constexpr,  # 0 off, 1 fixed-k, 2 cumulative-prob, 3 learned gate
+@@ -334,6 +333,9 @@ def _router_triton_kernel(
+     if DYNK_MODE != 0:
+         # Drop tail slots: id -1, weight 0; kept slots keep their top-K weight
+         # (no renormalisation). Slots are in descending weight order here.
++        if DYNK_MODE >= 2:
++            dynk_kmin = tl.load(dynk_kk_ptr + dynk_slot * 2)
++            dynk_kmax = tl.load(dynk_kk_ptr + dynk_slot * 2 + 1)
+         if DYNK_MODE == 1:
+             keep = offs_k[None, :] < dynk_k
+         elif DYNK_MODE == 2:
+@@ -592,8 +594,7 @@ def moe_fused_gate(
+             dynk_mlp_ptr=dynk.mlp if dynk.mlp is not None else dynk.tau,
+             dynk_slot=int(dynk.slot),
+             dynk_k=int(dynk.k),
+-            dynk_kmin=int(dynk.k_min),
+-            dynk_kmax=int(dynk.k_max),
++            dynk_kk_ptr=dynk.kk,
+             dynk_cnt_ptr=dynk.cnt if dynk.cnt is not None else _unused_i32,
+             DYNK_COUNT=dynk.cnt is not None,
+             DYNK_MODE=int(dynk.mode),
+@@ -608,8 +609,7 @@ def moe_fused_gate(
+             dynk_mlp_ptr=_unused_i32,
+             dynk_slot=0,
+             dynk_k=0,
+-            dynk_kmin=0,
+-            dynk_kmax=0,
++            dynk_kk_ptr=_unused_i32,
+             dynk_cnt_ptr=_unused_i32,
+             DYNK_COUNT=False,
+             DYNK_MODE=0,
+diff --git a/python/sglang/srt/layers/moe/dynk.py b/python/sglang/srt/layers/moe/dynk.py
+index ee796f1..cd59454 100644
+--- a/python/sglang/srt/layers/moe/dynk.py
++++ b/python/sglang/srt/layers/moe/dynk.py
+@@ -9,19 +9,27 @@ Off by default. Enabled only by ``SGLANG_QWENOPT_DYNK`` (inline JSON) or
+     ARM = {"mode": "off"}
+         | {"mode": "fixed",   "k": 8}                                   # top-k truncation
+         | {"mode": "cumprob", "tau": 0.9 | [tau_0 .. tau_47], "k_min": 4, "k_max": 10}
+-        | {"mode": "learned", "weights": "/path/gate.pt", "k_min": 4, "k_max": 10}
++        | {"mode": "learned", "weights": "/path/gate.pt", "budget": -2.0 | [..],
++           "k_min": 4, "k_max": 10}
+ 
+ Semantics (all modes): the router still selects the model's full top-K (K=10) and
+-normalises weights over that top-K exactly as today. Dynamic-k then DROPS the tail
+-slots: dropped slots get id -1 and weight 0, kept slots keep their ORIGINAL top-K
+-weight (no renormalisation, the "k2 = K" rule of arXiv 2609.04575). The output shape
+-stays [M, K], so CUDA graphs are unchanged. flashinfer cutlass_fused_moe treats id -1
+-as "expert not on this rank": the slot is excluded from the permutation, the grouped
+-GEMM and finalize, so dropped experts cost zero bytes (GATE 1, skip_check.json).
+-
+-cumprob: keep the shortest prefix of the (descending) top-K weights whose mass is
+->= tau * (top-K mass), clamped to [k_min, k_max]. tau is per layer (slot) and lives in
+-a device tensor, so it can be changed between steps without recapturing graphs.
++normalises weights over that top-K exactly as today. Dynamic-k then DROPS tail slots:
++dropped slots get id -1 and weight 0, kept slots keep their ORIGINAL top-K weight (no
++renormalisation, the "k2 = K" rule of arXiv 2609.04575). The output shape stays [M, K],
++so CUDA graphs are unchanged. flashinfer cutlass_fused_moe treats id -1 as "expert not
++on this rank": the slot is excluded from the permutation, grouped GEMM and finalize,
++so dropped experts cost zero bytes (GATE 1: bitwise equal to the narrow reference).
++
++fixed:   keep slots 0..k-1 (k is a launch constant).
++cumprob: keep the shortest prefix of the descending top-K weights whose mass is
++         >= tau * (top-K mass), clamped to [k_min, k_max].
++learned: per-slot MLP on router statistics predicts log10 relative output error for
++         each k in 3..10; keep the smallest k in [k_min, k_max] with prediction <= budget.
++For cumprob/learned, tau/budget AND k_min/k_max are per-slot DEVICE tensors, so they
++can be changed while serving (no graph recapture) via ``SGLANG_QWENOPT_DYNK_CONTROL``:
++a JSON file {"target": {...}, "draft": {...}} with any of tau/budget, k_min, k_max,
++polled every 2 s. cumprob with tau=1, k_min=k_max=k is exactly fixed-k; with k=10 it is
++exactly off (bitwise), so one boot can sweep every arm.
+ 
+ Slots: target MoE layers use their layer id (0..62); the MTP/draft MoE uses slot 63.
+ Duplicate expert ids within a token are a correctness hazard for cutlass_fused_moe
+@@ -30,7 +38,7 @@ Duplicate expert ids within a token are a correctness hazard for cutlass_fused_m
+ asserts it outside graph capture when ``SGLANG_QWENOPT_DYNK_CHECK=1``.
+ 
+ ``SGLANG_QWENOPT_DYNK_STATS_FILE=/path.json`` turns on in-kernel per-slot counters
+-(kept slots, live rows; padded graph rows excluded) written every 5 s, so mean k per
++(kept slots, live rows; padded graph rows excluded), written every 5 s, so mean k per
+ layer is measured on live traffic rather than assumed.
+ """
+ from __future__ import annotations
+@@ -49,11 +57,12 @@ MODE_OFF, MODE_FIXED, MODE_CUMPROB, MODE_LEARNED = 0, 1, 2, 3
+ _MODE_NAMES = {"off": MODE_OFF, "fixed": MODE_FIXED, "cumprob": MODE_CUMPROB, "learned": MODE_LEARNED}
+ NUM_SLOTS = 64
+ DRAFT_SLOT = NUM_SLOTS - 1
+-# Learned gate: per-slot MLP  F_IN -> H -> (K_MAX_CLASSES) logits over k in [k_min .. k_max].
++TARGET_SLOTS = range(0, DRAFT_SLOT)
++# Learned gate: per-slot MLP  F_IN -> H -> OUT predicted log10 rel. error for k = 3..10.
+ LEARNED_TOPN = 16  # sorted top-16 router probabilities (softmax over all experts)
+-LEARNED_F_IN = 20  # 16 probs + top-10 mass + entropy(top-16 renorm) + p1/p2 + 1 (bias feature)
++LEARNED_F_IN = 20  # 16 probs + top-10 mass + entropy(top-16) + log p1 + log(p1/p2)
+ LEARNED_H = 32
+-LEARNED_OUT = 8  # k in 3..10 (k = k_lo + argmax), k_lo = 3
++LEARNED_OUT = 8
+ 
+ 
+ @dataclass
+@@ -62,7 +71,7 @@ class DynKArm:
+     k: int = 10
+     k_min: int = 1
+     k_max: int = 10
+-    tau: Optional[list] = None
++    tau: Optional[list] = None  # cumprob tau / learned budget, per target layer or scalar
+     weights_path: Optional[str] = None
+ 
+ 
+@@ -73,58 +82,22 @@ class DynKCallParams:
+     mode: int
+     slot: int
+     k: int
+-    k_min: int
+-    k_max: int
+-    tau: torch.Tensor  # [NUM_SLOTS] fp32
+-    mlp: Optional[torch.Tensor]  # [NUM_SLOTS, P] fp32 packed learned-gate params
++    tau: torch.Tensor  # [NUM_SLOTS] fp32 (cumprob tau / learned log10 budget)
++    kk: torch.Tensor  # [NUM_SLOTS, 2] int32 (k_min, k_max)
++    mlp: Optional[torch.Tensor] = None  # [NUM_SLOTS, P] fp32 packed learned-gate params
+     cnt: Optional[torch.Tensor] = None  # [NUM_SLOTS, 2] int32 (kept slots, live rows)
+ 
+ 
+ _cfg: Optional[Dict[str, DynKArm]] = None
+-_dev_tau: Dict[tuple, torch.Tensor] = {}
+-_dev_mlp: Dict[tuple, torch.Tensor] = {}
+-_dev_cnt: Dict[str, torch.Tensor] = {}
+-_stats_thread = None
+-
+-
+-def _stats_enabled() -> bool:
+-    return bool(os.environ.get("SGLANG_QWENOPT_DYNK_STATS_FILE", "").strip())
++_dev: Dict[str, dict] = {}
++_thread = None
+ 
+ 
+-def _start_stats_writer(device: torch.device) -> None:
+-    """Every 5 s copy the per-slot counters to host on a side stream (no sync with the
+-    compute stream; values are cumulative and may lag by one step) and write JSON:
+-    {"t": unix, "slots": {slot: [kept_slots, live_rows]}}. Readers diff two snapshots."""
+-    global _stats_thread
+-    if _stats_thread is not None:
+-        return
+-    import threading
+-    import time
+-
+-    path = os.environ["SGLANG_QWENOPT_DYNK_STATS_FILE"].strip()
+-    cnt = _dev_cnt[str(device)]
+-
+-    def run():
+-        torch.cuda.set_device(device)
+-        side = torch.cuda.Stream(device=device)
+-        host = torch.empty(cnt.shape, dtype=cnt.dtype, pin_memory=True)
+-        while True:
+-            time.sleep(5.0)
+-            try:
+-                with torch.cuda.stream(side):
+-                    host.copy_(cnt, non_blocking=True)
+-                side.synchronize()
+-                h = host.tolist()
+-                out = {"t": time.time(), "slots": {str(i): h[i] for i in range(NUM_SLOTS) if h[i][1] > 0}}
+-                tmp = path + ".tmp"
+-                with open(tmp, "w") as f:
+-                    json.dump(out, f)
+-                os.replace(tmp, path)
+-            except Exception as e:  # stats must never take the server down
+-                logger.warning("dynk stats writer: %s", e)
+-
+-    _stats_thread = threading.Thread(target=run, name="dynk-stats", daemon=True)
+-    _stats_thread.start()
++def _as_list(v, n):
++    if isinstance(v, list):
++        v = [float(x) for x in v]
++        return v + [v[-1]] * (n - len(v)) if len(v) < n else v[:n]
++    return [float(v)] * n
+ 
+ 
+ def _parse_arm(d: Optional[dict], name: str) -> DynKArm:
+@@ -140,11 +113,11 @@ def _parse_arm(d: Optional[dict], name: str) -> DynKArm:
+         arm.k_max = int(d.get("k_max", 10))
+         assert 1 <= arm.k_min <= arm.k_max, f"dynk {name}: k_min/k_max"
+         if mode == MODE_CUMPROB:
+-            tau = d["tau"]
+-            arm.tau = [float(tau)] * NUM_SLOTS if not isinstance(tau, list) else [float(t) for t in tau]
++            arm.tau = _as_list(d["tau"], len(TARGET_SLOTS))
+             assert all(0.0 < t <= 1.0 for t in arm.tau), f"dynk {name}: tau in (0,1]"
+         else:
+             arm.weights_path = d["weights"]
++            arm.tau = _as_list(d.get("budget", -2.0), len(TARGET_SLOTS))
+     return arm
+ 
+ 
+@@ -180,52 +153,155 @@ def slot_for_layer(layer_id: Optional[int], is_draft: bool) -> Optional[int]:
+     return layer_id
+ 
+ 
+-def prepare(slot: Optional[int], device: torch.device) -> None:
+-    """Allocate the device tensors for ``slot`` eagerly (model init, before graph capture)."""
+-    if slot is None or not is_enabled():
+-        return
+-    arm = _arm_for_slot(slot)
+-    key = (str(device), "draft" if slot == DRAFT_SLOT else "target")
+-    if key not in _dev_tau:
+-        tau = arm.tau if arm.tau is not None else [1.0] * NUM_SLOTS
+-        if len(tau) < NUM_SLOTS:  # per-layer list for the target; pad
+-            tau = list(tau) + [tau[-1]] * (NUM_SLOTS - len(tau))
+-        _dev_tau[key] = torch.tensor(tau[:NUM_SLOTS], dtype=torch.float32, device=device)
+-    if _stats_enabled() and str(device) not in _dev_cnt:
+-        _dev_cnt[str(device)] = torch.zeros((NUM_SLOTS, 2), dtype=torch.int32, device=device)
+-        _start_stats_writer(device)
+-    if arm.mode == MODE_LEARNED and key not in _dev_mlp:
+-        blob = torch.load(arm.weights_path, map_location="cpu", weights_only=True)
+-        packed = blob["packed"].to(torch.float32)  # [NUM_SLOTS or L, P]
+-        assert packed.shape[1] == learned_param_count(), "learned gate: packed width mismatch"
+-        if packed.shape[0] < NUM_SLOTS:
+-            pad = packed[-1:].expand(NUM_SLOTS - packed.shape[0], -1)
+-            packed = torch.cat([packed, pad], 0)
+-        _dev_mlp[key] = packed.contiguous().to(device)
+-
+-
+ def learned_param_count() -> int:
+     # W1 [H, F_IN] + b1 [H] + W2 [OUT, H] + b2 [OUT]
+     return LEARNED_H * LEARNED_F_IN + LEARNED_H + LEARNED_OUT * LEARNED_H + LEARNED_OUT
+ 
+ 
++def _host_tables():
++    cfg = get_config()
++    tau = [1.0] * NUM_SLOTS
++    kk = [[1, 10] for _ in range(NUM_SLOTS)]
++    t, dr = cfg["target"], cfg["draft"]
++    for s in TARGET_SLOTS:
++        if t.tau is not None:
++            tau[s] = t.tau[s]
++        kk[s] = [t.k_min, t.k_max]
++    if dr.tau is not None:
++        tau[DRAFT_SLOT] = dr.tau[0]
++    kk[DRAFT_SLOT] = [dr.k_min, dr.k_max]
++    return tau, kk
++
++
++def prepare(slot: Optional[int], device: torch.device) -> None:
++    """Allocate the device tensors eagerly (model init, before graph capture)."""
++    if slot is None or not is_enabled():
++        return
++    key = str(device)
++    if key not in _dev:
++        tau, kk = _host_tables()
++        st = {
++            "tau": torch.tensor(tau, dtype=torch.float32, device=device),
++            "kk": torch.tensor(kk, dtype=torch.int32, device=device),
++            "cnt": None,
++            "mlp": None,
++            "tau_host": list(tau),
++            "kk_host": [list(x) for x in kk],
++        }
++        if os.environ.get("SGLANG_QWENOPT_DYNK_STATS_FILE", "").strip():
++            st["cnt"] = torch.zeros((NUM_SLOTS, 2), dtype=torch.int32, device=device)
++        _dev[key] = st
++        _start_thread(device)
++    st = _dev[key]
++    cfg = get_config()
++    if st["mlp"] is None and any(a.mode == MODE_LEARNED for a in cfg.values()):
++        packed = torch.zeros((NUM_SLOTS, learned_param_count()), dtype=torch.float32)
++        for name, arm in cfg.items():
++            if arm.mode != MODE_LEARNED:
++                continue
++            blob = torch.load(arm.weights_path, map_location="cpu", weights_only=True)
++            p = blob["packed"].to(torch.float32)  # [L, P] (target) or [1, P] (draft)
++            assert p.shape[1] == learned_param_count(), "learned gate: packed width mismatch"
++            if name == "draft":
++                packed[DRAFT_SLOT] = p[-1]
++            else:
++                for s in TARGET_SLOTS:
++                    packed[s] = p[min(s, p.shape[0] - 1)]
++        st["mlp"] = packed.to(device)
++
++
+ def call_params(slot: Optional[int], device: torch.device) -> Optional[DynKCallParams]:
+     if slot is None or not is_enabled():
+         return None
+     arm = _arm_for_slot(slot)
+     if arm.mode == MODE_OFF:
+         return None
+-    key = (str(device), "draft" if slot == DRAFT_SLOT else "target")
+-    if key not in _dev_tau:
++    key = str(device)
++    if key not in _dev or (arm.mode == MODE_LEARNED and _dev[key]["mlp"] is None):
+         # Not prepared at init: allocating now would be illegal inside graph capture.
+         assert not torch.cuda.is_current_stream_capturing(), (
+             "dynk: device params were not prepared before CUDA graph capture"
+         )
+         prepare(slot, device)
+-    return DynKCallParams(
+-        mode=arm.mode, slot=slot, k=arm.k, k_min=arm.k_min, k_max=arm.k_max,
+-        tau=_dev_tau[key], mlp=_dev_mlp.get(key), cnt=_dev_cnt.get(str(device)),
+-    )
++    st = _dev[key]
++    return DynKCallParams(mode=arm.mode, slot=slot, k=arm.k, tau=st["tau"], kk=st["kk"],
++                          mlp=st["mlp"], cnt=st["cnt"])
++
++
++def _start_thread(device: torch.device) -> None:
++    """Side thread: (a) every 2 s apply SGLANG_QWENOPT_DYNK_CONTROL if it changed;
++    (b) every 5 s write the kept-slot counters to SGLANG_QWENOPT_DYNK_STATS_FILE.
++    All device traffic is on a private side stream; the compute stream is never synced.
++    A control update lands between (or, rarely, within) steps; each value is one aligned
++    4-byte word, so a router reads either the old or the new value."""
++    global _thread
++    ctl = os.environ.get("SGLANG_QWENOPT_DYNK_CONTROL", "").strip()
++    stats = os.environ.get("SGLANG_QWENOPT_DYNK_STATS_FILE", "").strip()
++    if _thread is not None or not (ctl or stats):
++        return
++    import threading
++    import time
++
++    st = _dev[str(device)]
++
++    def apply_control(d):
++        tau = list(st["tau_host"])  # host mirrors: never read the device here
++        kk = [list(x) for x in st["kk_host"]]
++        for name, slots in (("target", list(TARGET_SLOTS)), ("draft", [DRAFT_SLOT])):
++            c = d.get(name)
++            if not c:
++                continue
++            if _arm_for_slot(slots[0]).mode not in (MODE_CUMPROB, MODE_LEARNED):
++                logger.warning("dynk control: %s arm is not cumprob/learned; ignored", name)
++                continue
++            if "tau" in c or "budget" in c:
++                v = _as_list(c.get("tau", c.get("budget")), len(slots))
++                for i, s in enumerate(slots):
++                    tau[s] = v[i]
++            for s in slots:
++                kmin = int(c.get("k_min", kk[s][0]))
++                kmax = int(c.get("k_max", kk[s][1]))
++                assert 1 <= kmin <= kmax <= 16
++                kk[s] = [kmin, kmax]
++        side = torch.cuda.Stream(device=device)
++        with torch.cuda.stream(side):
++            st["tau"].copy_(torch.tensor(tau, dtype=torch.float32).pin_memory(), non_blocking=True)
++            st["kk"].copy_(torch.tensor(kk, dtype=torch.int32).pin_memory(), non_blocking=True)
++        side.synchronize()
++        st["tau_host"], st["kk_host"] = tau, kk
++        logger.warning("dynk control applied: %s", d)
++
++    def run():
++        torch.cuda.set_device(device)
++        side = torch.cuda.Stream(device=device)
++        host = torch.empty((NUM_SLOTS, 2), dtype=torch.int32, pin_memory=True)
++        last_ctl, last_stats = None, 0.0
++        while True:
++            time.sleep(2.0)
++            try:
++                if ctl and os.path.exists(ctl):
++                    raw = open(ctl).read()
++                    if raw != last_ctl:
++                        apply_control(json.loads(raw) if raw.strip() else {})
++                        last_ctl = raw
++                        if stats:
++                            with open(stats + ".control", "a") as f:
++                                f.write(json.dumps({"t": time.time(), "control": raw}) + "\n")
++                if stats and st["cnt"] is not None and time.time() - last_stats >= 5.0:
++                    last_stats = time.time()
++                    with torch.cuda.stream(side):
++                        host.copy_(st["cnt"], non_blocking=True)
++                    side.synchronize()
++                    h = host.tolist()
++                    out = {"t": last_stats, "slots": {str(i): h[i] for i in range(NUM_SLOTS) if h[i][1] > 0}}
++                    with open(stats + ".tmp", "w") as f:
++                        json.dump(out, f)
++                    os.replace(stats + ".tmp", stats)
++            except Exception as e:  # never take the server down
++                logger.warning("dynk side thread: %s", e)
++
++    _thread = threading.Thread(target=run, name="dynk-side", daemon=True)
++    _thread.start()
+ 
+ 
+ def apply_torch(topk_weights: torch.Tensor, topk_ids: torch.Tensor, p: DynKCallParams,
+@@ -238,14 +314,15 @@ def apply_torch(topk_weights: torch.Tensor, topk_ids: torch.Tensor, p: DynKCallP
+     if p.mode == MODE_FIXED:
+         keep = ar < p.k
+     elif p.mode == MODE_CUMPROB:
++        kmin, kmax = p.kk[p.slot, 0], p.kk[p.slot, 1]
+         # rank by weight descending (the fused kernel emits slots already sorted)
+         w = torch.where(routed, topk_weights, torch.zeros_like(topk_weights))
+-        order = torch.argsort(w, dim=1, descending=True)
++        order = torch.argsort(w, dim=1, descending=True, stable=True)
+         ws = torch.gather(w, 1, order)
+         tot = ws.sum(1, keepdim=True)
+         cum_excl = ws.cumsum(1) - ws
+-        keep_sorted = (cum_excl < p.tau[p.slot] * tot) | (ar < p.k_min)
+-        keep_sorted = keep_sorted & (ar < p.k_max)
++        keep_sorted = (cum_excl < p.tau[p.slot] * tot) | (ar < kmin)
++        keep_sorted = keep_sorted & (ar < kmax)
+         keep = torch.zeros_like(keep_sorted)
+         keep.scatter_(1, order, keep_sorted)
+     else:

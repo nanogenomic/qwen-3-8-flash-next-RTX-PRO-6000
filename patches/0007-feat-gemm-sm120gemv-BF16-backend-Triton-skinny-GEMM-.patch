@@ -1,0 +1,345 @@
+From 90b9e166b65caececaabae5e9bc16da5b59924b0 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:44:58 +0000
+Subject: [PATCH 07/32] feat(gemm): sm120gemv BF16 backend, Triton skinny GEMM
+ for M<=32 on SM12x
+
+--bf16-gemm-backend sm120gemv routes BF16 linears with M<=32, K%128==0,
+N<=65536 to a weight-streaming Triton kernel (W@X^T on mma.sync, evict-first
+weights, in-kernel deterministic split-K via per-tile tickets, per-stream
+workspace, CUDA-graph safe). Everything else stays on cuBLAS.
+GPU2 (sm_120) vs cuBLAS, cold weights, graph replay: 1.00-1.25x across the
+qwen38-flash-next dense shapes at M=1..32; correctness vs fp32 matches cuBLAS.
+---
+ .../ops/gemm/sm120_bf16_skinny_gemm.py        | 215 ++++++++++++++++++
+ python/sglang/srt/arg_groups/fields/exec_.py  |   4 +-
+ .../sglang/srt/layers/quantization/unquant.py |  37 ++-
+ 3 files changed, 253 insertions(+), 3 deletions(-)
+ create mode 100644 python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
+
+diff --git a/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
+new file mode 100644
+index 0000000..06a9d93
+--- /dev/null
++++ b/python/sglang/kernels/ops/gemm/sm120_bf16_skinny_gemm.py
+@@ -0,0 +1,215 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""Skinny BF16 GEMM for SM12x decode/verify row counts (M <= 32).
++
++y[M, N] = x[M, K] @ w[N, K]^T, bf16 in/out, fp32 accumulation.
++
++On SM120 cuBLAS serves these shapes with SM80 WMMA tiles plus a separate split-K
++reduce kernel, which leaves 15-45% of DRAM bandwidth unused for the mid-sized
++per-layer weights. This kernel streams each weight exactly once with evict-first
++loads and computes (W @ X^T) so the wide N dimension sits on the MMA M side; the
++activation rows are padded to a 16/32-row MMA tile.
++
++Split-K is reduced inside the same launch: each split writes an fp32 partial to a
++per-stream workspace, the last split to arrive for an N tile (atomic ticket) sums
++the partials in a fixed order and writes bf16, then resets its ticket. One kernel
++per GEMM, deterministic run to run, and CUDA-graph safe: the tickets are back at
++zero after every call, and each stream owns its workspace so GEMMs overlapped on
++two streams never share one.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, Optional, Tuple
++
++import torch
++import triton
++import triton.language as tl
++
++MAX_M = 32
++_MAX_N = 65536  # lm_head-sized N stays on cuBLAS (already at the bandwidth ceiling)
++_MIN_BLOCK_K = 128
++_WS_FLOATS = 1 << 20  # 4 MiB fp32 split-K workspace per stream
++_N_TICKETS = 1 << 14
++
++
++@triton.jit
++def _skinny_gemm_kernel(
++    x_ptr,
++    w_ptr,
++    y_ptr,
++    ws_ptr,
++    tickets_ptr,
++    M,
++    N,
++    stride_xm,
++    stride_wn,
++    stride_ym,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++    K_PER_SPLIT: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_m = tl.arange(0, BLOCK_M)
++    mask_n = offs_n < N
++    mask_m = offs_m < M
++    k_begin = pid_k * K_PER_SPLIT
++
++    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
++    for kk in range(0, K_PER_SPLIT, BLOCK_K):
++        offs_k = k_begin + kk + tl.arange(0, BLOCK_K)
++        w = tl.load(
++            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
++            mask=mask_n[:, None],
++            other=0.0,
++            eviction_policy="evict_first",
++        )
++        x = tl.load(
++            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
++            mask=mask_m[:, None],
++            other=0.0,
++            eviction_policy="evict_last",
++        )
++        acc = tl.dot(w, tl.trans(x), acc)
++
++    y_offs = offs_m[None, :] * stride_ym + offs_n[:, None]
++    y_mask = mask_m[None, :] & mask_n[:, None]
++    if SPLIT_K == 1:
++        tl.store(y_ptr + y_offs, acc.to(y_ptr.dtype.element_ty), mask=y_mask)
++    else:
++        # workspace layout [SPLIT_K, BLOCK_M, N] fp32
++        ws_offs = offs_m[None, :] * N + offs_n[:, None]
++        tl.store(ws_ptr + pid_k * (BLOCK_M * N) + ws_offs, acc, mask=y_mask)
++        tl.debug_barrier()
++        ticket = tl.atomic_add(tickets_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
++        if ticket == SPLIT_K - 1:
++            total = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
++            for s in tl.static_range(SPLIT_K):
++                total += tl.load(
++                    ws_ptr + s * (BLOCK_M * N) + ws_offs,
++                    mask=y_mask,
++                    other=0.0,
++                    cache_modifier=".cg",
++                )
++            tl.store(y_ptr + y_offs, total.to(y_ptr.dtype.element_ty), mask=y_mask)
++            tl.atomic_xchg(tickets_ptr + pid_n, 0, sem="relaxed", scope="gpu")
++
++
++_num_sms: Dict[int, int] = {}
++_scratch: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
++_configs: Dict[Tuple[int, int, int], Tuple[int, int, int, int, int]] = {}
++
++
++def _get_num_sms(device: torch.device) -> int:
++    idx = device.index if device.index is not None else torch.cuda.current_device()
++    if idx not in _num_sms:
++        _num_sms[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
++    return _num_sms[idx]
++
++
++def _get_scratch(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Workspace + tickets owned by the current stream (kept alive for graph replay)."""
++    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
++    buf = _scratch.get(key)
++    if buf is None:
++        buf = (
++            torch.empty(_WS_FLOATS, dtype=torch.float32, device=device),
++            torch.zeros(_N_TICKETS, dtype=torch.int32, device=device),
++        )
++        _scratch[key] = buf
++    return buf
++
++
++def pick_config(m: int, n: int, k: int, num_sms: int) -> Tuple[int, int, int, int, int]:
++    """(block_n, block_k, split_k, num_warps, num_stages).
++
++    Measured on sm_120 (RTX PRO 4000, 70 SMs) at native N and with N scaled by
++    70/188 to reproduce the RTX PRO 6000's per-SM work: a weight strip of
++    BLOCK_M rows per CTA (square MMA tile), split-K doubled until there are >= 2 CTAs per SM while each split keeps
++    >= 256 K elements, and the partial workspace fits.
++    """
++    block_m = 16 if m <= 16 else 32
++    bn = block_m
++    tiles = triton.cdiv(n, bn)
++    split = 1
++    while (
++        tiles * split < 2 * num_sms
++        and split < 8
++        and k % (split * 2 * _MIN_BLOCK_K) == 0
++        and k // (split * 2) >= 256
++        and (split * 2) * block_m * n <= _WS_FLOATS
++    ):
++        split *= 2
++    kps = k // split
++    if m <= 16 and kps % 256 == 0 and kps >= 1024:
++        return bn, 256, split, 4, 3
++    return bn, 128, split, 4, 4
++
++
++def use_sm120_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> bool:
++    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
++        return False
++    if weight.dim() != 2 or weight.stride(1) != 1 or x.stride(-1) != 1:
++        return False
++    k = weight.shape[1]
++    m = x.numel() // k if k else 0
++    return (
++        1 <= m <= MAX_M
++        and x.shape[-1] == k
++        and k % _MIN_BLOCK_K == 0
++        and 16 <= weight.shape[0] <= _MAX_N
++    )
++
++
++def sm120_skinny_gemm(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: Optional[torch.Tensor] = None,
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """y = x @ weight^T (+ bias). ``x`` may be [..., K]; returns [..., N] (or ``out``)."""
++    k = weight.shape[1]
++    n = weight.shape[0]
++    x2 = x.reshape(-1, k)
++    m = x2.shape[0]
++    if out is None:
++        y = torch.empty((m, n), dtype=x.dtype, device=x.device)
++    else:
++        y = out
++    key = (m, n, k)
++    cfg = _configs.get(key)
++    if cfg is None:
++        cfg = pick_config(m, n, k, _get_num_sms(x.device))
++        _configs[key] = cfg
++    bn, bk, split, num_warps, num_stages = cfg
++    n_tiles = triton.cdiv(n, bn)
++    ws, tickets = _get_scratch(x.device)
++    assert n_tiles <= tickets.numel()
++    _skinny_gemm_kernel[(n_tiles, split)](
++        x2,
++        weight,
++        y,
++        ws,
++        tickets,
++        m,
++        n,
++        x2.stride(0),
++        weight.stride(0),
++        y.stride(0),
++        BLOCK_M=16 if m <= 16 else 32,
++        BLOCK_N=bn,
++        BLOCK_K=bk,
++        SPLIT_K=split,
++        K_PER_SPLIT=k // split,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    if bias is not None:
++        y.add_(bias)
++    if out is not None:
++        return out
++    return y.view(*x.shape[:-1], n)
+diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
+index bc3edcd..62c3f3b 100644
+--- a/python/sglang/srt/arg_groups/fields/exec_.py
++++ b/python/sglang/srt/arg_groups/fields/exec_.py
+@@ -202,9 +202,9 @@ class ExecKernel(msgspec.Struct):
+     bf16_gemm_backend: A[
+         str,
+         Arg(
+-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
++            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'sm120gemv' (SM12x: Triton skinny BF16 GEMM for M <= 32 with in-kernel split-K, cuBLAS otherwise), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+             cli_name="--bf16-gemm-backend",
+-            choices=["auto", "cutedsl", "gemv", "torch"],
++            choices=["auto", "cutedsl", "gemv", "sm120gemv", "torch"],
+         ),
+     ] = "auto"
+     dsa_prefill_backend: A[
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 8edd7e7..20d055c 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -78,6 +78,7 @@ class Bf16GemmBackend(Enum):
+     AUTO = "auto"
+     CUTEDSL = "cutedsl"
+     GEMV = "gemv"
++    SM120GEMV = "sm120gemv"
+     TORCH = "torch"
+ 
+     def is_auto(self) -> bool:
+@@ -89,12 +90,17 @@ class Bf16GemmBackend(Enum):
+     def is_gemv(self) -> bool:
+         return self == Bf16GemmBackend.GEMV
+ 
++    def is_sm120gemv(self) -> bool:
++        return self == Bf16GemmBackend.SM120GEMV
++
+ 
+ _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+ _cutedsl_bf16_gemm = None
+ _use_cutedsl_bf16_gemm = None
+ _hopper_bf16_gemv = None
+ _use_hopper_bf16_gemv = None
++_sm120_skinny_gemm = None
++_use_sm120_skinny_gemm = None
+ _splitk_tactic = None
+ _run_splitk_dense = None
+ _direct_default_tactic = None
+@@ -234,6 +240,18 @@ def initialize_bf16_gemm_config() -> None:
+ 
+         _hopper_bf16_gemv = hopper_bf16_gemv
+         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
++    elif backend.is_sm120gemv():
++        if torch.cuda.get_device_capability()[0] != 12:
++            raise ValueError("--bf16-gemm-backend sm120gemv requires SM12x")
++
++        global _sm120_skinny_gemm, _use_sm120_skinny_gemm
++        from sglang.kernels.ops.gemm.sm120_bf16_skinny_gemm import (
++            sm120_skinny_gemm,
++            use_sm120_skinny_gemm,
++        )
++
++        _sm120_skinny_gemm = sm120_skinny_gemm
++        _use_sm120_skinny_gemm = use_sm120_skinny_gemm
+     elif backend.is_cutedsl():
+         if get_exec().deterministic.enable_deterministic_inference:
+             raise ValueError(
+@@ -324,6 +342,8 @@ def _bf16_gemm_dispatch_impl(
+         m, weight.shape[0], weight.shape[1]
+     ):
+         output = _bf16_splitk_gemm(x, weight, bias)
++    elif _use_sm120_skinny_gemm is not None and _use_sm120_skinny_gemm(x, weight):
++        output = _sm120_skinny_gemm(x, weight, bias)
+     elif (
+         _use_hopper_bf16_gemv is not None
+         and bias is None
+@@ -482,7 +502,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+ 
+         elif (
+-            get_bf16_gemm_backend().is_cutedsl()
++            (
++                get_bf16_gemm_backend().is_cutedsl()
++                or get_bf16_gemm_backend().is_sm120gemv()
++            )
+             and x.is_cuda
+             and x.dtype == torch.bfloat16
+             and layer.weight.dtype == torch.bfloat16
+@@ -543,6 +566,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
+             )
+         ):
+             return _bf16_splitk_gemm_out(x, layer.weight, None, output)
++        if (
++            _use_sm120_skinny_gemm is not None
++            and x.is_cuda
++            and x.ndim == 2
++            and output.dtype == torch.bfloat16
++            and output.is_contiguous()
++            and output.shape == (x.shape[0], layer.weight.shape[0])
++            and (bias is None or bias.dtype == torch.bfloat16)
++            and not layer.weight.requires_grad
++            and _use_sm120_skinny_gemm(x, layer.weight)
++        ):
++            return _sm120_skinny_gemm(x, layer.weight, bias, out=output)
+         if (
+             get_bf16_gemm_backend().is_cutedsl()
+             and x.is_cuda

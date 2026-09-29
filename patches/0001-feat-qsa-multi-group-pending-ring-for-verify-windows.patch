@@ -1,0 +1,796 @@
+From 389ad4f455ece1f6a844ac8d6d40096a1abf9df3 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 20:22:50 +0000
+Subject: [PATCH 01/32] feat(qsa): multi-group pending ring for verify windows
+ > compress ratio
+
+The pending index-key ring held exactly compress_ratio rows per request and was
+addressed req_pool_idx * ratio + position % ratio. A forward that writes W
+consecutive positions and compresses the group ending inside that window touches
+up to W + ratio - 1 consecutive positions, so the ring aliases as soon as W > 1.
+
+At the shipped W == ratio == 4 this is already wrong: a verify window covers every
+residue class, so the group completing mid-window is compressed from the NEXT
+groups tokens whenever the committed length is not a multiple of the ratio, i.e.
+on three verify cycles out of four. It is silent, because the compressed key is
+only consumed by the block-selection top-k.
+
+Size the ring R = ratio * ceil((W + ratio - 1) / ratio) and address position % R,
+in the eager builders, the CUDA-graph Triton kernel, the graph-replay host
+fallback and the PD pending-state transfer infos (whose page is one requests
+whole ring, not one group). Relax the target-verify guard to W <= R - ratio + 1.
+W == 1 keeps the historical ratio-sized layout bit for bit.
+SGLANG_QSA_PENDING_RING_SLOTS pins the old ring for an A/B against an older build.
+
+topk > 1 is still rejected: tree verify multiplies the routed-expert union.
+
+Adds 117 CPU tests that drive the production slot builders over prefill lengths,
+verify widths 1-8, exhaustive accept patterns and rejection/rollback streams, and
+that assert the ratio-sized ring aliases, so the sizing cannot be reverted quietly.
+---
+ python/sglang/srt/environ.py                  |   4 +
+ .../sglang/srt/layers/attention/qsa/config.py |  67 ++++
+ .../layers/attention/qsa/graph_metadata.py    |   9 +-
+ .../srt/layers/attention/qsa/metadata.py      |  30 +-
+ .../srt/layers/attention/qsa/qsa_indexer.py   |  13 +
+ .../attention/qwen_sparse_attn_backend.py     |  52 +++-
+ python/sglang/srt/mem_cache/qsa_kv_pool.py    |  31 +-
+ .../unit/attention/test_qsa_pending_ring.py   | 292 ++++++++++++++++++
+ 8 files changed, 479 insertions(+), 19 deletions(-)
+ create mode 100644 test/registered/unit/attention/test_qsa_pending_ring.py
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 9af31ca..fbd02c7 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1558,6 +1558,10 @@ class Envs:
+     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
+     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
++    # Pin the Qwen QSA pending index-key ring to a fixed row count per request.
++    # 0 derives it from the compress ratio and the verify window. Set it only to
++    # reproduce an older build's addressing in an A/B.
++    SGLANG_QSA_PENDING_RING_SLOTS = EnvInt(0)
+     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+diff --git a/python/sglang/srt/layers/attention/qsa/config.py b/python/sglang/srt/layers/attention/qsa/config.py
+index 42df016..d5088b5 100644
+--- a/python/sglang/srt/layers/attention/qsa/config.py
++++ b/python/sglang/srt/layers/attention/qsa/config.py
+@@ -33,6 +33,70 @@ class QSAProfile(msgspec.Struct, frozen=True):
+         return self.budget // self.compress_ratio
+ 
+ 
++def qsa_pending_ring_size(compress_ratio: int, num_draft_tokens: int = 0) -> int:
++    """Rows per request in the pending index-key ring.
++
++    The ring is addressed by ``position % ring_size``, so it is collision-free
++    exactly when every position that must be live at the same instant has a
++    distinct residue.  A forward writes a window of ``W`` consecutive positions
++    and compresses the group whose last member lands inside that window; the
++    group's ``compress_ratio`` members may start up to ``compress_ratio - 1``
++    positions before the window.  Window and group therefore cover at most
++    ``W + compress_ratio - 1`` consecutive positions, and that span is the
++    minimum ring size.  Round up to whole groups so request rows stay
++    group-aligned.
++
++    ``num_draft_tokens <= 1`` (plain decode) reproduces the historical
++    ``ring_size == compress_ratio`` layout, where the window is one token and
++    the ring holds exactly the pending group.
++    """
++    if compress_ratio <= 0:
++        raise ValueError(f"QSA compress ratio must be positive, got {compress_ratio}")
++    window = max(int(num_draft_tokens), 1)
++    span = window + compress_ratio - 1
++    return compress_ratio * -(-span // compress_ratio)
++
++
++def qsa_max_draft_tokens(compress_ratio: int, ring_size: int) -> int:
++    """Widest verify window a ring of ``ring_size`` rows can serve."""
++    return max(1, ring_size - compress_ratio + 1)
++
++
++def resolve_qsa_pending_ring_size(compress_ratio: int) -> int:
++    """Ring size under the published spec config.
++
++    The pool allocates by this and the attention backend addresses by it, so
++    both must call the same function.  ``SGLANG_QSA_PENDING_RING_SLOTS``
++    pins the ring for A/B runs against an older build; it is an override, not a
++    tuning knob, and a value below ``compress_ratio`` is rejected.
++    """
++    from sglang.srt.environ import envs
++    from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
++
++    override = int(envs.SGLANG_QSA_PENDING_RING_SLOTS.get() or 0)
++    if override > 0:
++        if override < compress_ratio:
++            raise ValueError(
++                "SGLANG_QSA_PENDING_RING_SLOTS must be at least the QSA compress "
++                f"ratio ({compress_ratio}), got {override}"
++            )
++        return override
++    try:
++        spec = get_spec()
++        algorithm = spec.speculative_algorithm
++    except Exception:
++        # No published configuration (unit tests, offline pool construction):
++        # the decode-only ring is the safe minimum, and a speculative runtime
++        # always has the config bag by the time it builds a pool.
++        return qsa_pending_ring_size(compress_ratio, 0)
++    if algorithm is None:
++        return qsa_pending_ring_size(compress_ratio, 0)
++    num_draft_tokens = max_speculative_num_draft_tokens() or (
++        spec.speculative_num_draft_tokens or 0
++    )
++    return qsa_pending_ring_size(compress_ratio, num_draft_tokens)
++
++
+ def _text_config(config):
+     return getattr(config, "text_config", config)
+ 
+@@ -96,6 +160,9 @@ def is_qwen_qsa(config) -> bool:
+ 
+ __all__ = [
+     "QSAProfile",
++    "qsa_max_draft_tokens",
++    "qsa_pending_ring_size",
++    "resolve_qsa_pending_ring_size",
+     "is_qwen_qsa",
+     "parse_qsa_profile",
+ ]
+diff --git a/python/sglang/srt/layers/attention/qsa/graph_metadata.py b/python/sglang/srt/layers/attention/qsa/graph_metadata.py
+index dc91f87..4b67a44 100644
+--- a/python/sglang/srt/layers/attention/qsa/graph_metadata.py
++++ b/python/sglang/srt/layers/attention/qsa/graph_metadata.py
+@@ -111,6 +111,7 @@ def _qsa_graph_row_metadata_kernel(
+     req_to_token_row_stride,
+     max_pages,
+     RATIO: tl.constexpr,
++    RING: tl.constexpr,  # pending-ring rows per request (>= RATIO)
+     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+     PAGE_BLOCK: tl.constexpr,
+ ):
+@@ -131,11 +132,12 @@ def _qsa_graph_row_metadata_kernel(
+     tl.store(write_locs_ptr + row, write_loc)
+ 
+     tl.store(logical_positions_ptr + row, current)
+-    tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
++    # A group always has RATIO members; only their ring addressing uses RING.
++    tl.store(state_slots_ptr + row, req * RING + (current % RING).to(tl.int64))
+     ring_base = row.to(tl.int64) * RATIO
+     for k in tl.static_range(RATIO):
+         member = tl.maximum(current - (RATIO - 1 - k), 0)
+-        slot = req * RATIO + (member % RATIO).to(tl.int64)
++        slot = req * RING + (member % RING).to(tl.int64)
+         tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
+ 
+     # Page-table entries are the request's FULL-KV page ids, read from the
+@@ -213,6 +215,9 @@ def launch_graph_metadata(
+         req_to_token.stride(0),
+         max_pages,
+         RATIO=indexer.compress_ratio,
++        RING=int(
++            getattr(pool, "qsa_pending_ring_size", None) or indexer.compress_ratio
++        ),
+         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+         PAGE_BLOCK=128,
+         num_warps=1,
+diff --git a/python/sglang/srt/layers/attention/qsa/metadata.py b/python/sglang/srt/layers/attention/qsa/metadata.py
+index a9e3270..eab8eaa 100644
+--- a/python/sglang/srt/layers/attention/qsa/metadata.py
++++ b/python/sglang/srt/layers/attention/qsa/metadata.py
+@@ -67,6 +67,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
+     compress_ratio: int
+     block_topk: int
+     req_pool_indices: Optional[torch.Tensor] = None
++    # Rows per request in the pending index-key ring; None means the historical
++    # decode-only layout where the ring is exactly one compression group.
++    pending_ring_size: Optional[int] = None
+     # Parallel per-group arrays for the groups compressed this forward:
+     # slot, sequence-local group-end position, and owning metadata row.
+     # The first member's token row in this forward's packed tensors is extend only,
+@@ -219,6 +222,11 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
+         )
+ 
+ 
++def resolve_ring_size(ring_size: Optional[int], compress_ratio: int) -> int:
++    """``ring_size`` with the historical decode-only default."""
++    return compress_ratio if ring_size is None else int(ring_size)
++
++
+ def build_pending_ring_slots(
+     *,
+     token_to_batch_idx: torch.Tensor,
+@@ -227,18 +235,23 @@ def build_pending_ring_slots(
+     logical_positions: torch.Tensor,
+     compress_ratio: int,
+     is_extend: bool,
++    ring_size: Optional[int] = None,
+ ) -> torch.Tensor:
+-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
+-    On extend, tokens before the pending tail dump into rows [0, ratio),
++    """Pending-ring slot ``req_pool_idx * ring + position % ring`` per token.
++    ``ring`` is the per-request row count of the pending ring, which is
++    ``compress_ratio`` for plain decode and wider once a verify window writes
++    several positions at once (see ``qsa_pending_ring_size``).
++    On extend, tokens before the pending tail dump into rows [0, ring),
+     which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
++    ring = resolve_ring_size(ring_size, compress_ratio)
+     rows = token_to_batch_idx.long()[: logical_positions.numel()]
+     requests = req_pool_indices.long()[rows]
+     positions = logical_positions.long()
+-    slots = requests * compress_ratio + positions % compress_ratio
++    slots = requests * ring + positions % ring
+     if is_extend:
+         lengths = sequence_lengths.long()[rows]
+         pending = positions >= (lengths // compress_ratio) * compress_ratio
+-        slots = torch.where(pending, slots, positions % compress_ratio)
++        slots = torch.where(pending, slots, positions % ring)
+     return slots
+ 
+ 
+@@ -248,8 +261,12 @@ def build_group_ring_slots(
+     group_end_positions: torch.Tensor,
+     sequence_ids: torch.Tensor,
+     compress_ratio: int,
++    ring_size: Optional[int] = None,
+ ) -> torch.Tensor:
+-    """Ring slots of a planned group's members, oldest first."""
++    """Ring slots of a planned group's members, oldest first.
++    A group always has ``compress_ratio`` members; only their ring addressing
++    depends on ``ring_size``."""
++    ring = resolve_ring_size(ring_size, compress_ratio)
+     requests = req_pool_indices.long()[sequence_ids]
+     offsets = torch.arange(
+         compress_ratio - 1,
+@@ -259,7 +276,7 @@ def build_group_ring_slots(
+         dtype=torch.long,
+     )
+     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
+-    return requests[:, None] * compress_ratio + positions % compress_ratio
++    return requests[:, None] * ring + positions % ring
+ 
+ 
+ def build_rope_position_matrix(
+@@ -309,5 +326,6 @@ __all__ = [
+     "build_pending_ring_slots",
+     "build_group_ring_slots",
+     "build_rope_position_matrix",
++    "resolve_ring_size",
+     "compressed_decode_view",
+ ]
+diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+index a308419..b8feecd 100644
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+@@ -253,6 +253,17 @@ class QSAIndexer(MultiPlatformOp):
+             self.rotary_emb.is_neox_style,
+         )
+ 
++    @staticmethod
++    def _ring_size(metadata) -> int:
++        """Ring rows per request: the metadata carries it, and a pool that
++        predates the field falls back to one compression group."""
++        ring = getattr(metadata, "pending_ring_size", None)
++        if ring is None:
++            ring = getattr(
++                metadata.token_to_kv_pool, "qsa_pending_ring_size", None
++            )
++        return metadata.compress_ratio if ring is None else int(ring)
++
+     def _pending_ring_slots(
+         self, metadata, logical_positions: torch.Tensor, is_extend: bool
+     ) -> torch.Tensor:
+@@ -263,6 +274,7 @@ class QSAIndexer(MultiPlatformOp):
+             logical_positions=logical_positions,
+             compress_ratio=self.compress_ratio,
+             is_extend=is_extend,
++            ring_size=self._ring_size(metadata),
+         )
+ 
+     def _group_ring_slots(
+@@ -273,6 +285,7 @@ class QSAIndexer(MultiPlatformOp):
+             group_end_positions=group_end_positions,
+             sequence_ids=sequence_ids,
+             compress_ratio=self.compress_ratio,
++            ring_size=self._ring_size(metadata),
+         )
+ 
+     def update_key_state_and_compress(
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index b6b032d..2d5db3d 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -191,6 +191,10 @@ class QwenSparseAttnBackend(AttentionBackend):
+             if self.qsa_profile is not None
+             else int(getattr(config, "indexer_compress_ratio", 4))
+         )
++        # Rows per request in the pending index-key ring. The pool owns the
++        # allocation; ``pending_ring_size`` reads it from there so both sides
++        # address identically even when the pool is attached after construction.
++        self._pending_ring_size_fallback: Optional[int] = None
+         req_pool = getattr(runner, "req_to_token_pool", None)
+         self.req_to_token = getattr(req_pool, "req_to_token", None)
+         self.req_to_token_pool = req_pool
+@@ -227,6 +231,33 @@ class QwenSparseAttnBackend(AttentionBackend):
+             return False
+         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+ 
++    @property
++    def pending_ring_size(self) -> int:
++        """Rows per request in the pending index-key ring.
++
++        The pool is the allocator and therefore the source of truth; before it
++        is attached, fall back to the published spec config (the same function
++        the pool itself calls, so the two can never disagree)."""
++        ring = getattr(self.token_to_kv_pool, "qsa_pending_ring_size", None)
++        if ring is not None:
++            return int(ring)
++        if self._pending_ring_size_fallback is None:
++            from sglang.srt.layers.attention.qsa.config import (
++                resolve_qsa_pending_ring_size,
++            )
++
++            self._pending_ring_size_fallback = resolve_qsa_pending_ring_size(
++                self.compress_ratio
++            )
++        return self._pending_ring_size_fallback
++
++    @property
++    def max_draft_tokens(self) -> int:
++        """Widest verify window this ring can serve collision-free."""
++        from sglang.srt.layers.attention.qsa.config import qsa_max_draft_tokens
++
++        return qsa_max_draft_tokens(self.compress_ratio, self.pending_ring_size)
++
+     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
+         if forward_mode is None or not forward_mode.is_target_verify():
+             return
+@@ -235,13 +266,15 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
+             )
+         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
+-        if draft_tokens > self.compress_ratio:
+-            # The pending-group ring keys state by position % ratio; a verify
+-            # window wider than the ratio would collide within one forward.
++        if draft_tokens > self.max_draft_tokens:
++            # A verify window of W positions plus the group it completes covers
++            # W + ratio - 1 consecutive positions, all of which must hold a
++            # distinct ring row; see qsa_pending_ring_size.
+             raise NotImplementedError(
+-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
+-                f"compress ratio ({self.compress_ratio}): the pending "
+-                f"index-key ring holds one group; got {draft_tokens}"
++                "Qwen QSA requires speculative_num_draft_tokens <= "
++                f"{self.max_draft_tokens} for a pending index-key ring of "
++                f"{self.pending_ring_size} rows at compress ratio "
++                f"{self.compress_ratio}; got {draft_tokens}"
+             )
+ 
+     @staticmethod
+@@ -676,6 +709,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 logical_positions=ring_logical_positions,
+                 compress_ratio=self.compress_ratio,
+                 is_extend=group_member_rows is not None,
++                ring_size=self.pending_ring_size,
+             )
+             if write_locs.numel():
+                 if group_member_rows is not None:
+@@ -693,6 +727,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                         group_end_positions=group_positions.long(),
+                         sequence_ids=group_sequence_ids.long(),
+                         compress_ratio=self.compress_ratio,
++                        ring_size=self.pending_ring_size,
+                     )
+         indexer_metadata = QSAIndexerMetadata(
+             sequence_lengths=sequence_lengths,
+@@ -703,6 +738,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+             block_topk=self.token_to_kv_pool.qsa_block_topk,
+             req_pool_indices=row_req_pool_indices,
++            pending_ring_size=self.pending_ring_size,
+             write_locs=write_locs,
+             compress_group_positions=group_positions,
+             compress_sequence_ids=group_sequence_ids,
+@@ -887,6 +923,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+             compress_ratio=pool.qsa_compress_ratio,
+             block_topk=pool.qsa_block_topk,
+             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
++            pending_ring_size=self.pending_ring_size,
+             is_cuda_graph=True,
+             graph_write_locs=self._graph_write_locs[:metadata_rows],
+             graph_compressed_page_table=self._graph_compressed_page_table[
+@@ -1084,6 +1121,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+         metadata.graph_write_locs.copy_(write_locs.to(torch.int32))
+ 
+         metadata.decode_logical_positions.copy_(current_positions.to(torch.int32))
++        ring_size = self.pending_ring_size
+         metadata.pending_ring_slots.copy_(
+             build_pending_ring_slots(
+                 token_to_batch_idx=metadata.token_to_batch_idx,
+@@ -1092,6 +1130,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 logical_positions=current_positions,
+                 compress_ratio=ratio,
+                 is_extend=False,
++                ring_size=ring_size,
+             )
+         )
+         metadata.graph_ring_group_locs.copy_(
+@@ -1100,6 +1139,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 group_end_positions=current_positions,
+                 sequence_ids=metadata.token_to_batch_idx.long(),
+                 compress_ratio=ratio,
++                ring_size=ring_size,
+             ).to(torch.int32)
+         )
+ 
+diff --git a/python/sglang/srt/mem_cache/qsa_kv_pool.py b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+index b3e4f60..1e46544 100644
+--- a/python/sglang/srt/mem_cache/qsa_kv_pool.py
++++ b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+@@ -14,6 +14,11 @@ from typing import List, Optional
+ import torch
+ 
+ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
++from sglang.srt.layers.attention.qsa.config import (
++    qsa_max_draft_tokens,
++    qsa_pending_ring_size,
++    resolve_qsa_pending_ring_size,
++)
+ from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+ 
+ # State layer IDs are serialized as uint32 by the disaggregation protocols.
+@@ -62,6 +67,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         qsa_compress_ratio: int,
+         qsa_token_topk: int,
+         num_request_slots: int,
++        qsa_pending_ring_slots: Optional[int] = None,
+         enable_memory_saver: bool = False,
+         enable_kv_cache_copy: bool = False,
+         start_layer: Optional[int] = None,
+@@ -123,15 +129,27 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
+         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
+         # Pre-compression index-K state is a per-request ring, not a per-token cache:
+-        # only the pending group's ``ratio`` members must survive a forward,
+-        # addressed as ``req_pool_idx * ratio + position % ratio``.
+-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
++        # every position a forward may still need must survive it, addressed as
++        # ``req_pool_idx * ring_size + position % ring_size``.  Plain decode needs
++        # only the pending group (``ring_size == ratio``); a verify window of W
++        # draft tokens needs ``W + ratio - 1`` rows, see ``qsa_pending_ring_size``.
++        # Request slot 0 is never allocated, so rows [0, ring_size) are the inert dump.
+         if num_request_slots <= 0:
+             raise ValueError(
+                 f"QSA pending ring needs request slots, got {num_request_slots}"
+             )
+         self.qsa_num_request_slots = int(num_request_slots)
+-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
++        self.qsa_pending_ring_size = int(
++            qsa_pending_ring_slots
++            if qsa_pending_ring_slots is not None
++            else resolve_qsa_pending_ring_size(self.qsa_compress_ratio)
++        )
++        if self.qsa_pending_ring_size < self.qsa_compress_ratio:
++            raise ValueError(
++                "the QSA pending ring must hold at least one compression group: "
++                f"ring={self.qsa_pending_ring_size}, ratio={self.qsa_compress_ratio}"
++            )
++        ring_slots = self.qsa_num_request_slots * self.qsa_pending_ring_size
+         # These buffers participate in Mooncake PD transfer just like the base
+         # KV and Mamba pools.  Keep their allocation in the same memory-saver
+         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
+@@ -239,10 +257,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         # its zero-initialized or stale contents.
+         if not self.full_attention_layer_id_mapping:
+             return [], [], []
++        # The transfer unit is one request's whole ring, so the "page" is
++        # ``ring_size`` rows -- not the compression ratio, which is only the
++        # ring's lower bound (plain decode).
+         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+         return self._get_paged_state_buf_infos(
+             tensors,
+-            self.qsa_compress_ratio,
++            self.qsa_pending_ring_size,
+         )
+ 
+     def get_qsa_pending_state_layer_ids(self):
+diff --git a/test/registered/unit/attention/test_qsa_pending_ring.py b/test/registered/unit/attention/test_qsa_pending_ring.py
+new file mode 100644
+index 0000000..f721a58
+--- /dev/null
++++ b/test/registered/unit/attention/test_qsa_pending_ring.py
+@@ -0,0 +1,292 @@
++"""Pure-index tests for the QSA pending index-key ring.
++
++The ring stores one raw index key per *live* position and is addressed by
++``req_pool_idx * ring_size + position % ring_size``.  Everything below drives
++the production builders (``build_pending_ring_slots`` /
++``build_group_ring_slots``) on CPU tensors and checks the one property the
++compression step depends on: when a forward compresses the group ending at
++position ``p``, the ring rows named for positions ``p - ratio + 1 .. p`` still
++hold *those* positions' keys and no others.
++
++The simulation writes a position tag instead of a key, so a collision is
++observable exactly where the real pool would silently compress the wrong keys.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++from sglang.srt.layers.attention.qsa.metadata import (
++    build_group_ring_slots,
++    build_pending_ring_slots,
++)
++from sglang.srt.layers.attention.qsa.config import (
++    qsa_max_draft_tokens,
++    qsa_pending_ring_size,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=20, suite="base-a-test-cpu")
++
++RATIO = 4
++# Request pool slot 0 is never allocated; it is the inert dump.
++REQ = 3
++EMPTY = -1
++
++
++class RingSim:
++    """One request's pending ring, driven by the production slot builders."""
++
++    def __init__(self, ring_size: int, ratio: int = RATIO, num_requests: int = 8):
++        self.ring_size = ring_size
++        self.ratio = ratio
++        self.slots = torch.full((num_requests * ring_size,), EMPTY, dtype=torch.long)
++        self.compressions: list[tuple[int, list[int]]] = []
++
++    def _pending_slots(self, positions, lengths, is_extend):
++        rows = torch.arange(positions.numel(), dtype=torch.long)
++        return build_pending_ring_slots(
++            token_to_batch_idx=rows,
++            req_pool_indices=torch.full((positions.numel(),), REQ, dtype=torch.long),
++            sequence_lengths=lengths,
++            logical_positions=positions,
++            compress_ratio=self.ratio,
++            is_extend=is_extend,
++            ring_size=self.ring_size,
++        )
++
++    def _group_slots(self, group_end_positions):
++        n = group_end_positions.numel()
++        return build_group_ring_slots(
++            req_pool_indices=torch.full((n,), REQ, dtype=torch.long),
++            group_end_positions=group_end_positions,
++            sequence_ids=torch.arange(n, dtype=torch.long),
++            compress_ratio=self.ratio,
++            ring_size=self.ring_size,
++        )
++
++    def forward(self, first_position: int, width: int, is_extend: bool = False):
++        """One forward over ``width`` consecutive positions.
++
++        Mirrors ``QSAIndexer.update_key_state_and_compress``: every row's state
++        is stored first, then every completed group is compressed out of the
++        ring.  Returns the list of (group_end_position, member_tags) it read.
++        """
++        positions = torch.arange(
++            first_position, first_position + width, dtype=torch.long
++        )
++        lengths = positions + 1
++        if is_extend:
++            # Extend rows carry the whole request length, not a per-row length.
++            lengths = torch.full_like(positions, first_position + width)
++
++        slots = self._pending_slots(positions, lengths, is_extend)
++        self.slots[slots] = positions
++
++        # A paged row completes the group its length ends; extend reads its
++        # members from the packed chunk instead of the ring, so only the paged
++        # (decode / speculative) path is a ring consumer.
++        read = []
++        if not is_extend:
++            boundary = positions[(positions + 1) % self.ratio == 0]
++            if boundary.numel():
++                group_slots = self._group_slots(boundary)
++                for row, end in enumerate(boundary.tolist()):
++                    members = self.slots[group_slots[row]].tolist()
++                    read.append((end, members))
++                    self.compressions.append((end, members))
++        return read
++
++    @staticmethod
++    def expected_members(group_end: int, ratio: int = RATIO) -> list[int]:
++        return list(range(group_end - ratio + 1, group_end + 1))
++
++
++def run_stream(ring_size, prefill_len, window, accepts, ratio=RATIO):
++    """Prefill, then verify windows committing ``accepts[i]`` tokens each."""
++    sim = RingSim(ring_size, ratio=ratio)
++    sim.forward(0, prefill_len, is_extend=True)
++    committed = prefill_len
++    for accept in accepts:
++        sim.forward(committed, window)
++        committed += accept
++    return sim
++
++
++def assert_all_groups_correct(sim, ratio=RATIO):
++    for end, members in sim.compressions:
++        assert members == RingSim.expected_members(end, ratio), (
++            f"group ending at {end} compressed positions {members}, "
++            f"expected {RingSim.expected_members(end, ratio)}"
++        )
++
++
++# --------------------------------------------------------------------------
++# ring size formula
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("window", list(range(1, 17)))
++def test_ring_size_covers_window_plus_group(window):
++    ring = qsa_pending_ring_size(RATIO, window)
++    # The window and the group it completes span at most W + ratio - 1
++    # consecutive positions, every one of which needs its own row.
++    assert ring >= window + RATIO - 1
++    assert ring % RATIO == 0
++    # And it is the tightest such multiple of the ratio.
++    assert ring - RATIO < window + RATIO - 1
++
++
++def test_ring_size_is_unchanged_without_speculation():
++    assert qsa_pending_ring_size(RATIO, 0) == RATIO
++    assert qsa_pending_ring_size(RATIO, 1) == RATIO
++
++
++def test_declared_window_matches_ring():
++    for window in range(1, 17):
++        ring = qsa_pending_ring_size(RATIO, window)
++        assert qsa_max_draft_tokens(RATIO, ring) >= window
++
++
++# --------------------------------------------------------------------------
++# collision freedom of the addressing itself
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("window", list(range(1, 9)))
++def test_live_positions_have_distinct_rows(window):
++    """Every position a forward may still need maps to its own ring row."""
++    ring = qsa_pending_ring_size(RATIO, window)
++    for first in range(0, 4 * RATIO + window + 1):
++        # Window positions, plus the earlier members of a group the window
++        # completes (at most ratio - 1 of them).
++        live = list(range(first - RATIO + 1, first + window))
++        live = [position for position in live if position >= 0]
++        rows = {position % ring for position in live}
++        assert len(rows) == len(live), (
++            f"window={window} ring={ring} first={first}: "
++            f"{len(live)} live positions share {len(rows)} rows"
++        )
++
++
++# --------------------------------------------------------------------------
++# end-to-end streams
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("window", list(range(1, 9)))
++@pytest.mark.parametrize("prefill_len", [1, 2, 3, 4, 5, 7, 8, 9, 16, 17])
++def test_every_group_compresses_its_own_members(window, prefill_len):
++    ring = qsa_pending_ring_size(RATIO, window)
++    # Walk every accept length, so the committed length visits every residue.
++    accepts = [1 + (step % window) for step in range(12)]
++    sim = run_stream(ring, prefill_len, window, accepts)
++    assert sim.compressions, "the stream compressed no group at all"
++    assert_all_groups_correct(sim)
++
++
++@pytest.mark.parametrize("window", [4, 5, 6, 8])
++def test_exhaustive_accept_patterns(window):
++    """Four cycles of every accept pattern, for the widths we intend to run."""
++    import itertools
++
++    ring = qsa_pending_ring_size(RATIO, window)
++    for prefill_len in (1, 4, 6):
++        for accepts in itertools.product(range(1, window + 1), repeat=3):
++            sim = run_stream(ring, prefill_len, window, accepts)
++            assert_all_groups_correct(sim)
++
++
++@pytest.mark.parametrize("window", [4, 5, 6, 8])
++def test_rejected_tokens_never_corrupt_the_committed_prefix(window):
++    """A rejected draft must not damage the group its committed neighbours are in.
++
++    After a verify that accepts ``k < W``, positions ``L+k .. L+W-1`` were
++    written to the ring and then abandoned.  The next verify re-writes them with
++    the newly drafted tokens, and any group that completes afterwards must still
++    read the committed positions -- never a leftover from the rejected chain.
++    """
++    ring = qsa_pending_ring_size(RATIO, window)
++    for prefill_len in range(1, 2 * RATIO + 1):
++        for accept in range(1, window + 1):
++            sim = RingSim(ring)
++            sim.forward(0, prefill_len, is_extend=True)
++            committed = prefill_len
++            # Cycle 1: write the full window, commit only `accept` of it.
++            sim.forward(committed, window)
++            committed += accept
++            # Cycles 2-4: the abandoned rows are still in the ring.
++            for _ in range(3):
++                sim.forward(committed, window)
++                committed += accept
++            assert_all_groups_correct(sim)
++
++
++def test_draft_extend_window_shares_the_ring_bound():
++    """DRAFT_EXTEND_V2 writes a full ``num_draft_tokens`` window per request,
++    so the MTP layer's ring needs the same size as the target layers'."""
++    for window in range(1, 9):
++        ring = qsa_pending_ring_size(RATIO, window)
++        sim = RingSim(ring)
++        sim.forward(0, 6, is_extend=True)
++        committed = 6
++        for accept in (1, window, 2, 3):
++            accept = min(accept, window)
++            # Draft-extend covers the same W positions the verify did.
++            sim.forward(committed, window)
++            committed += accept
++        assert_all_groups_correct(sim)
++
++
++# --------------------------------------------------------------------------
++# the regression this sizing exists to prevent
++# --------------------------------------------------------------------------
++
++
++def test_ratio_sized_ring_aliases_once_the_window_is_wider_than_one():
++    """A ring of exactly ``ratio`` rows cannot serve a multi-token window.
++
++    This pins the reason the default ring grew.  With ``ring == ratio`` a verify
++    window of W == ratio covers every residue class, so the members of the group
++    that completes mid-window are overwritten -- by positions from the *next*
++    group -- before the compression reads them.  It is silent: the compressed
++    key is well-formed, just built from the wrong tokens.
++    """
++    window = RATIO
++    corrupted = []
++    for first in range(1, RATIO):  # committed length not on a group boundary
++        sim = RingSim(RATIO)
++        sim.forward(0, first, is_extend=True)
++        sim.forward(first, window)
++        for end, members in sim.compressions:
++            if members != RingSim.expected_members(end):
++                corrupted.append((first, end, members))
++    assert corrupted, (
++        "expected the ratio-sized ring to alias for every unaligned committed "
++        "length; if this no longer reproduces, the ring sizing can be reverted"
++    )
++    assert len(corrupted) == RATIO - 1
++
++    # The same streams are clean once the ring is sized for the window.
++    ring = qsa_pending_ring_size(RATIO, window)
++    for first in range(1, RATIO):
++        sim = RingSim(ring)
++        sim.forward(0, first, is_extend=True)
++        sim.forward(first, window)
++        assert_all_groups_correct(sim)
++
++
++def test_extend_dump_rows_belong_to_no_request():
++    """Non-pending extend tokens land in rows [0, ring), which request slot 0
++    owns and no allocated request ever addresses."""
++    for window in (1, 4, 8):
++        ring = qsa_pending_ring_size(RATIO, window)
++        sim = RingSim(ring)
++        positions = torch.arange(11, dtype=torch.long)
++        lengths = torch.full_like(positions, 11)
++        slots = sim._pending_slots(positions, lengths, is_extend=True)
++        pending = positions >= (11 // RATIO) * RATIO
++        assert (slots[~pending] < ring).all()
++        assert (slots[pending] >= REQ * ring).all()
++        assert (slots[pending] < (REQ + 1) * ring).all()

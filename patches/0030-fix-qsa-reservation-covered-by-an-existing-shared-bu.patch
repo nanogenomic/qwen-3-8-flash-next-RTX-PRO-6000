@@ -1,0 +1,97 @@
+From f6bcb9292f5319d6966e69d85f905c978da605df Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 00:40:16 +0000
+Subject: [PATCH 30/32] fix(qsa): reservation covered by an existing shared
+ buffer is idempotent
+
+FlashInfer autotune hands out the shared packed-KV scratch before
+init_cuda_graph_state reserves, so the boot-time reservation of the same
+size raised already allocated at 33792 rows when a backend reserved 33792.
+A reservation <= the allocated size now succeeds; only a larger one raises.
+Adds allocate-then-reserve equal/smaller/larger tests and a boot-order smoke
+(autotune handout -> every tier reserves -> per-tier capture handout).
+---
+ .../layers/attention/qsa/shared_scratch.py    | 12 +++--
+ .../speculative/test_adaptive_shared_ws.py    | 46 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/shared_scratch.py b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+index 5ef80e3..05f98d7 100644
+--- a/python/sglang/srt/layers/attention/qsa/shared_scratch.py
++++ b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+@@ -158,10 +158,14 @@ class QSASharedScratchPlan:
+         rows = int(rows)
+         self.reserve_calls += 1
+         if rows > self.reserved_rows:
+-            if self._allocated_rows:
+-                # A backend asked for more than an already-captured buffer holds.
+-                # Growing it would strand the graphs that baked in the old
+-                # pointer, so refuse here where it is still a config error.
++            # A buffer may already exist before any reservation: FlashInfer
++            # autotune runs a forward (and so a handout) before
++            # init_cuda_graph_state reserves. A reservation the existing buffer
++            # already covers is satisfied as-is (idempotent); only one that
++            # would need a LARGER buffer is refused, because growing it would
++            # strand graphs that baked in the old pointer.
++            covered = min(self._allocated_rows.values()) if self._allocated_rows else None
++            if covered is not None and rows > covered:
+                 raise ValueError(
+                     "QSA shared packed-KV scratch was already allocated at "
+                     f"{max(self._allocated_rows.values())} rows when a backend "
+diff --git a/test/registered/unit/speculative/test_adaptive_shared_ws.py b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+index 2bacedc..060b97f 100644
+--- a/test/registered/unit/speculative/test_adaptive_shared_ws.py
++++ b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+@@ -315,6 +315,52 @@ def test_late_reservation_that_would_grow_the_buffer_raises():
+         plan.reserve_rows(MAX_BS * WIDEST_W * _stride())
+ 
+ 
++def test_allocate_then_reserve_equal_succeeds():
++    """Boot order on GPU1: FlashInfer autotune hands out the buffer before any
++    reservation, then init_cuda_graph_state reserves the SAME size. Regression for
++    "already allocated at 33792 rows when a backend reserved 33792"."""
++    plan = QSASharedScratchPlan()
++    rows = MAX_BS * WIDEST_W * _stride()
++    k0, _ = plan.packed_kv(rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    assert plan.reserve_rows(rows) == rows
++    k1, _ = plan.packed_kv(rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    assert k1.data_ptr() == k0.data_ptr() and plan.packed_allocations == 1
++
++
++def test_allocate_then_reserve_smaller_succeeds():
++    plan = QSASharedScratchPlan()
++    rows = MAX_BS * WIDEST_W * _stride()
++    plan.packed_kv(rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    plan.reserve_rows(rows // 2)
++    plan.reserve_rows(rows)
++    assert plan.packed_allocations == 1 and plan.overflow_calls == 0
++
++
++def test_boot_order_autotune_then_every_tier_reserves_then_capture():
++    """Smoke of the real boot order: autotune handout at the widest width, then
++    every tier's backend reserves, then each tier's capture hands out its own
++    width. One allocation, one pointer, no raise."""
++    plan = QSASharedScratchPlan()
++    widest = MAX_BS * WIDEST_W * _stride()
++    k0, _ = plan.packed_kv(widest, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    for s in CANDIDATE_STEPS:
++        plan.reserve_rows(MAX_BS * _w(s) * _stride())
++    for s in CANDIDATE_STEPS:
++        k, _ = plan.packed_kv(
++            MAX_BS * _w(s) * _stride(), KV_HEADS, HEAD_DIM, DTYPE, _cpu()
++        )
++        assert k.data_ptr() == k0.data_ptr()
++    assert plan.packed_allocations == 1 and plan.overflow_calls == 0
++
++
++def test_allocate_then_reserve_larger_still_raises():
++    plan = QSASharedScratchPlan()
++    rows = MAX_BS * 4 * _stride()
++    plan.packed_kv(rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    with pytest.raises(ValueError):
++        plan.reserve_rows(rows + 1)
++
++
+ def test_reservation_is_idempotent_and_order_free():
+     plan_a = QSASharedScratchPlan()
+     plan_b = QSASharedScratchPlan()

@@ -1,0 +1,176 @@
+From bf9f3e6f878f06db0494f9722f7fa7f0c08fac36 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 00:07:26 +0000
+Subject: [PATCH 28/32] fix(qsa): bound the shared reservation by the widest
+ reachable batch
+
+init_cuda_graph_state reserved from the calling backend's OWN geometry, and both
+axes are narrower than the process-wide worst case. The window was already scaled
+up by max_speculative_num_draft_tokens; the batch was not.
+
+get_batch_sizes_to_capture filters the configured graph batch sizes by
+bs * captured_req_width % alignment. The target verify runner passes
+captured_req_width = W and the draft runner passes 1, so with an alignment above 1
+the two resolve different max_bs -- and whichever reserved second would be asking
+to GROW a buffer the first one's graphs had already captured, which the plan
+refuses. That is a boot failure, on a code path whose whole point is to let the
+boot succeed.
+
+Reservations now take widest_batch: the configured graph-bs list unioned with the
+admission cap. Every backend in the process therefore lands on the same row count
+regardless of order, and covering the admission cap also means an eager verify
+wider than every captured graph is served from shared storage instead of falling
+back to a private buffer -- so the fallback path is now unreachable in practice
+rather than merely harmless.
+
+At B3c-4 (graph bs 4 = mrr 4) the number is unchanged: 67584 rows / 132 MiB.
+Tests: 19 pass in the serving venv (new case asserts six different (bs, per_req) pairs
+reserve one number, and that without the bound the plan refuses the second
+reservation). GPU2 equivalence re-passes -- 1 allocation, 138412032 bytes, all
+four tiers plus the interleave bitwise equal, 0.29 GiB peak, 5.1 s.
+---
+ .../layers/attention/qsa/shared_scratch.py    | 24 +++++++---
+ .../attention/qwen_sparse_attn_backend.py     | 26 ++++++++++
+ .../speculative/test_adaptive_shared_ws.py    | 47 +++++++++++++++++++
+ 3 files changed, 91 insertions(+), 6 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/shared_scratch.py b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+index 5b43d13..5ef80e3 100644
+--- a/python/sglang/srt/layers/attention/qsa/shared_scratch.py
++++ b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+@@ -314,19 +314,31 @@ def deepest_packed_kv_rows(
+     max_num_tokens: int,
+     expanded_topk: int,
+     widest_num_draft_tokens: Optional[int] = None,
++    widest_batch: Optional[int] = None,
+ ) -> int:
+-    """Packed-KV rows the DEEPEST reachable tier needs.
++    """Packed-KV rows the widest reachable (batch x verify window) needs.
+ 
+     ``init_cuda_graph_state`` is called once per backend with that backend's own
+-    verify window, which under adaptive speculation is the *active* tier's, not
+-    the widest one. Scaling ``max_num_tokens`` back up to the widest reachable
+-    window is what lets the first allocation be the last one.
++    geometry, and BOTH axes are narrower than the process-wide worst case:
++
++      * the window is the *active* tier's under adaptive speculation, so it is
++        scaled up by ``widest_num_draft_tokens``;
++      * the batch is that runner's FILTERED capture list. The target verify runner
++        filters the configured bs by ``bs * W % alignment`` while the draft runner
++        filters by ``bs * 1``, so the two can resolve different ``max_bs`` --- and
++        whichever reserved second would be asking to GROW a buffer the first one's
++        graphs had already captured, which is refused. ``widest_batch`` (the
++        configured graph-bs list unioned with the admission cap) removes that
++        ordering dependence, and covering the admission cap also means an eager
++        verify above every captured graph batch is served from shared storage
++        instead of falling back to a private buffer.
+     """
+     max_bs = max(1, int(max_bs))
+     max_num_tokens = max(1, int(max_num_tokens))
+     per_req = max(1, max_num_tokens // max_bs)
+-    widest = max(per_req, int(widest_num_draft_tokens or 0))
+-    tokens = max(max_num_tokens, max_bs * widest)
++    widest_w = max(per_req, int(widest_num_draft_tokens or 0))
++    widest_bs = max(max_bs, int(widest_batch or 0))
++    tokens = max(max_num_tokens, widest_bs * widest_w)
+     return packed_kv_rows(tokens, expanded_topk)
+ 
+ 
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index db5e096..5aa80ec 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -908,9 +908,35 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 max_num_tokens=max_num_tokens,
+                 expanded_topk=expanded_topk,
+                 widest_num_draft_tokens=widest,
++                widest_batch=self._widest_reachable_batch(max_bs),
+             )
+         )
+ 
++    def _widest_reachable_batch(self, max_bs: int) -> int:
++        """Widest batch ANY runner in this process could present.
++
++        Not this backend's own filtered capture list: the target verify runner
++        filters the configured graph batch sizes by ``bs * W`` and the draft
++        runner by ``bs * 1``, so they can resolve different maxima, and the one
++        that reserved second would be asking to grow an already-captured buffer.
++        The admission cap is included too, so an eager verify wider than every
++        captured graph is still served from shared storage.
++        """
++        widest = int(max_bs)
++        try:
++            from sglang.srt.runtime_context import get_exec
++
++            cfg = get_exec().graph.cuda_graph_config
++            if cfg is not None and cfg.decode.bs:
++                widest = max(widest, max(int(b) for b in cfg.decode.bs))
++        except Exception:
++            pass
++        try:
++            widest = max(widest, int(getattr(self.runner, "max_running_requests", 0) or 0))
++        except Exception:
++            pass
++        return widest
++
+     def _capture_cuda_graph_metadata(
+         self,
+         *,
+diff --git a/test/registered/unit/speculative/test_adaptive_shared_ws.py b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+index a10e790..2bacedc 100644
+--- a/test/registered/unit/speculative/test_adaptive_shared_ws.py
++++ b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+@@ -192,6 +192,53 @@ def test_draft_decode_backends_reserve_the_same_rows():
+     assert draft_rows == MAX_BS * WIDEST_W * _stride()
+ 
+ 
++def test_reservation_is_independent_of_the_runners_filtered_capture_list():
++    """Target and draft runners can resolve DIFFERENT max_bs, and the one that
++    reserves second must not be asking to grow an already-captured buffer.
++
++    ``get_batch_sizes_to_capture`` filters the configured graph bs by
++    ``bs * captured_req_width % alignment``; the target verify runner passes
++    ``captured_req_width = W`` and the draft runner passes 1, so with an alignment
++    > 1 their surviving lists differ. ``widest_batch`` is what makes both
++    reservations land on the same number.
++    """
++    widest_bs = 8  # configured graph bs list max / admission cap
++    rows = [
++        deepest_packed_kv_rows(
++            max_bs=bs,
++            max_num_tokens=bs * per_req,
++            expanded_topk=EXPANDED_TOPK,
++            widest_num_draft_tokens=WIDEST_W,
++            widest_batch=widest_bs,
++        )
++        # target verify at its own bs and W, and the draft chain at bs x topk=1
++        for bs, per_req in [(2, 4), (4, 4), (8, 8), (4, 1), (8, 1), (1, 1)]
++    ]
++    assert len(set(rows)) == 1
++    assert rows[0] == widest_bs * WIDEST_W * _stride()
++
++    # Without the bound, the wider runner reserves more and the plan refuses it.
++    plan = QSASharedScratchPlan()
++    plan.reserve_rows(
++        deepest_packed_kv_rows(
++            max_bs=4,
++            max_num_tokens=4 * 4,
++            expanded_topk=EXPANDED_TOPK,
++            widest_num_draft_tokens=WIDEST_W,
++        )
++    )
++    plan.packed_kv(plan.reserved_rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    with pytest.raises(ValueError):
++        plan.reserve_rows(
++            deepest_packed_kv_rows(
++                max_bs=8,
++                max_num_tokens=8 * 8,
++                expanded_topk=EXPANDED_TOPK,
++                widest_num_draft_tokens=WIDEST_W,
++            )
++        )
++
++
+ def test_widest_hint_missing_falls_back_to_the_backend_window():
+     """No adaptive capacity published (static boot): the backend's own window."""
+     rows = deepest_packed_kv_rows(

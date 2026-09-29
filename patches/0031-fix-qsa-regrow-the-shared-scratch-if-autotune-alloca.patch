@@ -1,0 +1,109 @@
+From a24d7de63da6fb208eba8ebf7c0b1c13f00bdd01 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 00:44:43 +0000
+Subject: [PATCH 31/32] fix(qsa): regrow the shared scratch if autotune
+ allocated it undersized before capture
+
+Follow-up to 486b099529. Autotune may hand out at the active tier width,
+below the widest reservation made later in init_cuda_graph_state. Until a
+handout happens under CUDA-graph capture no graph holds the pointer, so a
+larger reservation drops the undersized buffer and the next handout
+allocates at the reserved size. After the first captured handout, growth
+still raises. Tests: smaller-then-larger-before-capture regrows; the two
+post-capture growth tests now mark the plan captured.
+---
+ .../layers/attention/qsa/shared_scratch.py    | 22 +++++++++++++++++++
+ .../speculative/test_adaptive_shared_ws.py    | 15 +++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/shared_scratch.py b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+index 05f98d7..6be86e5 100644
+--- a/python/sglang/srt/layers/attention/qsa/shared_scratch.py
++++ b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+@@ -151,6 +151,9 @@ class QSASharedScratchPlan:
+         self.packed_allocations: int = 0
+         self.handout_calls: int = 0
+         self.overflow_calls: int = 0
++        # True once any buffer was handed out while a CUDA graph was capturing;
++        # from then on the buffer address is baked into a graph and must not move.
++        self._captured: bool = False
+ 
+     # -- planning -------------------------------------------------------
+     def reserve_rows(self, rows: int) -> int:
+@@ -165,6 +168,19 @@ class QSASharedScratchPlan:
+             # would need a LARGER buffer is refused, because growing it would
+             # strand graphs that baked in the old pointer.
+             covered = min(self._allocated_rows.values()) if self._allocated_rows else None
++            if covered is not None and rows > covered and not self._captured:
++                # Nothing has been handed out under CUDA-graph capture yet (e.g.
++                # only the autotune warmup allocated), so no graph holds the old
++                # pointer: drop the undersized buffers; the next handout
++                # allocates at the new reservation.
++                logger.info(
++                    "QSA shared packed-KV scratch regrown before capture: %d -> %d rows",
++                    covered,
++                    rows,
++                )
++                self._packed.clear()
++                self._allocated_rows.clear()
++                covered = None
+             if covered is not None and rows > covered:
+                 raise ValueError(
+                     "QSA shared packed-KV scratch was already allocated at "
+@@ -195,6 +211,12 @@ class QSASharedScratchPlan:
+         device = _normalize_device(device)
+         key = (int(num_kv_heads), int(head_dim), dtype, device)
+         self.handout_calls += 1
++        if (
++            not self._captured
++            and torch.cuda.is_available()
++            and torch.cuda.is_current_stream_capturing()
++        ):
++            self._captured = True
+         buffers = self._packed.get(key)
+         if buffers is None:
+             rows = max(capacity, self.reserved_rows)
+diff --git a/test/registered/unit/speculative/test_adaptive_shared_ws.py b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+index 060b97f..4d212c7 100644
+--- a/test/registered/unit/speculative/test_adaptive_shared_ws.py
++++ b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+@@ -228,6 +228,7 @@ def test_reservation_is_independent_of_the_runners_filtered_capture_list():
+         )
+     )
+     plan.packed_kv(plan.reserved_rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    plan._captured = True  # the first runner's graphs were captured
+     with pytest.raises(ValueError):
+         plan.reserve_rows(
+             deepest_packed_kv_rows(
+@@ -311,6 +312,7 @@ def test_late_reservation_that_would_grow_the_buffer_raises():
+     plan = QSASharedScratchPlan()
+     plan.reserve_rows(MAX_BS * 4 * _stride())  # launch width only -- the bug
+     plan.packed_kv(MAX_BS * 4 * _stride(), KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    plan._captured = True  # the first tier's graph was captured
+     with pytest.raises(ValueError):
+         plan.reserve_rows(MAX_BS * WIDEST_W * _stride())
+ 
+@@ -353,10 +355,23 @@ def test_boot_order_autotune_then_every_tier_reserves_then_capture():
+     assert plan.packed_allocations == 1 and plan.overflow_calls == 0
+ 
+ 
++def test_allocate_smaller_then_reserve_larger_before_capture_regrows():
++    """Autotune may hand out at the ACTIVE tier's width, below the widest
++    reservation. Before any capture that is a regrow, not an error."""
++    plan = QSASharedScratchPlan()
++    small = MAX_BS * 4 * _stride()
++    widest = MAX_BS * WIDEST_W * _stride()
++    plan.packed_kv(small, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    assert plan.reserve_rows(widest) == widest
++    k, _ = plan.packed_kv(widest, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    assert k.shape[0] == widest and plan.overflow_calls == 0
++
++
+ def test_allocate_then_reserve_larger_still_raises():
+     plan = QSASharedScratchPlan()
+     rows = MAX_BS * 4 * _stride()
+     plan.packed_kv(rows, KV_HEADS, HEAD_DIM, DTYPE, _cpu())
++    plan._captured = True  # a graph already holds the pointer
+     with pytest.raises(ValueError):
+         plan.reserve_rows(rows + 1)
+ 

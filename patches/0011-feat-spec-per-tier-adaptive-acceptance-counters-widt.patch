@@ -1,0 +1,566 @@
+From 0a3b208b9296e6959c4016dd5a04ed58cd5c5423 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:51:07 +0000
+Subject: [PATCH 11/32] feat(spec): per-tier adaptive acceptance counters,
+ width-correct accept rate
+
+Under adaptive speculation the scheduler's reported accept_rate was a ratio between
+numbers gathered at different widths: num_correct_drafts accumulates over the whole
+log interval, while draft_per_round was read from the CURRENTLY active config at the
+end of it. A switch inside the interval therefore divided one width's accepted drafts
+by another width's capacity. The switch is applied in on_verify_complete_cpu, which
+runs before update_spec_metrics on the same batch, so the active config is not even
+the width that produced the batch being recorded.
+
+Two changes:
+
+1. metrics_reporter accumulates the draft CAPACITY per batch. The caller passes the
+   width from batch.spec_info.draft_token_num -- the batch's own verify input, which
+   is swap-proof. The old active-config denominator remains as the fallback for any
+   path that does not report a width, where it is exact because the width is fixed.
+
+2. AdaptiveSpeculativeParams keeps per-(bs slot, steps) counters, attributed to the
+   pre-update width that actually produced the drafts, and exposes tier_stats() /
+   tier_stats_line(). Set "tier_stats_log_interval" in the adaptive config JSON to
+   have them logged periodically. Without this there is no way to read
+   accept-length-by-tier off a running server: the aggregate accept_len mixes tiers,
+   and the "Adaptive spec params updated" lines only say when a switch happened.
+
+Tests: test/registered/unit/speculative/test_adaptive_wide.py, 22 cases, CPU only,
+driving the production policy and the production QSA ring sizing (no re-implementations).
+Covers the ring-serves-every-tier coupling, the per-state CUDA-graph pruning invariant
+(every graph batch size has its routed tier captured) and its VRAM budget, the derived
+hysteresis (switches on the right side of the modelled break-even, settles rather than
+oscillating, and the bs>=4 slots never widen past the static width), and the per-tier
+counters. Runs under pytest and, with a shim, as a plain script in a venv without pytest.
+---
+ .../batch_result_processor.py                 |  10 +
+ .../scheduler_components/metrics_reporter.py  |  25 +-
+ .../srt/speculative/adaptive_spec_params.py   |  66 ++++
+ .../unit/speculative/test_adaptive_wide.py    | 338 ++++++++++++++++++
+ 4 files changed, 435 insertions(+), 4 deletions(-)
+ create mode 100644 test/registered/unit/speculative/test_adaptive_wide.py
+
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index e0f922f..7035098 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -952,12 +952,22 @@ class SchedulerBatchResultProcessor:
+         num_generated_tokens = result.get_num_generated_tokens(batch_size)
+         self.metrics_reporter.num_generated_tokens += num_generated_tokens
+         if not batch.spec_algorithm.is_none():
++            # The BATCH's own spec_info carries the width that produced these
++            # drafts. Reading the active config here instead would attribute an
++            # adaptive switch (applied above, in on_verify_complete_cpu) to the
++            # batch that preceded it.
++            batch_draft_token_num = getattr(batch.spec_info, "draft_token_num", None)
+             self.metrics_reporter.update_spec_metrics(
+                 batch_size,
+                 result.num_correct_drafts,
+                 num_accept_tokens=num_generated_tokens,
+                 num_block_accept_tokens=result.num_block_accept_tokens,
+                 num_cap_tokens=result.num_cap_tokens,
++                num_drafts_per_req=(
++                    int(batch_draft_token_num) - 1
++                    if batch_draft_token_num is not None
++                    else None
++                ),
+             )
+         if get_observability().enable_metrics:
+             self.metrics_collector.increment_decode_cuda_graph_pass(
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 8203e70..625e6b1 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -262,6 +262,9 @@ class SchedulerMetricsReporter:
+         # `*_correct_drafts` counts accepted draft proposals only.
+         self.spec_num_accept_tokens = 0  # per-log-interval
+         self.spec_num_correct_drafts = 0
++        # None => no batch reported its own width this interval, fall back to
++        # the active config (correct when the width never changes).
++        self.spec_num_drafts_seen: int | None = 0
+         self.spec_num_forward_ct = 0
+         self.spec_total_num_accept_tokens = 0  # lifetime
+         self.spec_total_num_forward_ct = 0
+@@ -495,12 +498,22 @@ class SchedulerMetricsReporter:
+         num_accept_tokens: int,
+         num_block_accept_tokens: int = 0,
+         num_cap_tokens: int = 0,
++        num_drafts_per_req: int | None = None,
+     ):
+         self.spec_num_accept_tokens += num_accept_tokens
+         self.spec_num_correct_drafts += num_correct_drafts
+         self.spec_num_forward_ct += bs
+         self.spec_num_block_accept_tokens += num_block_accept_tokens
+         self.spec_num_cap_tokens += num_cap_tokens
++        # Accumulate the DRAFT CAPACITY of this batch, not of the width that
++        # happens to be active when the log interval ends: adaptive speculation
++        # may have switched mid-interval (and the switch runs before this, in
++        # on_verify_complete_cpu), which made accept_rate a ratio of counts
++        # gathered at one width to a denominator computed at another.
++        if num_drafts_per_req is None:
++            self.spec_num_drafts_seen = None
++        elif self.spec_num_drafts_seen is not None:
++            self.spec_num_drafts_seen += bs * max(0, num_drafts_per_req)
+ 
+     def _init_estimated_perf_constants(self) -> None:
+         model_config = self.scheduler.model_config
+@@ -666,6 +679,7 @@ class SchedulerMetricsReporter:
+         self.num_generated_tokens = 0
+         self.spec_num_accept_tokens = 0
+         self.spec_num_correct_drafts = 0
++        self.spec_num_drafts_seen = 0
+         self.spec_num_forward_ct = 0
+         self.spec_total_num_accept_tokens = 0
+         self.spec_total_num_forward_ct = 0
+@@ -928,11 +942,14 @@ class SchedulerMetricsReporter:
+         else:
+             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+             num_correct_drafts = self.spec_num_correct_drafts
+-            if get_spec().speculative_num_draft_tokens:
+-                draft_per_round = get_spec().speculative_num_draft_tokens - 1
++            if self.spec_num_drafts_seen is not None:
++                total_draft_tokens = self.spec_num_drafts_seen
+             else:
+-                draft_per_round = get_spec().speculative_num_steps or 0
+-            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
++                if get_spec().speculative_num_draft_tokens:
++                    draft_per_round = get_spec().speculative_num_draft_tokens - 1
++                else:
++                    draft_per_round = get_spec().speculative_num_steps or 0
++                total_draft_tokens = self.spec_num_forward_ct * draft_per_round
+             spec_accept_rate = (
+                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
+             )
+diff --git a/python/sglang/srt/speculative/adaptive_spec_params.py b/python/sglang/srt/speculative/adaptive_spec_params.py
+index 6d33534..946c6a2 100644
+--- a/python/sglang/srt/speculative/adaptive_spec_params.py
++++ b/python/sglang/srt/speculative/adaptive_spec_params.py
+@@ -276,6 +276,15 @@ class AdaptiveSpeculativeParams:
+         self._bs_list: list[int] = sorted(bs_entries)
+         self._slots: dict[int, AdaptiveStepSlot] = {}
+         self._cuda_graph_bs: list[int] | None = None
++        # Per-tier acceptance accounting. The scheduler's aggregate
++        # accept_rate divides accumulated accepted drafts by the CURRENTLY
++        # active width, which is wrong for any window a swap fell inside, so a
++        # sweep cannot read per-tier acceptance off it. These counters are
++        # attributed to the (bs slot, steps) pair that actually produced the
++        # drafts, which is the pre-update width.
++        self._tier_stats: dict[tuple[int, int], dict[str, float]] = {}
++        self._tier_stats_verifies = 0
++        self._tier_stats_log_interval = int(cfg.get("tier_stats_log_interval", 0) or 0)
+ 
+         for bs, entry in sorted(bs_entries.items()):
+             self._slots[bs] = AdaptiveStepSlot(
+@@ -310,10 +319,67 @@ class AdaptiveSpeculativeParams:
+         Returns the new step if a switch is warranted, else ``None``.
+         """
+         params = self._route(batch_size)
++        self._record_tier_stats(params, num_correct_drafts_per_req, batch_size)
+         if params.update(num_correct_drafts_per_req):
+             return params.current_steps
+         return None
+ 
++    def _record_tier_stats(
++        self,
++        slot: AdaptiveStepSlot,
++        num_correct_drafts_per_req: list[int],
++        batch_size: int,
++    ) -> None:
++        """Attribute this verify's acceptance to the width that produced it."""
++        if not num_correct_drafts_per_req:
++            return
++        bs_key = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
++        key = (bs_key, slot.current_steps)
++        entry = self._tier_stats.get(key)
++        if entry is None:
++            entry = {"verifies": 0.0, "reqs": 0.0, "correct": 0.0, "batch_sum": 0.0}
++            self._tier_stats[key] = entry
++        entry["verifies"] += 1.0
++        entry["reqs"] += float(len(num_correct_drafts_per_req))
++        entry["correct"] += float(sum(num_correct_drafts_per_req))
++        entry["batch_sum"] += float(batch_size)
++        self._tier_stats_verifies += 1
++        if (
++            self._tier_stats_log_interval > 0
++            and self._tier_stats_verifies % self._tier_stats_log_interval == 0
++        ):
++            log_info_on_rank0(logger, "Adaptive spec tiers: " + self.tier_stats_line())
++
++    def tier_stats(self) -> dict[str, dict[str, float]]:
++        """Per-(bs slot, steps) acceptance, keyed ``"bs<N>/steps<M>"``.
++
++        ``accept_len`` is tokens committed per verify (accepted drafts + the
++        always-committed bonus token), i.e. the same quantity as the scheduler's
++        ``accept len``, restricted to one tier. ``accept_rate`` divides by that
++        tier's own draft width, which the aggregate metric cannot do.
++        """
++        out: dict[str, dict[str, float]] = {}
++        for (bs_key, steps), entry in sorted(self._tier_stats.items()):
++            reqs = entry["reqs"]
++            if reqs <= 0:
++                continue
++            drafts = reqs * steps
++            out[f"bs{bs_key}/steps{steps}"] = {
++                "verifies": entry["verifies"],
++                "reqs": reqs,
++                "accept_len": entry["correct"] / reqs + 1.0,
++                "accept_rate": (entry["correct"] / drafts) if drafts > 0 else 0.0,
++                "mean_batch": entry["batch_sum"] / entry["verifies"],
++            }
++        return out
++
++    def tier_stats_line(self) -> str:
++        return " | ".join(
++            f"{name} n={int(v['verifies'])} accept_len={v['accept_len']:.3f} "
++            f"accept_rate={v['accept_rate']:.3f} mean_bs={v['mean_batch']:.1f}"
++            for name, v in self.tier_stats().items()
++        )
++
+     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
+         """Return cuda_graph_bs values that can reach *step* at runtime.
+ 
+diff --git a/test/registered/unit/speculative/test_adaptive_wide.py b/test/registered/unit/speculative/test_adaptive_wide.py
+new file mode 100644
+index 0000000..2d5a034
+--- /dev/null
++++ b/test/registered/unit/speculative/test_adaptive_wide.py
+@@ -0,0 +1,338 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""Adaptive speculation x wide QSA verify: the couplings that must hold.
++
++CPU only. Everything here drives PRODUCTION functions -- the adaptive policy, the
++config loader and the QSA ring sizing -- so a regression in them fails here rather
++than in a serving boot. qwen-opt.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++try:
++    import pytest
++except ModuleNotFoundError:  # the serving venv has no pytest and must not be modified
++    class _Skipped(Exception):
++        pass
++
++    class _Mark:
++        name = "parametrize"
++
++        def __init__(self, *args):
++            self.args = args
++
++        def __call__(self, fn):
++            marks = list(getattr(fn, "pytestmark", []))
++            marks.append(self)
++            fn.pytestmark = marks
++            return fn
++
++    class _MarkFactory:
++        def parametrize(self, *args):
++            return _Mark(*args)
++
++    class _PytestShim:
++        Skipped = _Skipped
++        mark = _MarkFactory()
++
++        @staticmethod
++        def skip(reason):
++            raise _Skipped(reason)
++
++    pytest = _PytestShim()
++
++from sglang.srt.layers.attention.qsa.config import (
++    qsa_max_draft_tokens,
++    qsa_pending_ring_size,
++)
++import sglang.srt.speculative.adaptive_spec_params
++from sglang.srt.speculative.adaptive_spec_params import (
++    DEFAULT_ADAPTIVE_CONFIG,
++    AdaptiveSpeculativeParams,
++    resolve_candidate_steps_from_config,
++)
++
++# The two tier configs ship in-tree next to adaptive_spec_params.py. Override the
++# directory with QWENOPT_ADAPTIVE_CONFIG_DIR to test a hand-tuned pair.
++_IN_TREE_CONFIG_DIR = os.path.join(
++    os.path.dirname(os.path.abspath(sglang.srt.speculative.adaptive_spec_params.__file__)),
++    "configs",
++)
++CONFIG_DIR = os.environ.get("QWENOPT_ADAPTIVE_CONFIG_DIR", _IN_TREE_CONFIG_DIR)
++SHIPPED = os.path.join(CONFIG_DIR, "adaptive_flashnext.json")
++LEAN = os.path.join(CONFIG_DIR, "adaptive_flashnext_lean.json")
++RATIO = 4  # qwen38-flash-next indexer_compress_ratio [source-verified, config.json]
++CUDA_GRAPH_BS = [1, 2, 3, 4, 5, 6, 7, 8]
++
++
++def _shipped_configs():
++    paths = [p for p in (SHIPPED, LEAN) if os.path.exists(p)]
++    if not paths:
++        pytest.skip("shipped adaptive configs not present on this host")
++    return paths
++
++
++# --------------------------------------------------------------------------
++# 1. The ring must serve the DEEPEST tier, not the launch width.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("cfg_path", [None] + _shipped_configs())
++def test_ring_sized_from_max_candidate_serves_every_tier(cfg_path):
++    """qsa_pending_ring_size(ratio, max(candidates)+1) is collision-free for the
++    verify window of EVERY candidate tier -- this is what lets the pool allocate
++    once at startup while the active width moves."""
++    candidates = resolve_candidate_steps_from_config(cfg_path)
++    max_draft = max(candidates) + 1
++    ring = qsa_pending_ring_size(RATIO, max_draft)
++    assert ring % RATIO == 0
++    for steps in candidates:
++        width = max(steps + 1, 1)
++        # window U group spans width + ratio - 1 consecutive positions
++        assert ring >= width + RATIO - 1, (steps, width, ring)
++        assert width <= qsa_max_draft_tokens(RATIO, ring)
++
++
++def test_launch_width_ring_would_alias_the_deep_tiers():
++    """The point of sizing from the max: a ring sized for the LAUNCH width 4
++    cannot serve a 6- or 8-token window. If this ever passes, sizing from the
++    launch value stopped being a bug and something else changed."""
++    launch_ring = qsa_pending_ring_size(RATIO, 4)
++    assert launch_ring == 8
++    assert qsa_max_draft_tokens(RATIO, launch_ring) == 5
++    for deep_steps in (5, 7):
++        assert deep_steps + 1 > qsa_max_draft_tokens(RATIO, launch_ring)
++
++
++def test_shipped_config_ring_is_12_at_ratio_4():
++    """Concrete: the shipped tiers top out at 7 steps -> W=8 -> ring 12."""
++    candidates = resolve_candidate_steps_from_config(SHIPPED)
++    assert max(candidates) == 7
++    assert qsa_pending_ring_size(RATIO, max(candidates) + 1) == 12
++
++
++# --------------------------------------------------------------------------
++# 2. Per-state CUDA-graph pruning has to agree with runtime routing.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("cfg_path", [None] + _shipped_configs())
++def test_every_graph_bs_has_its_active_step_captured(cfg_path):
++    """The invariant that makes cuda_graph_bs_for_step() safe: for every graph
++    batch size, the tier the router would activate at that batch size is one the
++    pruned capture list includes. A violation is a runtime graph miss (silent
++    fall back to eager, or a missing-state ValueError)."""
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=cfg_path)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    for bs in CUDA_GRAPH_BS:
++        step = params.get_steps_for_batch(bs)
++        captured = params.cuda_graph_bs_for_step(step)
++        assert captured is not None and bs in captured, (bs, step, captured)
++
++
++@pytest.mark.parametrize("cfg_path", [None] + _shipped_configs())
++def test_capture_budget_is_bounded(cfg_path):
++    """Graph VRAM scales with the number of (state, bs) captures, so count them.
++    The static config captures len(CUDA_GRAPH_BS); this asserts the shipped
++    configs stay within 2x that, which is the measured VRAM headroom
++    (0.65 GB for 4 bs at W=4 against 2.82 GB spare)."""
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=cfg_path)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    total = sum(
++        len(params.cuda_graph_bs_for_step(step) or []) for step in params.candidate_steps
++    )
++    if cfg_path is None:
++        # The DEFAULT config is the one that does not fit: recorded, not asserted.
++        assert total > len(CUDA_GRAPH_BS)
++        return
++    assert total <= 2 * len(CUDA_GRAPH_BS), (cfg_path, total)
++
++
++def test_shipped_capture_counts_are_the_documented_ones():
++    p = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    p.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    per_step = {s: len(p.cuda_graph_bs_for_step(s) or []) for s in p.candidate_steps}
++    assert per_step == {1: 1, 3: 8, 5: 3, 7: 1}, per_step
++    assert sum(per_step.values()) == 13
++    # steps=1 must be reachable ONLY from the bs8 slot: bs 4..7 route to slot 4,
++    # so adding 1 there would put the steps=1 state on 5 batch sizes.
++    assert p.cuda_graph_bs_for_step(1) == [8]
++
++    lean = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=LEAN)
++    lean.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    lean_per_step = {s: len(lean.cuda_graph_bs_for_step(s) or []) for s in lean.candidate_steps}
++    assert lean_per_step == {3: 8, 7: 1}, lean_per_step
++
++
++# --------------------------------------------------------------------------
++# 3. Hysteresis must place the switch at the derived break-even and not chatter.
++# --------------------------------------------------------------------------
++
++
++def _drive(params, ema_target: float, batch_size: int, batches: int = 400):
++    """Feed a constant accepted-draft count and return the step trajectory."""
++    trajectory = []
++    for _ in range(batches):
++        steps = params.get_steps_for_batch(batch_size)
++        # num_correct_drafts is clamped by the active width, exactly as the
++        # verify kernel would clamp it.
++        per_req = min(ema_target, float(max(steps, 0)))
++        params.on_verify_complete([per_req], batch_size=batch_size)
++        trajectory.append(params.get_steps_for_batch(batch_size))
++    return trajectory
++
++
++@pytest.mark.parametrize(
++    "ema,expect_top",
++    [
++        (1.0, False),   # below the bs1 n3->n5 break-even (1.29): stay at 3
++        (3.6, True),    # well above every break-even: climb
++    ],
++)
++def test_bs1_switches_on_the_right_side_of_the_breakeven(ema, expect_top):
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    traj = _drive(params, ema, batch_size=1)
++    final = traj[-1]
++    if expect_top:
++        assert final > 3, traj[-20:]
++    else:
++        assert final == 3, traj[-20:]
++
++
++def test_no_oscillation_at_a_steady_accept_rate():
++    """A steady acceptance must settle: at most a handful of switches over 400
++    batches. Chatter costs an apply_runtime_state (backend + graph-runner swap)
++    every update_interval and would confound any A/B."""
++    for ema in (0.5, 1.0, 1.4, 2.0, 3.0, 4.0, 6.0):
++        params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++        params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++        traj = _drive(params, ema, batch_size=1)
++        switches = sum(1 for a, b in zip(traj, traj[1:]) if a != b)
++        assert switches <= 4, (ema, switches, traj[:40])
++        tail = traj[-50:]
++        assert len(set(tail)) == 1, (ema, set(tail))
++
++
++def test_aggregate_slots_never_widen_past_the_static_width():
++    """The hard constraint is aggregate >= config B at conc 4/8, so the bs>=4
++    slots must never select a width deeper than the static 3 no matter how high
++    acceptance goes."""
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    for bs in (4, 8):
++        traj = _drive(params, 7.0, batch_size=bs)
++        assert max(traj) <= 3, (bs, set(traj))
++
++
++def test_collapsed_acceptance_drops_the_aggregate_slots_to_one_step():
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    traj = _drive(params, 0.0, batch_size=8)
++    assert traj[-1] == 1, set(traj)
++
++
++# --------------------------------------------------------------------------
++# 4. Per-tier acceptance accounting (the run spec reads these).
++# --------------------------------------------------------------------------
++
++
++def test_tier_stats_attribute_to_the_width_that_produced_the_drafts():
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    _drive(params, 3.6, batch_size=1, batches=300)
++    stats = params.tier_stats()
++    assert "bs1/steps3" in stats
++    assert any(k.startswith("bs1/steps5") or k.startswith("bs1/steps7") for k in stats)
++    for name, v in stats.items():
++        steps = int(name.split("steps")[1])
++        # accept_len = accepted drafts + the always-committed bonus token
++        assert 1.0 <= v["accept_len"] <= steps + 1 + 1e-9, (name, v)
++        assert 0.0 <= v["accept_rate"] <= 1.0 + 1e-9, (name, v)
++    assert params.tier_stats_line()
++
++
++def test_tier_stats_separate_batch_sizes():
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=SHIPPED)
++    params.set_cuda_graph_bs(CUDA_GRAPH_BS)
++    _drive(params, 2.0, batch_size=1, batches=60)
++    _drive(params, 2.0, batch_size=8, batches=60)
++    keys = set(params.tier_stats())
++    assert any(k.startswith("bs1/") for k in keys)
++    assert any(k.startswith("bs8/") for k in keys)
++
++
++# --------------------------------------------------------------------------
++# 5. The shipped configs must load under the production validator.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("cfg_path", _shipped_configs())
++def test_shipped_configs_load_and_are_monotone(cfg_path):
++    raw = json.load(open(cfg_path))
++    for key, entry in raw.items():
++        if not key.isdigit():
++            continue
++        steps = entry["candidate_steps"]
++        assert steps == sorted(set(steps)), (cfg_path, key, steps)
++        assert all(s >= 0 for s in steps)
++    params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=cfg_path)
++    # initial_steps must be a candidate in every slot, or a slot silently starts
++    # at its middle candidate and the first A/B point is not the launch config.
++    for bs in (1, 2, 4, 8):
++        assert params.get_steps_for_batch(bs) == 3, bs
++
++
++def test_default_config_is_unchanged():
++    """The shipped files are additions, not edits to the engine default."""
++    assert set(DEFAULT_ADAPTIVE_CONFIG) == {"1", "8", "32", "64"}
++    assert DEFAULT_ADAPTIVE_CONFIG["1"]["candidate_steps"] == [1, 3, 5, 7]
++
++
++# --------------------------------------------------------------------------
++# No-pytest driver: the serving venv has no pytest and must not be
++# modified, so this file also runs as a plain script there.
++#   PYTHONPATH=<worktree>/python CUDA_VISIBLE_DEVICES=9 python test_adaptive_wide.py
++# --------------------------------------------------------------------------
++if __name__ == "__main__":
++    import sys
++    import traceback
++
++    CASES = []
++    for _name, _fn in sorted(list(globals().items())):
++        if not _name.startswith("test_") or not callable(_fn):
++            continue
++        marks = getattr(_fn, "pytestmark", [])
++        argsets = None
++        for m in marks:
++            if m.name == "parametrize":
++                names = [n.strip() for n in m.args[0].split(",")]
++                argsets = [
++                    dict(zip(names, v if isinstance(v, tuple) else (v,)))
++                    for v in m.args[1]
++                ]
++        CASES.extend(
++            [(_name, _fn, a) for a in argsets] if argsets else [(_name, _fn, {})]
++        )
++
++    failures = 0
++    skipped = 0
++    for name, fn, kwargs in CASES:
++        label = name + (f"[{list(kwargs.values())}]" if kwargs else "")
++        try:
++            fn(**kwargs)
++        except Exception as exc:  # noqa: BLE001
++            if exc.__class__.__name__ in ("Skipped", "_Skipped"):
++                skipped += 1
++                print(f"SKIP {label}: {exc}")
++                continue
++            failures += 1
++            print(f"FAIL {label}")
++            traceback.print_exc()
++        else:
++            print(f"ok   {label}")
++    print(f"\n{len(CASES) - failures - skipped} passed, {failures} failed, {skipped} skipped")
++    sys.exit(1 if failures else 0)

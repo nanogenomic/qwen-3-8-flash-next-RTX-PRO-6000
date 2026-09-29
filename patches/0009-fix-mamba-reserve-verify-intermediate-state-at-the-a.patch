@@ -1,0 +1,70 @@
+From 0d7f29fe45b0f7c63d76e0191c5298b7f0d2db68 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 21:50:00 +0000
+Subject: [PATCH 09/32] fix(mamba): reserve verify intermediate state at the
+ adaptive maximum
+
+_handle_max_mamba_cache subtracted the intermediate SSM/conv reservation using
+get_spec().speculative_num_draft_tokens -- the width active when the configurator
+runs -- while the pool ALLOCATES that buffer from max_speculative_num_draft_tokens()
+(memory_pool.py: [layers, spec_state_size+1, num_draft_tokens, ...]). Under adaptive
+speculation those differ: a launch at 3/4 with tiers up to 7 steps reserves for 4
+draft tokens and allocates for 8, so the KV pool is sized against a budget that is
+short by the difference and the boot either OOMs or lands a pool that does not fit.
+
+Measured scale of the gap on this card: intermediate_ssm_state_cache is 1.05 GB at
+max_mamba_cache_size 16 / 4 draft tokens, i.e. 0.0525 GB per (request slot, draft
+token); at max_running_requests 8 it is 1.89 GB at W=4 and 3.78 GB at W=8, against
+2.82 GB of post-capture headroom.
+
+Inert when the width never moves (max == active) and inert under
+--enable-linear-replayssm-spec, which allocates no intermediate state at all; it is
+the non-replayssm fallback that this protects.
+---
+ python/sglang/srt/mem_cache/kv_cache_configurator.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index 13210da..9aed431 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -2456,7 +2456,11 @@ class KVCacheConfigurator:
+             replayssm_fixed_bytes = 0
+             replayssm_ring_per_slot = replayssm_ring_per_req
+         if has_spec_dec:
+-            assert get_spec().speculative_num_draft_tokens is not None
++            # The intermediate-state reservations below must use the same bound
++            # the pool ALLOCATES by (memory_pool.py sizes SpeculativeState from
++            # max_speculative_num_draft_tokens), not the currently active width:
++            # an adaptive algorithm switches to a deeper state after this runs.
++            assert max_speculative_num_draft_tokens() is not None
+             assert get_schedule().max_running_requests is not None
+ 
+         if get_schedule().max_mamba_cache_size is not None:
+@@ -2478,7 +2482,7 @@ class KVCacheConfigurator:
+                 intermediate_size = (
+                     stage_per_req
+                     * (capped_reqs + 1)
+-                    * get_spec().speculative_num_draft_tokens
++                    * max_speculative_num_draft_tokens()
+                 )
+                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+         elif (
+@@ -2497,7 +2501,7 @@ class KVCacheConfigurator:
+                 intermediate_size = (
+                     stage_per_req
+                     * (get_schedule().max_mamba_cache_size + 1)
+-                    * get_spec().speculative_num_draft_tokens
++                    * max_speculative_num_draft_tokens()
+                 )
+                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+         else:
+@@ -2517,7 +2521,7 @@ class KVCacheConfigurator:
+ 
+             if has_spec_dec and not replayssm_active:
+                 ratio = self._calculate_mamba_ratio()
+-                D = get_spec().speculative_num_draft_tokens
++                D = max_speculative_num_draft_tokens()
+                 # Joint solve: main_state + intermediate = mamba_budget
+                 get_context().override(
+                     "mamba_pool.memory_budget_spec",

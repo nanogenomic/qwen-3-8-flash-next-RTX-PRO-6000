@@ -1,0 +1,464 @@
+From 58879a4f8965cd40fddcd9a6f4f30a8b3d087159 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 00:19:00 +0000
+Subject: [PATCH 29/32] perf(moe): 4-launch expert-centric small-batch NVFP4
+ MoE for T<=16 (SGLANG_QWENOPT_FUSE_SBMOE)
+
+Replaces flashinfer cutlass_fused_moe (9 launches: 3 prefix sums, expand, strides, GEMM1, act,
+GEMM2, finalize) for NVFP4 MoE calls with T<=16 by: input quant, expert-centric fc1+SwiGLU+fp4 quant
+(weights decoded once per expert via cvt.rn.f16x2.e2m1x2, tensor-core dot over all routed tokens),
+expert-centric fc2, top-k-ordered fp32 finalize. Same quant recipes and accumulation structure.
+Tests (GPU2, real layers 20 and 5, real router on real-token rows, sglang _run_flashinfer_cutlass
+path): output BITWISE equal to stock at T=1,2,4,8,16 (~42 windows each), CUDA-graph replay with
+changing inputs == eager stock, deterministic. us/call off->on (20 rotating inputs): layer 20 T=1
+60.0->35.4, T=4 137.0->112.7, T=16 260.1->234.6; 188-SM emulation T=4 90.7->63.8.
+Off by default; eligibility-gated (fp4, bf16 in/out, tp=ep=1, plain SwiGLU, shapes); else stock.
+---
+ .../ops/moe/qwenopt_small_batch_nvfp4_moe.py  | 350 ++++++++++++++++++
+ .../moe/moe_runner/flashinfer_cutlass.py      |  69 ++++
+ 2 files changed, 419 insertions(+)
+ create mode 100644 python/sglang/kernels/ops/moe/qwenopt_small_batch_nvfp4_moe.py
+
+diff --git a/python/sglang/kernels/ops/moe/qwenopt_small_batch_nvfp4_moe.py b/python/sglang/kernels/ops/moe/qwenopt_small_batch_nvfp4_moe.py
+new file mode 100644
+index 0000000..85a9335
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/qwenopt_small_batch_nvfp4_moe.py
+@@ -0,0 +1,350 @@
++# Copyright © 2025 Ligandal, Inc.
++# SPDX-License-Identifier: Apache-2.0
++"""Small-batch NVFP4 MoE for T <= 16 on SM120 (qwen-opt, lever d4).
++
++Replaces flashinfer cutlass_fused_moe's 9 launches (3 prefix sums, expandInputRows, computeStrides,
++grouped GEMM1, doActivation, grouped GEMM2, finalize) with 4:
++  Q) NVFP4 quant of the input rows (expandInputRows recipe), stored dequantized (exact in fp16)
++  A) expert-centric fc1: the program of the first (token, slot) pair that uses an expert decodes that
++     expert's [up; gate] N-block once (hardware e2m1x2 -> f16x2 cvt, e4m3 block scale applied: exact in
++     fp16) and runs a tensor-core dot against every token routed to it; alpha -> bf16 -> SiLU(gate)*up
++     -> bf16 -> NVFP4 quant of the intermediate (doActivation recipe), stored dequantized
++  B) expert-centric fc2: same scheme, writes bf16(alpha2 * y) per (token, slot)
++  F) finalize: fp32 router-weighted sum in top-k order -> bf16 (finalizeMoeRoutingKernel structure).
++Weights are read in flashinfer's layout (w13 = [up; gate] packed e2m1, 128x4-swizzled e4m3 block scales),
++no extra weight copy. Deterministic (no atomics). Measured BITWISE equal to cutlass_fused_moe on real
++qwen38-flash-next layers (20, 5), real routing, T in {1,2,4,8,16}, eager and CUDA-graph replay.
++Wired in moe_runner/flashinfer_cutlass.py behind SGLANG_QWENOPT_FUSE_SBMOE=1.
++Duplicate expert ids within one token are not supported (nor by the CUTLASS path).
++"""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _rcp_approx(x):
++    return tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", "=f,f", [x], dtype=tl.float32,
++                                     is_pure=True, pack=1)
++
++
++@triton.jit
++def _e2m1_code_val(a):
++    # |a| -> e2m1 magnitude by round-to-nearest-even with satfinite, returned as its float value.
++    # grid {0,.5,1,1.5,2,3,4,6}; ties go to the even code (cvt.rn.satfinite.e2m1x2.f32).
++    code = ((a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
++            + (a >= 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32)
++            + (a > 5.0).to(tl.int32))
++    return _e2m1_decode_mag(code)
++
++
++@triton.jit
++def _e2m1_decode_mag(code):
++    e = code >> 1
++    mnt = (code & 1).to(tl.float32)
++    return tl.where(e == 0, 0.5 * mnt, (1.0 + 0.5 * mnt) * tl.exp2((e - 1).to(tl.float32)))
++
++
++@triton.jit
++def _nibble_val(nib):
++    mag = _e2m1_decode_mag(nib & 7)
++    return tl.where((nib & 8) != 0, -mag, mag)
++
++
++@triton.jit
++def _quant_blocks(v, sf_scale):
++    # v: [NB, 16] fp32 values that are exactly bf16. Returns (signed e2m1 values [NB,16], block scale fp32 [NB])
++    # recipe (quantization_utils.cuh cvt_warp_fp16_to_fp4, fast-math path):
++    #   SF = e4m3_rn_sat(sf_scale * (amax * rcp(6)));  out_scale = rcp(SF * rcp(sf_scale)); q = e2m1(v * out_scale)
++    amax = tl.max(tl.abs(v), axis=1)
++    sfv = sf_scale * (amax * _rcp_approx(tl.full(amax.shape, 6.0, tl.float32)))
++    sf = sfv.to(tl.float8e4nv).to(tl.float32)
++    osc = tl.where(amax != 0.0, _rcp_approx(sf * _rcp_approx(tl.full(amax.shape, 1.0, tl.float32) * sf_scale)), 0.0)
++    y = v * osc[:, None]
++    q = _e2m1_code_val(tl.abs(y))
++    q = tl.where(y < 0, -q, q)
++    return q, sf
++
++
++@triton.jit
++def _swz_off(m, kb, KB: tl.constexpr):
++    # flashinfer/sglang swizzle_blockscale: [M, KB] -> (M/128, KB/4, 32, 4, 4)
++    m0 = m // 128
++    m1 = (m // 32) % 4
++    m2 = m % 32
++    k0 = kb // 4
++    k1 = kb % 4
++    return (((m0 * (KB // 4) + k0) * 32 + m2) * 4 + m1) * 4 + k1
++
++
++@triton.jit
++def _e2m1_pair_f32(b):
++    # b: int32 tensor holding one packed byte (2 x e2m1). Hardware cvt -> f16x2; low nibble = element 2j.
++    r = tl.inline_asm_elementwise("{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
++                                  "=r,r", [b], dtype=tl.int32, is_pure=True, pack=1)
++    lo = (r & 0xFFFF).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
++    hi = ((r >> 16) & 0xFFFF).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
++    return lo, hi
++
++
++@triton.jit
++def _act_quant_kernel(X, A, A1S, H: tl.constexpr):
++    # NVFP4 quant of the MoE input (expandInputRows recipe), stored DEQUANTIZED (code * block scale, exact in fp16)
++    tok = tl.program_id(0)
++    c = tl.program_id(1)
++    offs = c * 128 + tl.arange(0, 128)
++    x = tl.load(X + tok * H + offs).to(tl.float32)
++    q, sf = _quant_blocks(tl.reshape(x, [8, 16]), tl.load(A1S))
++    tl.store(A + tok * H + offs, tl.reshape(q * sf[:, None], [128]).to(tl.float16))
++
++
++@triton.jit
++def _moe_fc1_act_kernel(
++    A, IDS, W13, S13, ALPHA1, INTER,
++    A2S,
++    TOPK: tl.constexpr, H: tl.constexpr, I: tl.constexpr, BN: tl.constexpr, BKB: tl.constexpr,
++    num_experts: tl.constexpr,
++):
++    pair = tl.program_id(0)
++    nb = tl.program_id(1)
++    tok = pair // TOPK
++    e = tl.load(IDS + pair)
++    valid = (e >= 0) & (e < num_experts)
++    e = tl.where(valid, e, 0)
++    rows = nb * BN + tl.arange(0, BN)                  # up rows; gate rows = I + rows
++    NBLK: tl.constexpr = BKB // 8                      # 16-element blocks per chunk (8 bytes each)
++    KB: tl.constexpr = H // 16
++    acc_u = tl.zeros([BN], dtype=tl.float32)
++    acc_g = tl.zeros([BN], dtype=tl.float32)
++    wbase = W13 + e.to(tl.int64) * (2 * I * (H // 2))
++    sbase = S13 + e.to(tl.int64) * (2 * I * KB)
++    for kc in range(0, H // 2, BKB):
++        a = tl.load(A + tok * H + kc * 2 + tl.arange(0, 2 * BKB)).to(tl.float32)
++        ae, ao = tl.split(tl.reshape(a, [NBLK, 8, 2]))
++        boffs = kc + tl.arange(0, BKB)
++        wu = tl.load(wbase + rows[:, None] * (H // 2) + boffs[None, :]).to(tl.int32)
++        wg = tl.load(wbase + (I + rows)[:, None] * (H // 2) + boffs[None, :]).to(tl.int32)
++        kb = kc // 8 + tl.arange(0, NBLK)
++        su = tl.load(sbase + _swz_off(rows[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        sg = tl.load(sbase + _swz_off((I + rows)[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        ul, uh = _e2m1_pair_f32(wu)
++        gl, gh = _e2m1_pair_f32(wg)
++        pu = tl.sum(tl.reshape(ul, [BN, NBLK, 8]) * ae[None, :, :] + tl.reshape(uh, [BN, NBLK, 8]) * ao[None, :, :], axis=2)
++        pg = tl.sum(tl.reshape(gl, [BN, NBLK, 8]) * ae[None, :, :] + tl.reshape(gh, [BN, NBLK, 8]) * ao[None, :, :], axis=2)
++        acc_u += tl.sum(pu * su, axis=1)
++        acc_g += tl.sum(pg * sg, axis=1)
++    alpha = tl.load(ALPHA1 + e)
++    up = (acc_u * alpha).to(tl.bfloat16).to(tl.float32)
++    gate = (acc_g * alpha).to(tl.bfloat16).to(tl.float32)
++    act = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
++    q2, sf2 = _quant_blocks(tl.reshape(act, [BN // 16, 16]), tl.load(A2S))
++    q2 = tl.where(valid, q2 * sf2[:, None], 0.0)
++    tl.store(INTER + pair * I + nb * BN + tl.arange(0, BN), tl.reshape(q2, [BN]).to(tl.float16))
++
++
++@triton.jit
++def _moe_fc1_act_expert_kernel(
++    A, IDS, W13, S13, ALPHA1, INTER,
++    A2S, T,
++    TOPK: tl.constexpr, H: tl.constexpr, I: tl.constexpr, BN: tl.constexpr, BKB: tl.constexpr,
++    TM: tl.constexpr, PP: tl.constexpr, TT: tl.constexpr, num_experts: tl.constexpr,
++):
++    # expert-centric: the program for pair p runs only if p is the first pair using its expert; it then
++    # computes that expert's rows for every token routed to it (weights decoded once, tensor-core dot).
++    p = tl.program_id(0)
++    nb = tl.program_id(1)
++    e = tl.load(IDS + p)
++    P = T * TOPK
++    qs = tl.arange(0, PP)
++    ids_all = tl.load(IDS + qs, mask=qs < P, other=-1)
++    dup_before = tl.sum(((ids_all == e) & (qs < p)).to(tl.int32), axis=0)
++    if (dup_before == 0) & (e >= 0) & (e < num_experts):
++        # member tokens and their pair index
++        tt = tl.arange(0, TT)
++        ids_tk = tl.load(IDS + tt[:, None] * TOPK + tl.arange(0, 16)[None, :],
++                         mask=(tt[:, None] < T) & (tl.arange(0, 16)[None, :] < TOPK), other=-1)
++        hit = ids_tk == e                                            # [TT, 16]
++        member = tl.sum(hit.to(tl.int32), axis=1) > 0                # [TT]
++        slot = tl.argmax(hit.to(tl.int32), axis=1)                   # [TT]
++        pos = tl.cumsum(member.to(tl.int32), axis=0) - 1             # compacted row of each member token
++        rr = tl.arange(0, TM)
++        sel = (pos[None, :] == rr[:, None]) & member[None, :]        # [TM, TT]
++        row_valid = tl.sum(sel.to(tl.int32), axis=1) > 0              # [TM]
++        row_tok = tl.sum(tl.where(sel, tt[None, :], 0), axis=1)       # [TM]
++        row_pair = tl.sum(tl.where(sel, (tt * TOPK + slot)[None, :], 0), axis=1)
++        rows = nb * BN + tl.arange(0, BN)
++        NBLK: tl.constexpr = BKB // 8
++        KB: tl.constexpr = H // 16
++        wbase = W13 + e.to(tl.int64) * (2 * I * (H // 2))
++        sbase = S13 + e.to(tl.int64) * (2 * I * KB)
++        acc_u = tl.zeros([TM, BN], dtype=tl.float32)
++        acc_g = tl.zeros([TM, BN], dtype=tl.float32)
++        for kc in range(0, H // 2, BKB):
++            koff = kc * 2 + tl.arange(0, 2 * BKB)
++            a = tl.load(A + row_tok[:, None] * H + koff[None, :], mask=row_valid[:, None], other=0.0)  # [TM, 2BKB] fp16
++            boffs = kc + tl.arange(0, BKB)
++            kb = kc // 8 + tl.arange(0, NBLK)
++            wu = tl.load(wbase + rows[:, None] * (H // 2) + boffs[None, :]).to(tl.int32)
++            wg = tl.load(wbase + (I + rows)[:, None] * (H // 2) + boffs[None, :]).to(tl.int32)
++            su = tl.load(sbase + _swz_off(rows[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            sg = tl.load(sbase + _swz_off((I + rows)[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            ul, uh = _e2m1_pair_f32(wu)
++            gl, gh = _e2m1_pair_f32(wg)
++            wud = tl.reshape(tl.reshape(tl.join(ul, uh), [BN, NBLK, 16]) * su[:, :, None], [BN, 2 * BKB]).to(tl.float16)
++            wgd = tl.reshape(tl.reshape(tl.join(gl, gh), [BN, NBLK, 16]) * sg[:, :, None], [BN, 2 * BKB]).to(tl.float16)
++            acc_u = tl.dot(a, tl.trans(wud), acc_u)
++            acc_g = tl.dot(a, tl.trans(wgd), acc_g)
++        alpha = tl.load(ALPHA1 + e)
++        up = (acc_u * alpha).to(tl.bfloat16).to(tl.float32)
++        gate = (acc_g * alpha).to(tl.bfloat16).to(tl.float32)
++        act = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)   # [TM, BN]
++        q2, sf2 = _quant_blocks(tl.reshape(act, [TM * (BN // 16), 16]), tl.load(A2S))
++        deq = tl.reshape(q2 * sf2[:, None], [TM, BN]).to(tl.float16)
++        tl.store(INTER + row_pair[:, None] * I + rows[None, :], deq, mask=row_valid[:, None])
++
++
++@triton.jit
++def _moe_fc2_expert_kernel(
++    INTER, IDS, W2, S2, ALPHA2, Y, T,
++    TOPK: tl.constexpr, H: tl.constexpr, I: tl.constexpr, BN: tl.constexpr, BKB: tl.constexpr,
++    TM: tl.constexpr, PP: tl.constexpr, TT: tl.constexpr, num_experts: tl.constexpr,
++):
++    # expert-centric fc2: Y[pair, n] = bf16(alpha2 * (inter[pair] . w2[e, n])) for every token routed to e
++    p = tl.program_id(0)
++    nb = tl.program_id(1)
++    e = tl.load(IDS + p)
++    P = T * TOPK
++    qs = tl.arange(0, PP)
++    ids_all = tl.load(IDS + qs, mask=qs < P, other=-1)
++    dup_before = tl.sum(((ids_all == e) & (qs < p)).to(tl.int32), axis=0)
++    if (dup_before == 0) & (e >= 0) & (e < num_experts):
++        tt = tl.arange(0, TT)
++        ids_tk = tl.load(IDS + tt[:, None] * TOPK + tl.arange(0, 16)[None, :],
++                         mask=(tt[:, None] < T) & (tl.arange(0, 16)[None, :] < TOPK), other=-1)
++        hit = ids_tk == e
++        member = tl.sum(hit.to(tl.int32), axis=1) > 0
++        slot = tl.argmax(hit.to(tl.int32), axis=1)
++        pos = tl.cumsum(member.to(tl.int32), axis=0) - 1
++        rr = tl.arange(0, TM)
++        sel = (pos[None, :] == rr[:, None]) & member[None, :]
++        row_valid = tl.sum(sel.to(tl.int32), axis=1) > 0
++        row_pair = tl.sum(tl.where(sel, (tt * TOPK + slot)[None, :], 0), axis=1)
++        rows = nb * BN + tl.arange(0, BN)
++        NBLK: tl.constexpr = BKB // 8
++        KB: tl.constexpr = I // 16
++        wb = W2 + e.to(tl.int64) * (H * (I // 2))
++        sb = S2 + e.to(tl.int64) * (H * KB)
++        acc = tl.zeros([TM, BN], dtype=tl.float32)
++        for kc in range(0, I // 2, BKB):
++            koff = kc * 2 + tl.arange(0, 2 * BKB)
++            a = tl.load(INTER + row_pair[:, None] * I + koff[None, :], mask=row_valid[:, None], other=0.0)
++            w = tl.load(wb + rows[:, None] * (I // 2) + kc + tl.arange(0, BKB)[None, :]).to(tl.int32)
++            kb = kc // 8 + tl.arange(0, NBLK)
++            sw = tl.load(sb + _swz_off(rows[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            wl, wh = _e2m1_pair_f32(w)
++            wd = tl.reshape(tl.reshape(tl.join(wl, wh), [BN, NBLK, 16]) * sw[:, :, None], [BN, 2 * BKB]).to(tl.float16)
++            acc = tl.dot(a, tl.trans(wd), acc)
++        y = (acc * tl.load(ALPHA2 + e)).to(tl.bfloat16)
++        tl.store(Y + row_pair[:, None] * H + rows[None, :], y, mask=row_valid[:, None])
++
++
++@triton.jit
++def _moe_finalize_kernel(Y, IDS, WTS, OUT, TOPK: tl.constexpr, H: tl.constexpr, BN: tl.constexpr,
++                         num_experts: tl.constexpr):
++    # same structure as finalizeMoeRoutingKernel: fp32 sum of scale * float(bf16 row), in top-k order
++    tok = tl.program_id(0)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    out = tl.zeros([BN], dtype=tl.float32)
++    for k in tl.static_range(TOPK):
++        e = tl.load(IDS + tok * TOPK + k)
++        if (e >= 0) & (e < num_experts):
++            y = tl.load(Y + (tok * TOPK + k) * H + cols).to(tl.float32)
++            out = out + tl.load(WTS + tok * TOPK + k) * y
++    tl.store(OUT + tok * H + cols, out.to(tl.bfloat16))
++
++
++@triton.jit
++def _moe_fc2_finalize_kernel(
++    INTER, IDS, WTS, W2, S2, ALPHA2, OUT,
++    TOPK: tl.constexpr, H: tl.constexpr, I: tl.constexpr, BN: tl.constexpr, BKB: tl.constexpr,
++    num_experts: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    nb = tl.program_id(1)
++    rows = nb * BN + tl.arange(0, BN)
++    KB: tl.constexpr = I // 16
++    NBLK: tl.constexpr = BKB // 8
++    out = tl.zeros([BN], dtype=tl.float32)
++    for k in tl.static_range(TOPK):
++        e = tl.load(IDS + tok * TOPK + k)
++        if (e >= 0) & (e < num_experts):
++            pair = tok * TOPK + k
++            wb = W2 + e.to(tl.int64) * (H * (I // 2))
++            sb = S2 + e.to(tl.int64) * (H * KB)
++            acc = tl.zeros([BN], dtype=tl.float32)
++            for kc in range(0, I // 2, BKB):
++                iv = tl.load(INTER + pair * I + kc * 2 + tl.arange(0, 2 * BKB)).to(tl.float32)
++                ie, io = tl.split(tl.reshape(iv, [NBLK, 8, 2]))
++                w = tl.load(wb + rows[:, None] * (I // 2) + kc + tl.arange(0, BKB)[None, :]).to(tl.int32)
++                kb = kc // 8 + tl.arange(0, NBLK)
++                s = tl.load(sb + _swz_off(rows[:, None], kb[None, :], KB)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++                wl, wh = _e2m1_pair_f32(w)
++                p = tl.sum(tl.reshape(wl, [BN, NBLK, 8]) * ie[None, :, :] + tl.reshape(wh, [BN, NBLK, 8]) * io[None, :, :], axis=2)
++                acc += tl.sum(p * s, axis=1)
++            y = (acc * tl.load(ALPHA2 + e)).to(tl.bfloat16).to(tl.float32)
++            out = out + tl.load(WTS + tok * TOPK + k) * y
++    tl.store(OUT + tok * H + rows, out.to(tl.bfloat16))
++
++
++def small_batch_nvfp4_moe(x, topk_ids, topk_weights, w13_u8, w13_sf_swz, alpha1, w2_u8, w2_sf_swz, alpha2,
++                          a1_scale, a2_scale, out=None, act=None, inter=None,
++                          BN1=32, BKB=128, BN2=128, warps1=4, warps2=4, stages1=2, stages2=2, BKB2=64,
++                          expert_centric=True, BNF=256, ybuf=None):
++    """x [T,H] bf16; topk_ids [T,K] int32; topk_weights [T,K] fp32; w13_u8 [E,2I,H/2] ([up;gate] packed e2m1);
++    w13_sf_swz / w2_sf_swz: swizzle_blockscale()d e4m3 block scales (any dtype view, contiguous);
++    alpha1/alpha2 [E] fp32 GEMM alphas; a1_scale/a2_scale: 1-element fp32 tensors (1/input_scale).
++    Duplicate expert ids within a token are NOT supported (same as the CUTLASS path)."""
++    if not torch.is_tensor(a1_scale):
++        a1_scale = torch.tensor([a1_scale], dtype=torch.float32, device=x.device)
++    if not torch.is_tensor(a2_scale):
++        a2_scale = torch.tensor([a2_scale], dtype=torch.float32, device=x.device)
++    T, H = x.shape
++    TOPK = topk_ids.shape[1]
++    E = w13_u8.shape[0]
++    I = w2_u8.shape[2] * 2
++    w13_sf_swz = w13_sf_swz.contiguous().view(torch.uint8)
++    w2_sf_swz = w2_sf_swz.contiguous().view(torch.uint8)
++    assert w13_sf_swz.numel() == w13_u8.shape[0] * w13_u8.shape[1] * (H // 16)
++    assert w2_sf_swz.numel() == w2_u8.shape[0] * H * (I // 16)
++    assert (H // 2) % BKB == 0 and (I // 2) % BKB2 == 0 and I % BN1 == 0 and H % BN2 == 0 and BN1 % 16 == 0
++    if out is None:
++        out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
++    if act is None:
++        act = torch.empty(T, H, dtype=torch.float16, device=x.device)
++    if inter is None:
++        inter = torch.empty(T * TOPK, I, dtype=torch.float16, device=x.device)
++    _act_quant_kernel[(T, H // 128)](x, act, a1_scale, H=H, num_warps=1)
++    if expert_centric:
++        _moe_fc1_act_expert_kernel[(T * TOPK, I // BN1)](
++            act, topk_ids, w13_u8, w13_sf_swz, alpha1, inter, a2_scale, T,
++            TOPK=TOPK, H=H, I=I, BN=BN1, BKB=BKB, TM=max(16, triton.next_power_of_2(T)),
++            PP=triton.next_power_of_2(T * TOPK), TT=max(16, triton.next_power_of_2(T)), num_experts=E,
++            num_warps=warps1, num_stages=stages1)
++    else:
++        _moe_fc1_act_kernel[(T * TOPK, I // BN1)](
++            act, topk_ids, w13_u8, w13_sf_swz, alpha1, inter, a2_scale,
++            TOPK=TOPK, H=H, I=I, BN=BN1, BKB=BKB, num_experts=E, num_warps=warps1, num_stages=stages1)
++    if expert_centric:
++        y = torch.empty(T * TOPK, H, dtype=torch.bfloat16, device=x.device) if ybuf is None else ybuf
++        _moe_fc2_expert_kernel[(T * TOPK, H // BN2)](
++            inter, topk_ids, w2_u8, w2_sf_swz, alpha2, y, T,
++            TOPK=TOPK, H=H, I=I, BN=BN2, BKB=BKB2, TM=max(16, triton.next_power_of_2(T)),
++            PP=triton.next_power_of_2(T * TOPK), TT=max(16, triton.next_power_of_2(T)), num_experts=E,
++            num_warps=warps2, num_stages=stages2)
++        _moe_finalize_kernel[(T, H // BNF)](y, topk_ids, topk_weights, out, TOPK=TOPK, H=H, BN=BNF,
++                                            num_experts=E, num_warps=1)
++    else:
++        _moe_fc2_finalize_kernel[(T, H // BN2)](
++            inter, topk_ids, topk_weights, w2_u8, w2_sf_swz, alpha2, out,
++            TOPK=TOPK, H=H, I=I, BN=BN2, BKB=BKB2, num_experts=E, num_warps=warps2, num_stages=stages2)
++    return out
+diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+index 808ae13..1e54137 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -221,6 +221,51 @@ if _QWENOPT_FUSE_MOE_FINALIZE_ILP:
+     # install before any runner instance can cache the stock module
+     _maybe_install_qwenopt_finalize_module()
+ 
++# qwen-opt fuse lever: SGLANG_QWENOPT_FUSE_SBMOE=1 routes NVFP4 MoE calls with
++# T <= SGLANG_QWENOPT_FUSE_SBMOE_MAX_T (default 16) tokens to a 4-launch expert-centric Triton path
++# (sglang/kernels/ops/moe/qwenopt_small_batch_nvfp4_moe.py) instead of flashinfer's 9-launch CUTLASS
++# pipeline. Measured bitwise-equal to cutlass_fused_moe on real weights/routing. Unset -> unchanged.
++_QWENOPT_FUSE_SBMOE = os.environ.get("SGLANG_QWENOPT_FUSE_SBMOE", "0") == "1"
++_QWENOPT_FUSE_SBMOE_MAX_T = int(os.environ.get("SGLANG_QWENOPT_FUSE_SBMOE_MAX_T", "16"))
++
++
++def _sbmoe_eligible(x, x_sf, output, output_dtype, topk_ids, quant_info, runner_config, enable_alltoall):
++    if quant_info.quant_type != "fp4" or x_sf is not None or enable_alltoall:
++        return False
++    if x.dim() != 2 or x.dtype != torch.bfloat16 or output_dtype != torch.bfloat16:
++        return False
++    T, H = x.shape
++    if not (1 <= T <= _QWENOPT_FUSE_SBMOE_MAX_T) or topk_ids.dim() != 2 or topk_ids.shape[1] > 16:
++        return False
++    if tuple(output.shape) != (T, H) or not output.is_contiguous() or not x.is_contiguous():
++        return False
++    if quant_info.moe_ep_size != 1 or quant_info.moe_tp_size != 1:
++        return False
++    if any(v is not None for v in (quant_info.swiglu_alpha, quant_info.swiglu_beta, quant_info.swiglu_limit)):
++        return False
++    if getattr(runner_config, "apply_router_weight_on_input", False) or not runner_config.is_gated:
++        return False
++    _, activation_types = _flashinfer_cutlass_fused_moe()
++    if _activation_type(runner_config) != activation_types.Swiglu:
++        return False
++    w13, w2 = quant_info.w13_weight, quant_info.w2_weight
++    if w13.dtype != torch.uint8 or w2.dtype != torch.uint8 or w13.dim() != 3 or w2.dim() != 3:
++        return False
++    E, N2, Kh = w13.shape
++    I = N2 // 2
++    if Kh * 2 != H or tuple(w2.shape) != (E, H, I // 2):
++        return False
++    if H % 256 or I % 128 or N2 % 128 or (I // 16) % 4:
++        return False
++    qs = quant_info.quant_scales
++    if qs is None or len(qs) != 6:
++        return False
++    if qs[1].numel() * qs[1].element_size() != E * N2 * (H // 16):
++        return False
++    if qs[4].numel() * qs[4].element_size() != E * H * (I // 16):
++        return False
++    return True
++
+ def _flashinfer_cutlass_fused_moe():
+     if not is_flashinfer_available():
+         raise RuntimeError(
+@@ -372,6 +417,30 @@ def _run_flashinfer_cutlass(
+             quant_scales[5],
+         ]
+ 
++    if _QWENOPT_FUSE_SBMOE and _sbmoe_eligible(
++        x, x_sf, output, output_dtype, topk_ids, quant_info, runner_config, enable_alltoall
++    ):
++        from sglang.kernels.ops.moe.qwenopt_small_batch_nvfp4_moe import (
++            small_batch_nvfp4_moe,
++        )
++
++        qs = quant_info.quant_scales
++        small_batch_nvfp4_moe(
++            x,
++            topk_ids.to(torch.int32).contiguous(),
++            topk_weights.contiguous(),
++            quant_info.w13_weight,
++            qs[1],
++            qs[2],
++            quant_info.w2_weight,
++            qs[4],
++            qs[5],
++            qs[0],
++            qs[3],
++            out=output,
++        )
++        return output
++
+     output = flashinfer_cutlass_fused_moe(
+         output=output,
+         input=x,

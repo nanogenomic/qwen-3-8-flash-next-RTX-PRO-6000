@@ -1,0 +1,176 @@
+From 0d9cee830611cb315cd6bf61afb476635165f5fe Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:26:59 +0000
+Subject: [PATCH 16/32] feat(moe): dynamic-k per-slot kept-slot counters +
+ stats writer (SGLANG_QWENOPT_DYNK_STATS_FILE)
+
+---
+ .../sglang/kernels/ops/moe/moe_fused_gate.py  | 14 +++++
+ python/sglang/srt/layers/moe/dynk.py          | 52 ++++++++++++++++++-
+ python/sglang/srt/layers/moe/topk.py          | 10 +++-
+ 3 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/moe/moe_fused_gate.py b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+index a97689d..3b517a1 100644
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -145,6 +145,8 @@ def _router_triton_kernel(
+     dynk_k,
+     dynk_kmin,
+     dynk_kmax,
++    dynk_cnt_ptr,  # [64, 2] int32 (kept slots, live rows) per slot, DYNK_COUNT only
++    DYNK_COUNT: tl.constexpr,
+     DYNK_MODE: tl.constexpr,  # 0 off, 1 fixed-k, 2 cumulative-prob, 3 learned gate
+     DYNK_TOPN: tl.constexpr,  # router probs fed to the learned gate (16)
+     DYNK_F: tl.constexpr,  # learned-gate input features (20, padded to 32 in-kernel)
+@@ -386,6 +388,14 @@ def _router_triton_kernel(
+             ok = (pred <= budget) & (kval >= dynk_kmin) & (kval <= dynk_kmax) & (offs_o[None, :] < DYNK_OUT)
+             k_sel = tl.min(tl.where(ok, kval, dynk_kmax), axis=1)[:, None]  # [BLOCK_M, 1]
+             keep = offs_k[None, :] < k_sel
++        if DYNK_COUNT:
++            kept_n = tl.sum(
++                tl.sum((keep & mask_k_routed[None, :] & live_m[:, None]).to(tl.int32), axis=1),
++                axis=0,
++            )
++            rows_n = tl.sum(live_m.to(tl.int32), axis=0)
++            tl.atomic_add(dynk_cnt_ptr + dynk_slot * 2, kept_n)
++            tl.atomic_add(dynk_cnt_ptr + dynk_slot * 2 + 1, rows_n)
+         keep = keep | (offs_k[None, :] >= K_ROUTED)  # never drop fused shared slots
+         selected_vals = tl.where(keep, selected_vals, 0.0)
+         selected_idx = tl.where(keep, selected_idx, -1)
+@@ -584,6 +594,8 @@ def moe_fused_gate(
+             dynk_k=int(dynk.k),
+             dynk_kmin=int(dynk.k_min),
+             dynk_kmax=int(dynk.k_max),
++            dynk_cnt_ptr=dynk.cnt if dynk.cnt is not None else _unused_i32,
++            DYNK_COUNT=dynk.cnt is not None,
+             DYNK_MODE=int(dynk.mode),
+             DYNK_TOPN=_dynk_mod.LEARNED_TOPN,
+             DYNK_F=_dynk_mod.LEARNED_F_IN,
+@@ -598,6 +610,8 @@ def moe_fused_gate(
+             dynk_k=0,
+             dynk_kmin=0,
+             dynk_kmax=0,
++            dynk_cnt_ptr=_unused_i32,
++            DYNK_COUNT=False,
+             DYNK_MODE=0,
+             DYNK_TOPN=16,
+             DYNK_F=20,
+diff --git a/python/sglang/srt/layers/moe/dynk.py b/python/sglang/srt/layers/moe/dynk.py
+index 61f7d7a..ee796f1 100644
+--- a/python/sglang/srt/layers/moe/dynk.py
++++ b/python/sglang/srt/layers/moe/dynk.py
+@@ -28,6 +28,10 @@ Duplicate expert ids within a token are a correctness hazard for cutlass_fused_m
+ (the duplicate's unpermuted->permuted row is never written; measured wrong by up to
+ 15.5 abs). Dynamic-k only ever writes -1, never a duplicate; ``check_no_duplicates``
+ asserts it outside graph capture when ``SGLANG_QWENOPT_DYNK_CHECK=1``.
++
++``SGLANG_QWENOPT_DYNK_STATS_FILE=/path.json`` turns on in-kernel per-slot counters
++(kept slots, live rows; padded graph rows excluded) written every 5 s, so mean k per
++layer is measured on live traffic rather than assumed.
+ """
+ from __future__ import annotations
+ 
+@@ -73,11 +77,54 @@ class DynKCallParams:
+     k_max: int
+     tau: torch.Tensor  # [NUM_SLOTS] fp32
+     mlp: Optional[torch.Tensor]  # [NUM_SLOTS, P] fp32 packed learned-gate params
++    cnt: Optional[torch.Tensor] = None  # [NUM_SLOTS, 2] int32 (kept slots, live rows)
+ 
+ 
+ _cfg: Optional[Dict[str, DynKArm]] = None
+ _dev_tau: Dict[tuple, torch.Tensor] = {}
+ _dev_mlp: Dict[tuple, torch.Tensor] = {}
++_dev_cnt: Dict[str, torch.Tensor] = {}
++_stats_thread = None
++
++
++def _stats_enabled() -> bool:
++    return bool(os.environ.get("SGLANG_QWENOPT_DYNK_STATS_FILE", "").strip())
++
++
++def _start_stats_writer(device: torch.device) -> None:
++    """Every 5 s copy the per-slot counters to host on a side stream (no sync with the
++    compute stream; values are cumulative and may lag by one step) and write JSON:
++    {"t": unix, "slots": {slot: [kept_slots, live_rows]}}. Readers diff two snapshots."""
++    global _stats_thread
++    if _stats_thread is not None:
++        return
++    import threading
++    import time
++
++    path = os.environ["SGLANG_QWENOPT_DYNK_STATS_FILE"].strip()
++    cnt = _dev_cnt[str(device)]
++
++    def run():
++        torch.cuda.set_device(device)
++        side = torch.cuda.Stream(device=device)
++        host = torch.empty(cnt.shape, dtype=cnt.dtype, pin_memory=True)
++        while True:
++            time.sleep(5.0)
++            try:
++                with torch.cuda.stream(side):
++                    host.copy_(cnt, non_blocking=True)
++                side.synchronize()
++                h = host.tolist()
++                out = {"t": time.time(), "slots": {str(i): h[i] for i in range(NUM_SLOTS) if h[i][1] > 0}}
++                tmp = path + ".tmp"
++                with open(tmp, "w") as f:
++                    json.dump(out, f)
++                os.replace(tmp, path)
++            except Exception as e:  # stats must never take the server down
++                logger.warning("dynk stats writer: %s", e)
++
++    _stats_thread = threading.Thread(target=run, name="dynk-stats", daemon=True)
++    _stats_thread.start()
+ 
+ 
+ def _parse_arm(d: Optional[dict], name: str) -> DynKArm:
+@@ -144,6 +191,9 @@ def prepare(slot: Optional[int], device: torch.device) -> None:
+         if len(tau) < NUM_SLOTS:  # per-layer list for the target; pad
+             tau = list(tau) + [tau[-1]] * (NUM_SLOTS - len(tau))
+         _dev_tau[key] = torch.tensor(tau[:NUM_SLOTS], dtype=torch.float32, device=device)
++    if _stats_enabled() and str(device) not in _dev_cnt:
++        _dev_cnt[str(device)] = torch.zeros((NUM_SLOTS, 2), dtype=torch.int32, device=device)
++        _start_stats_writer(device)
+     if arm.mode == MODE_LEARNED and key not in _dev_mlp:
+         blob = torch.load(arm.weights_path, map_location="cpu", weights_only=True)
+         packed = blob["packed"].to(torch.float32)  # [NUM_SLOTS or L, P]
+@@ -174,7 +224,7 @@ def call_params(slot: Optional[int], device: torch.device) -> Optional[DynKCallP
+         prepare(slot, device)
+     return DynKCallParams(
+         mode=arm.mode, slot=slot, k=arm.k, k_min=arm.k_min, k_max=arm.k_max,
+-        tau=_dev_tau[key], mlp=_dev_mlp.get(key),
++        tau=_dev_tau[key], mlp=_dev_mlp.get(key), cnt=_dev_cnt.get(str(device)),
+     )
+ 
+ 
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 71e79ee..2344281 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -1070,7 +1070,11 @@ def fused_topk(
+                 topk,
+                 scoring_func="softmax",
+                 renormalize=renormalize,
+-                **({"dynk": dynk} if dynk is not None else {}),
++                **(
++                    {"dynk": dynk, "num_token_non_padded": num_token_non_padded}
++                    if dynk is not None
++                    else {}
++                ),
+             )
+             dynk_done = True
+         else:
+@@ -2701,7 +2705,11 @@ def select_experts(
+                 )
+             # ===== END TO BE REFACTORED ====
+             if _dynk_params is not None and packed_topk is None:
++                # num_token_non_padded lets the kernel exclude padded graph rows from
++                # its kept-slot counters; the padded-row mask it applies (-1, 0.0) is
++                # the one _post_process_topk_ids applies anyway.
+                 _fused_topk_kwargs["dynk"] = _dynk_params
++                _fused_topk_kwargs["num_token_non_padded"] = num_token_non_padded
+                 _dynk_done = True
+             topk_weights, topk_ids = fused_topk(
+                 hidden_states=hidden_states,

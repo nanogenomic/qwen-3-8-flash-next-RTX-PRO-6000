@@ -1,0 +1,120 @@
+From d70f519e20815dc37680627a14251e708c786046 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:54:07 +0000
+Subject: [PATCH 23/32] fix(qsa): normalize the device key so cuda and cuda:0
+ share one buffer
+
+torch.device("cuda") and torch.device("cuda", 0) are different dict keys but the
+same physical device, so the shared packed-KV plan minted a SECOND max-size buffer
+for the bare form and silently halved the saving. The forward path always passes
+k_buffer.device, which carries an index, but a reservation or a caller that builds
+the device by name does not.
+
+Found by the GPU2 equivalence run, which reported packed_allocations=2 and
+packed_bytes=75497472 where the plan is 1 and 37748736. After the fix the same run
+reports 1 allocation / 36 MiB, and all four tiers plus an A->B->A interleave
+through one shared workspace are bitwise identical to per-instance scratch.
+
+CPU device is left untouched (no index to resolve).
+---
+ .../layers/attention/qsa/shared_scratch.py    | 25 +++++++++++++++-
+ .../speculative/test_adaptive_shared_ws.py    | 29 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/shared_scratch.py b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+index 2c4ed7c..5b43d13 100644
+--- a/python/sglang/srt/layers/attention/qsa/shared_scratch.py
++++ b/python/sglang/srt/layers/attention/qsa/shared_scratch.py
+@@ -114,6 +114,25 @@ def packed_kv_rows(num_tokens: int, expanded_topk: int) -> int:
+     return int(num_tokens) * pages_per_row * TRTLLM_SPARSE_PAGE_SIZE
+ 
+ 
++def _normalize_device(device) -> torch.device:
++    """Resolve an index-less device so it cannot key a second allocation.
++
++    ``torch.device("cuda")`` and ``torch.device("cuda", 0)`` are different dict
++    keys but the same physical device. A caller that passes the bare form (the
++    forward path passes ``k_buffer.device``, which always carries an index, but a
++    reservation or a test may not) would otherwise mint a second max-size buffer
++    and undo the sharing. Caught by the GPU equivalence run, which reported
++    ``packed_allocations=2``.
++    """
++    d = torch.device(device)
++    if d.index is not None or d.type == "cpu":
++        return d
++    try:
++        return torch.device(d.type, torch.get_device_module(d.type).current_device())
++    except Exception:
++        return d
++
++
+ class QSASharedScratchPlan:
+     """Reservations, allocations and the pointer-stability invariant.
+ 
+@@ -169,6 +188,7 @@ class QSASharedScratchPlan:
+         its address, so growing it would free the block that graph replays from.
+         """
+         capacity = int(capacity)
++        device = _normalize_device(device)
+         key = (int(num_kv_heads), int(head_dim), dtype, device)
+         self.handout_calls += 1
+         buffers = self._packed.get(key)
+@@ -202,6 +222,7 @@ class QSASharedScratchPlan:
+         self, batch: int, pages_per_row: int, page: int, device: torch.device
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         """Read-only arange block tables — a pure function of the key."""
++        device = _normalize_device(device)
+         key = (int(batch), int(pages_per_row), device)
+         cached = self._sparse_tables.get(key)
+         if cached is None:
+@@ -271,7 +292,9 @@ def qsa_trtllm_workspace(device: torch.device) -> torch.Tensor:
+     return get_buffer(
+         _WORKSPACE_KEY,
+         lambda: torch.zeros(
+-            TRTLLM_SPARSE_WORKSPACE_BYTES, dtype=torch.uint8, device=device
++            TRTLLM_SPARSE_WORKSPACE_BYTES,
++            dtype=torch.uint8,
++            device=_normalize_device(device),
+         ),
+     )
+ 
+diff --git a/test/registered/unit/speculative/test_adaptive_shared_ws.py b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+index fa6bd2c..7e1010e 100644
+--- a/test/registered/unit/speculative/test_adaptive_shared_ws.py
++++ b/test/registered/unit/speculative/test_adaptive_shared_ws.py
+@@ -295,6 +295,35 @@ def test_over_capacity_request_returns_none_instead_of_reallocating():
+     assert k2.data_ptr() == ptr
+ 
+ 
++def test_indexless_and_indexed_device_are_one_key():
++    """``cuda`` and ``cuda:0`` must not mint two max-size buffers.
++
++    The forward path passes ``k_buffer.device`` (always indexed) but a reservation
++    or a test may pass the bare form. Keying on the raw torch.device split them
++    and allocated twice -- found by the GPU equivalence run
++    (``packed_allocations=2``), fixed by normalizing the key.
++    """
++    from sglang.srt.layers.attention.qsa.shared_scratch import _normalize_device
++
++    # CPU has no index to resolve and must be left alone.
++    assert _normalize_device(torch.device("cpu")) == torch.device("cpu")
++    assert _normalize_device("cpu") == torch.device("cpu")
++    if not torch.cuda.is_available():
++        pytest.skip("no CUDA device to resolve an index against")
++    assert _normalize_device(torch.device("cuda")).index is not None
++    assert _normalize_device(torch.device("cuda")) == _normalize_device(
++        torch.device("cuda", torch.cuda.current_device())
++    )
++    plan = QSASharedScratchPlan()
++    plan.reserve_rows(576)
++    k1, _ = plan.packed_kv(576, KV_HEADS, HEAD_DIM, DTYPE, torch.device("cuda"))
++    k2, _ = plan.packed_kv(
++        576, KV_HEADS, HEAD_DIM, DTYPE, torch.device("cuda", torch.cuda.current_device())
++    )
++    assert k1.data_ptr() == k2.data_ptr()
++    assert plan.packed_allocations == 1
++
++
+ def test_block_tables_are_pure_functions_of_their_key():
+     plan = QSASharedScratchPlan()
+     pages = math.ceil(EXPANDED_TOPK / TRTLLM_SPARSE_PAGE_SIZE)
