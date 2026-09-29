@@ -357,38 +357,38 @@ Host RAM floor during the run: **63 GiB MemAvailable**. Host↔GPU transfer meas
   1M** (from 93.0 at 256k) `[vendor-published]`. Needle retrieval passing is **not** a
   statement about multi-needle reasoning at these depths.
 
-### 3.5 Native RoPE past the trained window — retrieval holds to at least 530K (suite in progress)
+### 3.5 Native RoPE past the trained window — retrieval to 672K, short-context lossless
 
-`[measured]` With fp8 KV and **no rope override at all**, needle retrieval passes well past the
-trained 262,144-token window. Booting above the derived window needs
-`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. Full detail in
-[BENCHMARKS §3.8](BENCHMARKS.md#38-native-context-beyond-the-trained-window-with-no-yarn--suite-stage-2-of-n).
+`[measured]` With fp8 KV and **no rope override at all**, the model retrieves far past its trained
+262,144-token window, and declaring the larger window does not change short-context outputs. Booting
+above the derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. Full detail in
+[BENCHMARKS §3.8](BENCHMARKS.md#38-long-context-suite--complete-second-card).
 
-- **Second card (RTX PRO 6000 Server Edition, 600 W; production-config replica, 540K declaration,
-  pool 689,728):** a 3-depth × 3-trial grid passes **36 / 36** at 300K, 400K, 440K and 470K
-  (1.79×), and a start/end bracket passes **8 / 8** at 480K, 500K, 510K and **530K (2.02×)**. Every
-  completion was the exact passphrase. An over-limit 691,728-token request was cleanly refused with
-  HTTP 400.
-- **Reference card (300 W Max-Q, pool 519,040):** passes at ~200K (control), ~300K and ~400K; the
-  ~500K case returned an empty completion. The earlier conclusion that retrieval *"has broken by
-  500k"* is **superseded** — 500K passes on the second card, so it is **probably capacity, not
-  position**. Not re-tested, so not confirmed.
+Measured on a second card — RTX PRO 6000 Server Edition, 600 W, running a replica of the production
+configuration. Pass/fail and ratios transfer to the 300 W reference card; tok/s and pool sizes do not.
 
-This is worth more than the YaRN path for an agent lane, because YaRN f=4 is static and
-process-wide and measurably shifts short-context logits, whereas native extrapolation costs nothing
-at short context — **subject to** the normal-length equivalence test below.
+- **Retrieval 60 / 60**, no position ceiling found: 36 / 36 at 300–470K (3 depths × 3 trials), 8 / 8
+  at 480–530K, 16 / 16 at 560–672K on a 680,000 declaration. **672K is 2.56× the trained window**, and
+  it passed with 14,228 tokens of pool to spare. The pool binds before position does.
+- **Short-context equivalence PASS**, 540,000 vs 262,144 declared: mean |Δlogprob| 0.0171 vs a noise
+  run's 0.0157 at concurrency 1 (p 0.12), 0.0163 vs 0.0163 at concurrency 4 (p 0.63); degeneracy
+  0 / 192. **Lossless relative to run-to-run noise, not bitwise.** The gate's overall verdict reads
+  FAIL only because its long-context-claim rule requires needle cells in the same run; this was a
+  decode-path-only run and the needle evidence is the separate 60 retrievals above.
+- **Pool cost of the declaration:** −2.9 % at 540,000 and −3.4 % at 680,000 on the second card;
+  −4.4 % at 540,000 on the reference card.
+- **Recall at length is intact.** With five facts spread through the document, asked to list them
+  before answering, the model recalled all five exactly and answered correctly 10 of 10 times at every
+  length to 470K (n = 2 per length). A direct one-shot sum fails even at the 100K in-window control,
+  so that failure is arithmetic, not context.
+- **The reference card's earlier "broken by 500k" conclusion is superseded** — probably capacity,
+  not position; 500K passes on the second card. Not re-tested on the reference card.
 
-Load-bearing caveats:
-- **It is retrieval, not reasoning.** A long-document aggregation stage (five facts, argmax and sum)
-  scored argmax **7/8** and sum **2/8** — but the sum fails at the 100K in-window control too, so it
-  is not a context-length failure, and the run cannot separate a missed record from an arithmetic
-  slip. A recall-separating follow-up and a thinking-on variant are running.
-- **Normal-length equivalence under a 540K declaration is not yet verified.** A decode-path test
-  between a 262K and a 540K boot is part of the suite.
-- **No quality verdict exists at any length past 262,144**, and **no production deployment has been
-  changed** on this basis — the reference deployment serves 262,144 per request.
-- The second card is a different SKU and power class; its wall times are not comparable to anything
-  measured on the reference card.
+This is worth more than the YaRN path: YaRN f=4 is static and process-wide and measurably shifts
+short-context logits, whereas a larger native declaration was shown not to.
+
+Remaining limits: no accuracy benchmark or quality gate at any length past 262,144; reasoning is n = 2
+per cell; the ceiling was not found.
 
 *Hypothesis, not a finding:* only **12 of 48 layers are full-attention** and
 `partial_rotary_factor` is **0.25**, so RoPE acts on a quarter of the dimensions in a quarter of

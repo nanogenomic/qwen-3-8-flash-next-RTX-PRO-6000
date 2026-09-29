@@ -111,142 +111,188 @@ and the open gaps. No strict-mode (≤ 2-point) verdict was issued. The harness 
 The conc-4 WARN is a small but real divergence, which is why fp8 KV ships **labelled lossy
 and opt-in** rather than as a default.
 
-### Context beyond the trained window, with no YaRN — long-context suite, stage 2 of N
+## If you run agents on this model, set `--max-mamba-cache-size` first
 
-> **This is an in-progress suite, not a certification.** Retrieval is now measured well past the
-> trained window. Reasoning at length is **not** established, normal-length equivalence under a
-> larger declared window is **not yet verified**, and **no production deployment has been changed
-> on the strength of any of it** — the reference deployment still serves 262,144 tokens per
-> request. Further results will be added as they land.
+**This is the most useful single finding for anyone serving this model to agents, and it is
+invisible in every standard benchmark.** `[measured, second card — see note below]`
 
-`[measured]` With fp8 KV and **no rope override of any kind**, this model retrieves past its
-trained 262,144-token window on native RoPE alone. Booting above the derived window needs
-`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+A multi-turn agent simulation: 6 conversations at 4 running requests, each re-sending its
+full, growing history every turn (starting at 60K tokens, adding 2–4K of real text plus its own
+256-token reply per turn, 7 turns). The hit fraction is the engine's own `cached_tokens /
+prompt_tokens`, averaged over every turn after the first.
 
-**Headline: needle retrieval holds through at least 530K — 2.02× the trained window — across
-start, middle and end positions.** The full grid runs to 470K (1.79×); 480K–530K is a thinner
-bracket. That result comes from a **different card** from the rest of this repository, so read
-the next two subsections for what that does and does not change.
+| `--max-mamba-cache-size` | KV pool | Prefix-cache hit | Requests with >50 % hit | Mean TTFT |
+|---|---|---|---|---|
+| 12 (the quickstart value) | 710,336 | **5.4 %** | 2 / 36 | **16.8 s** |
+| 24 | 660,416 (−7.0 %) | 2.7 % | 1 / 36 | 16.8 s |
+| **36** | 610,496 (−14.1 %) | **95.6 %** | **36 / 36** | **2.5 s** |
 
-#### Result on a second card: 44 of 44 retrievals, and a clean over-limit refusal
+**Controls**, at 12 slots with fewer conversations: 1 conversation 95.1 % / 0.29 s; 2 conversations
+95.5 % / 0.30 s; 4 conversations 89.4 % / 0.62 s. **So prefix caching works.** What breaks is
+contention for the slots that hold each conversation's linear-attention state.
 
-**Hardware: NVIDIA RTX PRO 6000 Blackwell *Server Edition*, 600 W, 97,887 MiB.** Same SM120
-architecture as the reference card, but **not** the 300 W Max-Q that every other measurement here
-uses. The engine was a replica of the production configuration — this tree's final build, fp8 KV,
-both fuse levers, `sm120gemv`, the stock MTP draft head — booted with `--context-length 540000`.
-KV pool at that declaration: **689,728 tokens**.
+**The mechanism.** This is a hybrid model: 36 of its 48 layers are gated-delta-net linear attention,
+which carries a recurrent state rather than a KV cache. To reuse a cached prefix, the engine needs
+that conversation's **linear-attention state snapshot** as well as its KV. Each running request
+occupies 3 state slots, so 4 running requests fill all 12. When a conversation goes idle between
+turns, nothing is left to hold its snapshot, so the snapshot is evicted — and the next turn
+**re-prefills the whole history even though its KV is still sitting in the pool.** Nothing errors.
+The lane just spends almost all its time re-reading 60–80K-token histories.
 
-Each trial uses a distinct public-domain book window and its own passphrase, inserted as a
-synthetic needle. Temperature 0, thinking off.
+**It is a threshold, not a curve.** 24 slots was *worse* than 12, not halfway to 36. Below the
+threshold you get nearly nothing; above it you get nearly everything.
 
-| Stage | Prompt | × trained window | Depths | Trials | Result |
+**Rule of thumb, fitted to those six observations:** when live conversations exceed
+`--max-running-requests`, set
+
+```
+--max-mamba-cache-size  ≳  3 × max_running_requests  +  3 × (conversations to keep warm)
+```
+
+and when they do not, `3 × max_running_requests` was sufficient (the 1-, 2- and 4-conversation
+controls above). For 6 conversations at 4 running that gives 30, which matches 24 failing and 36
+working. Hold it loosely: the data **brackets** this workload's threshold between 24 and 36, it
+does not pin it, and a simpler "+1 slot per conversation" rule is contradicted by the 24-slot
+result. Treat the formula as a safe estimate, then measure your own hit rate.
+
+**The cost** is KV pool: about 50K tokens per 12 slots on the card measured. For an agent workload
+that is overwhelmingly worth it — the alternative is a 7× longer time-to-first-token on every turn.
+
+## Context past the trained window — long-context suite, complete
+
+`[measured]` **No YaRN, no rope override: native RoPE only.** Booting above the derived window
+needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+
+> **Where these were measured.** Everything in this section and the one above was measured on an
+> **RTX PRO 6000 Blackwell Server Edition, 600 W, driver 580.95.05** — same SM120 architecture as the
+> reference card, but not the **300 W Max-Q, driver 610.43.02** that every other number in this
+> repository comes from. It ran a replica of the production configuration: this tree's final
+> build, fp8 KV, both fuse levers, `sm120gemv`, NEXTN with the stock draft head. **Pass/fail
+> results and same-boot ratios transfer to the reference card. Absolute tok/s, TTFT and pool
+> sizes do not**, and none of them appears in any throughput table here.
+
+### Retrieval: 60 of 60, and no position ceiling found
+
+One synthetic passphrase needle per request in a real-text public-domain haystack; a distinct
+book window and passphrase per trial; temperature 0; thinking off; exact-match scoring.
+
+| Lengths | × trained 262,144 | Declared window | Depths | Per length | Result |
 |---|---|---|---|---|---|
-| 1 — grid | 300K | 1.14× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
-| 1 — grid | 400K | 1.53× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
-| 1 — grid | 440K | 1.68× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
-| 1 — grid | 470K | **1.79×** | 2 %, 50 %, 95 % | 3 | **9 / 9** |
-| 2 — bracket | 480K | 1.83× | 2 %, 95 % | 1 | **2 / 2** |
-| 2 — bracket | 500K | 1.91× | 2 %, 95 % | 1 | **2 / 2** |
-| 2 — bracket | 510K | 1.95× | 2 %, 95 % | 1 | **2 / 2** |
-| 2 — bracket | 530K | **2.02×** | 2 %, 95 % | 1 | **2 / 2** |
-| over-limit | 691,728 | — | 2 %, 95 % | 1 | **HTTP 400**, refused immediately |
+| 300K, 400K, 440K, 470K | 1.14–1.79× | 540,000 | 2 %, 50 %, 95 % | 9 | **36 / 36** |
+| 480K, 500K, 510K, 530K | 1.83–2.02× | 540,000 | 2 %, 95 % | 2 | **8 / 8** |
+| 560K, 600K, 640K, 672K | 2.14–**2.56×** | 680,000 | 2 %, 95 % | 4 | **16 / 16** |
 
-Every completion was the **exact passphrase** with `finish_reason: stop` — no errors, no empty
-completions, no near-misses. The over-limit request was refused up front with *"input (691,793
-tokens) is longer than the model's context length (540000)"*: a clean refusal, which is the
-behaviour you want, and **not a retrieval failure**.
+Every completion was the exact passphrase with `finish_reason: stop`: no errors, no empty
+completions, no near-misses. The server logs show no retractions, pool-full, abort or OOM events
+during the 680K runs. A deliberately over-limit 691,728-token request was refused immediately with
+HTTP 400 ("input … is longer than the model's context length") — a clean refusal, not a
+retrieval result.
 
-**Read the two halves differently.** The grid is 9 retrievals per length at start, middle and end.
-The bracket is 2 per length, start and end only, one trial — enough to find that there is **no
-retrieval ceiling below 530K on this card**, not enough to characterise 480K–530K as thoroughly as
-the grid does.
+**672K is 2.56× the trained window, and it passed with 14,228 tokens of pool to spare.** The suite
+stopped there because the pool, not the position encoding, had become the binding limit.
 
-Wall time per request on **this 600 W card only**, prefill-dominated:
+**The reference card's earlier 500K failure was most likely capacity, not position.** On the
+300 W card a ~500K prompt returned an empty completion with a 519,040-token pool. 500K passes here,
+at the same declaration, on the same engine build — so position alone does not explain it, and a
+~500K prompt plus the draft head's and state slots' reservations sits at the edge of a 519,040
+pool. Probable, not confirmed: it was not re-run on that card.
 
-| 300K | 400K | 440K | 470K | 480K | 500K | 510K | 530K |
-|---|---|---|---|---|---|---|---|
-| 30.7 s | 46.1 s | 54.3 s | 61.2 s | 63.6 s | 68.5 s | 70.5 s | 76.0 s |
+### Declaring a larger window does not change short-context outputs
 
-These are deliberately kept out of every throughput table in this repository: a 600 W Server
-Edition card is not comparable to the 300 W Max-Q reference card, and mixing them would be wrong.
+A decode-path equivalence test — 48 real prompts, greedy, 384 tokens, 2 reps — between a boot
+declared at 262,144 and one declared at 540,000, against a noise run that repeats the 262,144 boot:
 
-#### Result on the reference card, and a revised reading of its 500K case
+| Concurrency | 540K vs 262K, mean \|Δlogprob\| | Noise (262K vs 262K) | p (Δ larger) | Verdict |
+|---|---|---|---|---|
+| 1 | 0.0171 | 0.0157 | 0.12 | **PASS** |
+| 4 | 0.0163 | 0.0163 | 0.63 | **PASS** |
 
-The original probe on the 300 W reference card, one needle per request:
+Degeneracy 0 / 192. **This is lossless relative to run-to-run noise — not bitwise.** The engine is
+not deterministic run to run, and the 540K-vs-262K divergence sits inside that noise.
 
-| Prompt | × trained window | Result | Wall |
+One procedural note, so nobody is surprised by it: the gate's *overall* verdict on that comparison
+reads FAIL. That comes solely from its long-context-claim rule, which fails any candidate declaring
+more than 262,144 tokens unless the **same** run carries needle cells past 262,144 — and this was a
+decode-path-only run. The needle evidence exists; it is the 60 retrievals above, gathered by a
+separate harness. Decode-path and degeneracy both PASS.
+
+The only cost of the larger declaration is pool: **−2.9 % at 540,000 and −3.4 % at 680,000**
+(710,336 → 689,728 → 686,336 on the card measured). On the reference card the same effect measured
+−4.4 % (542,912 → 519,040).
+
+### Reasoning at length — n = 2 per cell
+
+Five synthetic ledger records at 10 %, 30 %, 50 %, 70 % and 90 % depth of a real-text document; one
+question needing all five (which record is largest, and the total). **Two trials per cell, so read
+each cell as a signal, not a rate.**
+
+| Length | Direct answer: argmax / sum | "List every record, then answer": recall / both | Thinking on (3,000-token budget): both |
 |---|---|---|---|
-| ~200k (in-range control) | 0.76× | **PASS** | — |
-| ~300k | 1.14× | **PASS** | — |
-| ~400k, needle 398k tokens back | 1.53× | **PASS** | 57.1 s |
-| ~500k | 1.91× | empty completion — **probably capacity, not position** (below) | 81.7 s |
-| 520,059 | 1.98× | **HTTP 400 — capacity refusal**, pool 519,040 < prompt | — |
+| 100K (in-window control) | 2/2 · **1/2** | 5/5 · 2/2 | 2/2 |
+| 300K | 2/2 · 1/2 | 5/5 · 2/2 | 2/2 |
+| 400K | 2/2 · 0/2 | 5/5 · 2/2 | 1/2 † |
+| 440K | 1/2 · 0/2 | 5/5 · 2/2 | — |
+| 470K | — | 5/5 · 2/2 | 1/2 † |
 
-This was previously written up as *"holds to 400k and has broken by 500k."* **That reading is
-superseded.** The same 500K position passes 2/2 on the second card at the same declared window,
-with no YaRN, on the same engine build — so position alone does not explain the reference card's
-empty completion. The **probable** explanation is capacity: that card's pool was 519,040 at the
-540K declaration, and a ~500K prompt plus the draft head's and state slots' reservations sits at
-that edge. **This is the likely cause, not a confirmed one — the 500K case has not been re-run on
-the reference card.**
+† Both thinking-mode misses stopped on the 3,000-token budget (`finish_reason: length`) before
+answering. Neither is a wrong answer.
 
-#### Stage 1b — long-document aggregation: argmax 7/8, sum 2/8, and why that is not a context failure
+**Asked to list the records first, the model recalled all five exactly and answered correctly in 10
+of 10 cases, at every length to 470K.** The direct-answer sum is not a context result: it fails at
+the 100K control, inside the native window. An earlier version of these docs said this run could not
+distinguish a missed record from an arithmetic slip; the list-first stage resolves that. The records
+are recalled perfectly, so the direct-answer errors are most likely the one-shot addition of five
+numbers with thinking off.
 
-Needle retrieval is a lookup. To start probing reasoning, the suite inserted **five synthetic
-ledger records at 10 %, 30 %, 50 %, 70 % and 90 % depth** of a real-text document and asked for two
-things that need all five: which record is largest (**argmax**) and the **sum**. Direct answer,
-thinking off, scored exactly. Two trials each at 100K, 300K, 400K and 440K, on the second card.
+### Decode speed is flat in context; the cost of long context is prefill
 
-| | 100K (control) | 300K | 400K | 440K | Overall |
-|---|---|---|---|---|---|
-| argmax correct | 2 / 2 | 2 / 2 | 2 / 2 | 1 / 2 | **7 / 8** |
-| sum correct | 1 / 2 | 1 / 2 | 0 / 2 | 0 / 2 | **2 / 8** |
+`[second card, relative only]` Single stream, production configuration, 540K declaration, 2 reps,
+first request discarded:
 
-**Do not read the sum column as a long-context failure.** It fails at the **100K control, which is
-inside the native window**, so whatever is going wrong is not caused by exceeding the trained window.
-*What* is going wrong, this run cannot say: five of the six wrong sums are **under**-counts, which
-fits a record being missed just as well as a slip in five-term addition done with thinking disabled.
-The argmax column, which is closer to a lookup, holds at 7/8 with a single miss at 440K.
+- **Decode is flat from 4K to 400K** — 152–174 tok/s per stream (median), with 400K at 0.95–1.0× of
+  4K. Qwen sparse attention reads at most ~2,048 selected tokens per step, so decode cost barely
+  moves with context.
+- **Long context costs prefill.** Prefill ran at 12.2–12.6K tokens/s up to ~100K, then fell to
+  11.2K at ~195K, 9.9K at ~290K and 8.7K at ~390K. Time to first token was 0.32 s at 4K and 44.8 s
+  at ~390K.
+- **Short turns decode faster per token:** 128-token generations ran 1.2–1.4× faster than 512-token
+  ones, with accept length 3.0–3.4 against ~2.45. Early tokens in a reply are easier to draft.
 
-**No reasoning conclusion is drawn from this yet.** A follow-up that separates recall from
-arithmetic — asking the model to list every record before answering, and repeating the task with
-thinking on — is running, and it is the result that will say something about reasoning at length.
+### What is not established
 
-#### What is still not established
+- **A quality verdict at any length past 262,144.** Retrieval and recall passes are a capability
+  result, not an accuracy benchmark.
+- **The position ceiling.** None was found; 672K passed with little pool to spare.
+- **Reasoning at scale.** n = 2 per cell throughout the reasoning table.
+- **Whether the reference card's 500K result was capacity.** Probable, not re-tested.
 
-- **Reasoning at length.** Retrieval is a lookup test. Stage 1b's arithmetic confound is being
-  separated out; until then, nothing here says the model *reasons* well at 400K+.
-- **Normal-length equivalence under a larger declared window.** Whether booting at 540K changes
-  outputs at ordinary lengths has not been verified. A decode-path equivalence test between a 262K
-  and a 540K boot is part of the suite.
-- **The retrieval ceiling.** It is above 530K on the second card and has not been found. Beyond
-  that, the declared window and the pool become the limit before position does.
-- **Whether the reference card's 500K result was capacity.** Probable, untested.
-- **A quality verdict at any length past 262,144.** None has been issued.
+*Hypothesis only:* 12 of 48 layers are full-attention and `partial_rotary_factor` is 0.25, so RoPE
+acts on a quarter of the dimensions in a quarter of the layers — a small positional surface, which
+fits graceful extrapolation to 2.56×. No experiment here isolates it.
 
-#### Two things that still hold
+A reproducibility note: the suite used a private, traffic-derived speculative token map. A map
+changes only which draft tokens are proposed and the target verifies them, so it cannot change a
+greedy completion.
 
-*Hypothesis, not a finding:* only **12 of 48 layers** are full-attention (the other 36 are
-gated-delta-net linear attention), and `partial_rotary_factor` is **0.25**, so RoPE covers a
-quarter of the dimensions in a quarter of the layers. That is a small positional surface to
-extrapolate, which would be consistent with the graceful behaviour now seen out to 2.02× — but it
-has not been tested directly, and it is not an explanation anyone should rely on.
+## Recommended configuration
 
-It is **cheaper than YaRN**: static YaRN f=4 is process-wide, shifts short-context logits by
-0.066–0.283 nats/token against native, and needs a separate process. Native extrapolation costs
-nothing at short context — **provided** the normal-length equivalence test above comes back clean,
-which is precisely why it is in the suite.
+These are the conclusions of the suite, measured on the second card and read across by ratio:
 
-A reproducibility note: both cards' runs used a speculative token map built from private traffic,
-which is not published. A map only changes which draft tokens are proposed; the target model
-verifies them, so it cannot change a greedy completion — the retrieval and aggregation results do
-not depend on it. Completions here are a handful of tokens and wall time is prefill-dominated, so
-the map has negligible effect on the timings either.
+| Setting | Recommendation | Why |
+|---|---|---|
+| `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
+| Per-request window to advertise | **~400K (393,216)** on a shared card | Where the pool binds. One request that size needs most of the pool, so gate it as exclusive use rather than an ordinary slot |
+| `--max-mamba-cache-size` | **36** at 4 running requests | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations |
+| `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
+| `--enable-priority-scheduling` | only **if fan-out grows past 4** — and set `--default-priority-value` | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
 
-Full methodology, harness, rep counts and noise bands: **[BENCHMARKS.md](BENCHMARKS.md)**.
-Per-lever specification: **[CHANGES-vs-upstream.md](CHANGES-vs-upstream.md)**.
-
----
+**The reference deployment adopted this configuration on 2026-09-29.** Its production card came up
+at `--context-length 540000`, 36 slots and 4 running requests with a **522,880-token pool**
+`[measured, read from /get_server_info]` — priority scheduling left off, as recommended at 4 streams.
+That is well above a projection of ~420K made beforehand, which had subtracted the slot cost from
+the *test* card's 519,040; the production card carries less foreign VRAM, and its own 262K baseline
+(643,456) predicts ~524K. A ~393K request takes about 75 % of 522,880, which is why it is still best
+treated as exclusive use rather than an ordinary slot.
 
 ## The correctness fix, separately
 
@@ -311,8 +357,10 @@ git am /path/to/this/patches/0*.patch
 
 ### Run it
 
-This is the configuration the measured results were taken on, transcribed from the reference
-deployment's own service unit rather than reconstructed:
+This is the configuration the headline results were measured on, transcribed from the reference
+deployment's own service unit rather than reconstructed. **For serving agents, use the
+[Recommended configuration](#recommended-configuration) instead** — it changes `--context-length` to
+540000 and `--max-mamba-cache-size` to 36, and the reference deployment has since moved to it:
 
 ```bash
 export SGLANG_QWENOPT_FUSE_SBMOE=1     # 4-launch small-batch NVFP4 MoE, bitwise-identical
@@ -469,13 +517,18 @@ layers**, which splits the memory cost in two:
 So the pool cost is roughly `N × fixed + total_tokens × rate`. Two consequences matter more
 than the formula:
 
-1. **Concurrency is capped by `--max-mamba-cache-size`, not by the token budget.** At 12 slots
-   and 3 slots per request that is **4 concurrent requests**, which is why the shipping config
-   pairs `--max-mamba-cache-size 12` with `--max-running-requests 4`. Raise one without the
-   other and nothing happens.
-2. **Every extra mamba slot comes out of the KV pool 1:1** — `[measured]` **~0.093 GB ≈ 3,750
-   pool tokens per slot**, so **~11,250 pool tokens per additional running request**.
-   Concurrency and context trade directly against each other.
+1. **Running concurrency needs 3 state slots per request, so the slot count caps it.** At 12
+   slots that is 4 running requests, which is why the shipping config pairs
+   `--max-mamba-cache-size 12` with `--max-running-requests 4`. But slots *beyond* 3 per running
+   request are **not** wasted: they hold idle conversations' state so their cached prefixes stay
+   usable — which is the whole of the finding in
+   [If you run agents on this model](#if-you-run-agents-on-this-model-set---max-mamba-cache-size-first).
+   Raising the slot count without raising concurrency is often exactly the right move.
+2. **Every slot and every running request comes out of the KV pool.** `[measured]` A state slot
+   costs roughly 3,750–4,160 pool tokens (the lower figure on the reference card, the higher on the
+   second card). A whole extra running request costs more than its 3 slots: **29,120 pool tokens**
+   measured on the second card, of which the slots are about 12,480 and the rest is the engine's
+   other per-stream reservations. Concurrency and context trade directly against each other.
 
 The practical inversion: **for many small requests the fixed term dominates, so admitting fewer
 clients can free more pool than shrinking each client's context.** That is the opposite of the
@@ -495,6 +548,59 @@ Subagent work is bounded — a subagent that searches, reads and reports does no
 primary's window — and sizing it small is what buys the primary its context. Treat the numbers
 above as an illustration of the method, not as your budget; substitute your own pool and your
 own session shapes.
+
+#### More streams buy little; priority scheduling buys admission
+
+`[measured, second card, same-boot ratios]`
+
+**Each extra running request costs ~29,120 pool tokens** (pool 710,336 / 652,096 / 593,856 /
+477,376 at 4 / 6 / 8 / 12 streams). Its 3 state slots are about 12,480 of that (~4,160 tokens per
+slot); the rest is the engine's other per-stream reservations.
+
+What it buys, on one fresh boot with uniform 8K prompts and 256-token replies:
+
+| Concurrent | Aggregate tok/s | Per-stream decode, median | TTFT p50 | Accept length |
+|---|---|---|---|---|
+| 1 | 111 | 179 | 0.88 s | 2.63 |
+| 2 | 142 | 124 | 1.25 s | 2.46 |
+| 4 | **188** | 87 | 2.75 s | 2.48 |
+| 6 | **205** | 63 | 2.74 s | 2.54 |
+| 8 | 191 | 49 | 4.26 s | 2.50 |
+
+A separate 12-stream boot reached 210–213 aggregate at ~34 per stream (median). So going from 4 to
+6 streams bought **+9 %** aggregate on the same boot, and 12 streams about +12–13 % across boots —
+while per-stream decode fell by 2.5×. **Beyond 4, you trade a lot of per-stream speed and pool for a
+little aggregate.** Per-stream figures are medians; the means run higher on a long tail of fast
+streams.
+
+**Accept length does not fall with concurrency** — it is flat at 2.46–2.63 from 1 to 8 streams on a
+clean boot. An apparent drop to ~1.85 at higher stream counts was a measurement artefact: a synthetic
+workload of forced continuations from random mid-document windows drafts at ~1.85 at *every* stream
+count, including 4. The content moved it, not the batch size.
+
+**Priority scheduling** (`--enable-priority-scheduling`), at 12 streams saturated by 14 background
+streams at priority 0, with a main stream at priority 100:
+
+| | First-come-first-served | Priority on |
+|---|---|---|
+| Main stream TTFT, median / p90 | **5.24 s / 5.63 s** | **1.11 s / 1.38 s** |
+| Main stream decode | 28.6 tok/s | 28.9 tok/s |
+| Background decode | 29.7 tok/s | 27.7 tok/s |
+| Background requests completed in the window | 152 | **113 (−26 %)** |
+
+It cuts the main agent's time to first token **4.7×** and does not change its decode speed, which is
+set by the batch. The cost lands on everything else: background completed about a quarter fewer
+requests in the same window.
+
+> **⛔ Caveat before you enable it: untagged requests go to the back of the queue.** With priority
+> scheduling on, a chat or completions request that carries no `priority` field arrives as `None`,
+> and unless `--default-priority-value` is set, the scheduler assigns it the most extreme value in
+> the losing direction — **below even an explicit priority of 0.** SGLang logs a warning at boot for
+> exactly this configuration. So if you raise your main agent's priority and leave its auxiliary
+> calls untagged (context compaction, summarisation, tool-result post-processing), those calls queue
+> behind *all* background work and can starve — and a stalled compaction stalls the agent that
+> needed it. Either **set `--default-priority-value`** to the tier you want untagged work to run at,
+> or tag every call. (The Responses API is the exception: its `priority` field defaults to 0.)
 
 #### The trap: subagents that inherit their context window
 
@@ -642,7 +748,7 @@ Not ours, listed because a result above needs them.
 |---|---|
 | `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Required to boot with `--context-length` above the window SGLang derives from the checkpoint. Needed for the native-extrapolation result and for any YaRN configuration. |
 | `--kv-cache-dtype fp8_e4m3` | Opt-in lossy. **1.94× the KV pool** (279,680 → 542,912), and required to reach a pool that admits ~400k-token prompts. |
-| `--max-mamba-cache-size` **and** `--max-running-requests` | These two must be set **together**: 3 mamba slots per request means the cache size divided by 3 is the real concurrency cap, whatever `--max-running-requests` says. See [Sizing for multiple clients and subagents](#sizing-for-multiple-clients-and-subagents). |
+| `--max-mamba-cache-size` **and** `--max-running-requests` | Set them **together**: 3 slots per running request means the slot count divided by 3 caps concurrency, whatever `--max-running-requests` says. For agent workloads set the slot count **higher** than 3 × running requests — the spare slots keep idle conversations' prefixes cacheable. See [If you run agents on this model](#if-you-run-agents-on-this-model-set---max-mamba-cache-size-first). |
 | `--context-length` | Declaring a larger window **costs pool** (measured: 542,912 tokens at 262k vs 519,040 at 540k), so do not advertise a window you do not intend to serve. |
 
 ### Build helpers (optional levers only)
