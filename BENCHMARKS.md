@@ -109,19 +109,47 @@ GSM8K, IFEval, HumanEval, HumanEval+, MBPP+ and MMLU-Pro are the standard public
 |---|---|---|---|
 | Single-stream, short context | 138.8 | **166.4** (+19.9 %) | 159.8 (+15.1 %) |
 | Single-stream peak (@325 tokens) | — | 180.5 | 167.3 |
-| Single-stream @48.6k | — | 175.6 | 164.2 |
-| Single-stream @95k | — | 155.5 (@98k) | 154.4 |
-| Single-stream @250k | — | — | **145.8** |
 | 4-concurrent aggregate | 351 | **413.9** (+17.9 %) | 411.4 (+17.1 %) |
 | KV pool, test card | 241,728 | **279,680** (+15.7 %) | **542,912** (2.25×) |
 | KV pool, production card | 241,728 | **331,456** (+37 %) | — |
 | Per-token time, 325 → 250k context | grows with depth | — | 14.7 → 15.4 ms (+4.5 % over 770× context) |
+
+Single-stream by context depth is in **§3.1b**, which is the one place those figures live.
 
 The fp8-KV column is a **2-rep mean**. The lossless column comes from a single run of the
 final build with both fuse levers on.
 
 A separate live check on the production lane after deployment measured **176.4 tok/s** on a
 768-token reply through the serving router.
+
+### 3.1b Single-stream across the full context range, and where it was not swept
+
+`[measured]` Consolidated from the three arms that between them cover the range. No cell is
+interpolated, and each column is a different configuration.
+
+| Depth | bf16 KV (shipping) | + fp8 KV (opt-in lossy) | host-KV + YaRN f=4 (1M arm) |
+|---|---|---|---|
+| 325 tokens | **180.5** | 167.3 | — |
+| 48.6k | **175.6** | 164.2 | — |
+| ~95–98k | **155.5** (@98k) | 154.4 (@95k) | — |
+| 250k | *not swept* | **145.8** | **157.0** |
+| 500k | *not swept* | — | **154.4** |
+| 900k | *not swept* | — | **141.0** |
+
+tok/s, temperature 0, single stream. Per-token latency over the same span:
+**14.7 → 15.4 ms from 325 tokens to 250k, +4.5 % across a 770× context increase.**
+
+**The "not swept" cells are a measurement gap, not a capability limit.** The shipping bf16-KV
+arm holds a 279,680-token pool (331,456 in production) and can serve far past 98k; its context
+sweep used harness cells at 4k / 48.6k / 95.4k and stopped there. **A deep single-stream sweep
+on the exact shipping configuration was never run** (§6). The right-hand columns show the
+engine sustaining 141–157 tok/s to 900k, but each carries its own cost: fp8 KV is opt-in lossy,
+and the 1M arm adds a host-resident KV pool plus static process-wide YaRN f=4 whose quality gate
+returned INVALID.
+
+Note that the 1M arm is *faster at 250k* than the fp8 arm (157.0 vs 145.8) — it uses bf16 KV
+spilled to host RAM rather than quantized on-device KV, and its hot cache ran at a 0.89–0.95 hit
+rate in steady decode. Those are different mechanisms, not a contradiction.
 
 ### 3.2 Same-engine A/B: the fusion levers on their own
 
@@ -477,7 +505,9 @@ Recorded so this is not mistaken for a finished evaluation.
 | Same-instance NLL repeat (the true NLL noise floor rather than a cross-instance one) | **never run**, same reason. |
 | IFEval, decpath and degen on the YaRN f=4 / 1M configuration | **not measured** — the run was stopped mid-suite, and the later gate returned INVALID. |
 | Cache-integrity (v2, cache-exercising) prefix probe on this engine | **not measured.** |
+| A deep single-stream context sweep on the exact shipping bf16-KV configuration (beyond 95.4k, up to its 279,680-token pool) | **not run.** The harness cells stopped at 95.4k, so §3.1b's deeper rows come from the fp8-KV and host-KV arms instead. This is the single most useful missing measurement for anyone sizing a long-context agent lane on the shipping config. |
 | Bracketing the native-RoPE cliff between 400k and 500k (e.g. 440k, 470k) | **not run.** §3.8 can only say "holds to 400k, broken by 500k". |
+| Single-stream throughput on the native-RoPE 400k configuration | **not measured** — that run was a retrieval probe only, so there is no tok/s figure at 400k without YaRN. |
 | A lossy quality gate at 400k on native RoPE | **not run**, so the 400k window is a capability probe and not a certified operating point. |
 | Wall times for the ~200k and ~300k native-RoPE needle cases | **not recorded** in the run ledger; omitted rather than estimated. |
 | Why the retrained MTP head won on a B200 under plain upstream SGLang (+1.8 % to +3.7 % in all four cells) and was flat on this tree's SM120 fused path (2.1076 vs 2.1079) | **cause not established.** GPU generation and the fused decode path were never isolated from each other. |

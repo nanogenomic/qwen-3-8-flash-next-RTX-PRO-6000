@@ -29,12 +29,46 @@ why this is a cross-engine comparison rather than a single-variable A/B.
 |---|---|---|---|
 | Single-stream, short context | 138.8 tok/s | **166.4 tok/s** | **+19.9 %** |
 | Single-stream peak (@325 tokens) | — | 180.5 tok/s | — |
-| Single-stream @48.6k | — | 175.6 tok/s | — |
-| Single-stream @95k | — | 155.5 tok/s (@98k) | — |
 | 4-concurrent aggregate | 351 tok/s | **413.9 tok/s** | **+17.9 %** |
 | KV pool (test card) | 241,728 tokens | **279,680 tokens** | +15.7 % |
 | KV pool (production card, less foreign VRAM resident) | 241,728 tokens | **331,456 tokens** | +37 % |
 | Per-token latency, 325 → 250k context | grows with depth | 14.7 → 15.4 ms | +4.5 % over 770× context |
+
+### Single-stream throughput across the full context range
+
+`[measured]` Decode speed on this card is **near-flat in context depth** — the single largest
+qualitative change versus the older engine, where per-token cost grew with depth. Per-token
+latency moves only **14.7 → 15.4 ms from 325 tokens to 250k**, i.e. **+4.5 % across a 770×
+increase in context**.
+
+No single configuration spans the whole range, because what limits depth is the KV pool, not
+speed. So the columns below are three different arms; each is labelled, and none of the numbers
+is interpolated.
+
+| Context depth | bf16 KV (the shipping config) | + fp8 KV (opt-in lossy) | host-KV + YaRN f=4 (1M arm) |
+|---|---|---|---|
+| 325 tokens | **180.5** | 167.3 | — |
+| 48.6k | **175.6** | 164.2 | — |
+| ~95–98k | **155.5** (@98k) | 154.4 (@95k) | — |
+| 250k | *not swept* | **145.8** | **157.0** |
+| 500k | *not swept* | — | **154.4** |
+| 900k | *not swept* | — | **141.0** |
+
+All tok/s, temperature 0, single stream.
+
+**Read the "not swept" cells correctly — they are a gap in the measurement, not a limit of the
+build.** The shipping bf16-KV configuration holds a **279,680-token pool** (331,456 in
+production), so it can serve well past 98k; its sweep simply used harness cells at 4k / 48.6k /
+95.4k and never went deeper. **A deep single-stream sweep on the exact shipping configuration
+was not run** — it is listed as an open item in [BENCHMARKS.md §6](BENCHMARKS.md#6-open-measurements).
+What the deeper rows do establish is that the *engine* sustains 141–157 tok/s out to 900k.
+
+Caveats on the two right-hand columns: fp8 KV is opt-in lossy (decode-path WARN at concurrency
+4, p = 0.033). The 1M arm additionally uses a host-RAM-resident KV pool and **static YaRN f=4**,
+which is process-wide and shifts short-context logits by 0.066–0.283 nats/token against native —
+so it is a separate lane, not a drop-in. Its quality gate returned INVALID; see
+[CHANGES §3.4](CHANGES-vs-upstream.md#34-1m-context-on-one-card--measured-and-not-the-default).
+The native-RoPE 400k result below is a **retrieval** probe — no throughput was measured on it.
 
 **Quality:** the decode-path equivalence test — the instrument that actually exercises the
 decode kernels — is **PASS at concurrency 1 and at concurrency 4**, with **0 / 192
