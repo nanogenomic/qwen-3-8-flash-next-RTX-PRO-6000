@@ -80,7 +80,7 @@ because decode on this stack is nondeterministic even for the unmodified baselin
 
 | | Value |
 |---|---|
-| KV pool | **542,912 tokens** (2.25× stock) |
+| KV pool | **542,912 tokens** on the test card (2.25× stock); **643,456** on the production card — the largest measured on this hardware |
 | Single-stream, short context | 159.8 tok/s (−4.0 % vs bf16 KV here) |
 | Single-stream @250k context | **145.8 tok/s** |
 | 4-concurrent aggregate | 411.4 tok/s |
@@ -295,6 +295,16 @@ Run it after `/health` returns, and make it non-fatal — a warmup hiccup must n
 lane down. If you would rather not depend on a warmup step, lower `--mem-fraction-static`
 and accept the smaller pool.
 
+> **⛔ If you wire this into a service manager, detach it.** A post-start hook generally runs
+> *inside* the unit's start timeout. On the reference deployment that timeout is **90 s**, while
+> the warmup polls for health — which takes **~9 minutes on a 206-shard checkpoint load**. Run
+> inline, the hook does not return, the service manager concludes the unit failed to start,
+> kills it, and restarts it. **It did that on every boot until the hook was detached** (four
+> restarts before it was caught). Either launch the warmup as its own transient unit so the
+> hook returns immediately, or raise the start timeout well past the load time. Do not leave it
+> inline: the mitigation for one outage becomes a restart loop, which is worse than the problem
+> it fixes.
+
 ### Sizing for multiple clients and subagents
 
 The benchmarks above are single-stream and 4-concurrent. Neither tells you how to size this
@@ -392,7 +402,19 @@ Two rules, and they hold for any orchestrator on any engine:
 
 #### fp8 KV is the capacity lever, and it is the honest trade
 
-`[measured, same build, same card]` The KV pool goes from **279,680 → 542,912 tokens: 1.94×.**
+`[measured]` The KV pool goes up **1.94×**, and that multiplier now has **two independent
+confirmations on cards with different amounts of foreign VRAM resident**:
+
+| Card | bf16 pool | fp8 pool | Ratio |
+|---|---|---|---|
+| Test card | 279,680 | 542,912 | **1.941×** |
+| Production card (read from `/get_server_info` at 18:31Z) | 331,456 | **643,456** | **1.941×** |
+
+Agreeing to three decimal places across different occupancy is worth stating plainly: **the
+1.94× is a property of the dtype change, not of one card's spare memory.** **643,456 tokens is
+the largest pool measured on this hardware**, at `--context-length 262144`,
+`--mem-fraction-static 0.98` and `--max-running-requests 4`.
+
 That is the single biggest capacity change available, and it buys roughly one extra long-context
 session or a handful of subagents.
 
@@ -415,10 +437,27 @@ decode path reads. Decide accordingly: for an agent lane that is pool-starved, 1
 for no measured task-metric change is usually the right trade; for anything where bit-level
 agreement with a bf16 baseline matters, it is not.
 
+**An independent check that fp8 does not cost much single-stream throughput in practice.**
+`[measured, live, 18:31Z]` Three sequential 512-token greedy completions of the same prompt
+through the serving router on the production card after warm-up: **175.3 / 183.3 / 173.1 tok/s**
+(mean ~177). These are **router-path chat completions, not harness cells** — different prompt,
+different path, different cell definition — so they are **not** directly comparable to the sweep
+numbers in [BENCHMARKS.md](BENCHMARKS.md). They are a sanity check, and they are consistent with
+the harness result on the other card, where fp8 measured 159.75 against bf16's 166.42 (−4.0 %).
+
+> **⛔ Benchmarking caveat: the first request after boot is garbage.** In the same run the very
+> first completion measured **39.6 tok/s** and the next three measured 173–183 — **about 4.5×
+> too low.** Anything that benchmarks immediately after a boot, or any monitoring that samples
+> early, will record that number and it means nothing. Warm up first, and discard the first
+> completion.
+
 One non-obvious interaction: **declaring a very large `--context-length` itself costs pool.**
-`[measured]` The same fp8 build gives **542,912** tokens at a 262k declaration but **519,040**
-at 540k. The window you advertise and the pool you get trade off, so do not declare a window
-you do not intend to serve.
+`[measured]` The same fp8 build and card gives **542,912** tokens at a 262k declaration but
+**519,040** at 540k — about **−4.4 %** for the larger declared window. Raising
+`--context-length` past the checkpoint's trained window additionally requires
+`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. So **the window you advertise and the pool you
+get trade against each other, and the maximum pool is only available at a modest declared
+context.** Do not declare a window you do not intend to serve.
 
 ### Deployment gotcha: a router that pins the context window
 

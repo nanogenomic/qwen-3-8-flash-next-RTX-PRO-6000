@@ -77,6 +77,8 @@ range.
 | **Temperature** | **0** for every throughput and equivalence measurement. The degeneracy suite deliberately runs production sampling: T=1.0, top_k 20, top_p 0.95. |
 | **Throughput harness** | A fixed code/math prompt through the chat endpoint, `max_tokens >= 512`, warmed up before measuring. Prose through `/v1/completions` measures ~2.3× lower under speculative decode and was not used. |
 | **Source of truth for rates** | `accept_len` and `gen_throughput` were read from the **scheduler log**, not from client wall time. |
+| **First request after a boot is discarded** | `[measured]` The first completion after a boot ran at **39.6 tok/s** where the next three ran at 173–183 — **~4.5× too low**. Any sweep or monitor that samples early records a meaningless number. Warm up, then discard the first completion. |
+| **Router-path spot checks are labelled as such** | A handful of figures in this document are chat completions through the serving router rather than harness cells (different prompt, path and cell definition). They are sanity checks and are **not** comparable row-to-row with the sweep. Every one is marked where it appears. |
 | **Config verification** | Every instance's configuration was read back from `/get_server_info`, and for env-gated levers from `/proc/<pid>/environ`, rather than trusted from the launch line. |
 | **Concurrency** | 1 and 4. **8 and 16 were dropped** because the shipping profile caps at `--max-running-requests 4`. |
 | **Context sweep** | prefix lengths 4k / 16k / 48k / 96k / 192k at bs=1, fitting ms-per-verify-cycle against context. |
@@ -219,7 +221,8 @@ to size a shared backend. The guidance built on them is in
 | Pool cost of one mamba slot | **~0.093 GB ≈ 3,750 pool tokens** | `[measured]` |
 | Pool cost of one extra running request | **~11,250 pool tokens** | 3 × the above |
 | Concurrency cap | `--max-mamba-cache-size` ÷ 3 | 12 slots → 4 concurrent, which is why the shipping config pairs 12 with `--max-running-requests 4` |
-| KV pool, bf16 → fp8 | 279,680 → **542,912** (**1.94×**) | `[measured]`, same build and card |
+| KV pool, bf16 → fp8, test card | 279,680 → **542,912** | **1.941×** `[measured]` |
+| KV pool, bf16 → fp8, production card | 331,456 → **643,456** | **1.941×** `[measured, read from `/get_server_info` at 18:31Z]`. **Largest pool measured on this hardware.** |
 | Cost of declaring a larger window | 542,912 tokens at a 262k declaration vs **519,040** at 540k | `[measured]`, same fp8 build |
 
 **Why the cost is affine rather than linear.** Only 12 of 48 layers are full attention; the other
@@ -243,6 +246,34 @@ instantaneous sample from the live lane, not a benchmark cell, and is reported a
 included because it identifies the failure mode: **the scheduler queues rather than erroring, and
 the cost lands as prefix eviction and full re-prefill**, which at ~250k context is tens of seconds
 per turn.
+
+### 3.3c fp8 KV on the production card — live readings, 18:31Z
+
+`[measured, live]` fp8 KV went live on the reference deployment's production card. Configuration
+read back from `/get_server_info` rather than trusted from the launch line:
+
+| | |
+|---|---|
+| `kv_cache_dtype` | `fp8_e4m3` |
+| `max_total_num_tokens` | **643,456** (that card's bf16 figure was 331,456 → **1.941×**) |
+| `context_length` | 262,144 |
+| `max_running_requests` | 4 |
+| `max_mamba_cache_size` | 12 |
+| `mem_fraction_static` | 0.98 |
+| `bf16_gemm_backend` | `sm120gemv` |
+| `speculative_algorithm` | reported as `EAGLE` — the launch flag is `NEXTN`; see [README](README.md#run-it) |
+
+**Single-stream, router path, three sequential 512-token greedy completions of the same prompt
+after warm-up: 175.3 / 183.3 / 173.1 tok/s** (mean ~177).
+
+**These are not harness cells.** They are chat completions through the serving router, on a
+different prompt and a different code path from the sweep in §3.1b, so they must not be compared
+row-to-row with it. What they are good for is one thing: confirming that fp8 does not cost
+meaningful single-stream throughput in practice, which is consistent with the harness A/B on the
+other card (fp8 159.75 vs bf16 166.42, **−4.0 %**).
+
+The first completion in that same run measured **39.6 tok/s** — see the first-request caveat in
+§2. It is excluded from the three figures above and is the reason the caveat is there.
 
 ### 3.4 Acceptance rule used for shipping
 

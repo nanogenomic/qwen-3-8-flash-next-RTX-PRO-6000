@@ -276,7 +276,7 @@ measurements are what qualify it.
 
 | | Value |
 |---|---|
-| KV pool | **542,912 tokens** (2.25× stock) |
+| KV pool | **542,912 tokens** on the test card (2.25× stock). On the production card, **643,456** — the largest pool measured on this hardware. The multiplier is **1.941× on both**, which is why it is a property of the dtype and not of one card's spare VRAM. |
 | Single-stream, short context | 159.8 tok/s, **−4.0 %** vs bf16 KV on this tree |
 | Single-stream @250k | **145.8 tok/s** |
 | 4-concurrent aggregate | 411.4 tok/s |
@@ -287,6 +287,10 @@ measurements are what qualify it.
 The conc-4 WARN is a small real divergence, so this is labelled **lossy and opt-in**. Note
 the indexer key cache does **not** shrink: `index_state_dtype` is hardcoded `torch.bfloat16`
 in `qsa_kv_pool.py`.
+
+Note also that **declaring a larger `--context-length` costs pool**: the same fp8 build and card
+gives 542,912 tokens at a 262k declaration but **519,040** at 540k, about **−4.4 %**. The maximum
+pool is only available at a modest declared window.
 
 There is one blind spot worth stating: fp8 KV is **bitwise equal to bf16 KV at a
 single-chunk prefill (ctx 512)** `[measured]`, because a single-chunk prefill attends over
