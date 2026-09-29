@@ -87,7 +87,7 @@ README.md  CHANGES-vs-upstream.md  BENCHMARKS.md  UPSTREAM-BUG-qsa-index-key-rin
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 32 commits as a git-am-able series against the base commit
-PUBLISHED-SHA-MAP.tsv    published SHA -> development SHA, for the engineering notes
+COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
 python/  test/           the 43 changed files, at their exact upstream paths
 ```
 

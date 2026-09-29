@@ -1,0 +1,33 @@
+patch	development_sha	subject
+0001-feat-qsa-multi-group-pending-ring-for-verify-windows.patch	5d5bbd7a51	feat(qsa): multi-group pending ring for verify windows > compress ratio
+0002-test-qsa-GPU-correctness-test-for-the-widened-pendin.patch	1fa1337b1e	test(qsa): GPU correctness test for the widened pending ring
+0003-feat-spec-scheduler-side-hidden-state-dump-for-MTP-d.patch	53c85dc0aa	feat(spec): scheduler-side hidden-state dump for MTP draft-head training
+0004-feat-spec-dump-writes-SERVER.json-so-the-dump-client.patch	195682cce2	feat(spec): dump writes SERVER.json so the dump client can refuse a non-dump instance
+0005-feat-spec-KEEP_FROM-tail-window-control-for-the-MTP-.patch	6bbc07ec1e	feat(spec): KEEP_FROM tail-window control for the MTP hidden dump
+0006-fix-qsa-require-num_steps-1-num_draft_tokens-for-MTP.patch	d76fed293a	fix(qsa): require num_steps + 1 >= num_draft_tokens for MTP index sharing
+0007-feat-gemm-sm120gemv-BF16-backend-Triton-skinny-GEMM-.patch	91dcb90c1c	feat(gemm): sm120gemv BF16 backend, Triton skinny GEMM for M<=32 on SM12x
+0008-perf-hc_mix-prefetch-up-weight-before-the-phase-barr.patch	0eec3a1293	perf(hc_mix): prefetch up-weight before the phase barrier, drop zeroing barrier
+0009-fix-mamba-reserve-verify-intermediate-state-at-the-a.patch	a06f56e8b9	fix(mamba): reserve verify intermediate state at the adaptive maximum
+0010-fix-qsa-one-max-width-MTP-selection-buffer-serves-ev.patch	00897e9e66	fix(qsa): one max-width MTP selection buffer serves every adaptive state
+0011-feat-spec-per-tier-adaptive-acceptance-counters-widt.patch	52391633d3	feat(spec): per-tier adaptive acceptance counters, width-correct accept rate
+0012-perf-gemm-sm120gemv-M-16-tiling-and-M-1-small-weight.patch	6395eefe36	perf(gemm): sm120gemv M>16 tiling and M=1 small-weight fallback
+0013-perf-mxfp8-SM120-skinny-MXFP8-GEMM-on-native-block-s.patch	a98e221c94	perf(mxfp8): SM120 skinny MXFP8 GEMM on native block-scaled MMA, opt-in
+0014-fix-qwen4_exp-load-ModelOpt-MIXED_PRECISION-QAD-chec.patch	a4aa369ee7	fix(qwen4_exp): load ModelOpt MIXED_PRECISION QAD checkpoints
+0015-feat-moe-dynamic-expert-count-fixed-k-cumprob-learne.patch	cc1ba2b840	feat(moe): dynamic expert count (fixed-k / cumprob / learned) fused into the Triton router, off by default
+0016-feat-moe-dynamic-k-per-slot-kept-slot-counters-stats.patch	63d92e2f47	feat(moe): dynamic-k per-slot kept-slot counters + stats writer (SGLANG_QWENOPT_DYNK_STATS_FILE)
+0017-test-gemm-CPU-dispatch-CLI-coverage-for-the-SM120-sk.patch	4309772a86	test(gemm): CPU dispatch + CLI coverage for the SM120 skinny BF16/MXFP8 GEMM
+0018-feat-moe-dynamic-k-live-control-file-per-slot-tau-k_.patch	9d08f8ffa5	feat(moe): dynamic-k live control file (per-slot tau/k_min/k_max on device) for one-boot arm sweeps
+0019-feat-qwen4_exp-native-NVFP4-PLE-table-host-resident-.patch	d7e1d0a51b	feat(qwen4_exp): native NVFP4 PLE table (host-resident, dequant in gather)
+0020-perf-moe-learned-dynamic-k-gate-features-from-the-to.patch	7621d4a796	perf(moe): learned dynamic-k gate features from the top-10 rounds only (F=16), +0.9 us/call on GPU2
+0021-perf-qsa-one-shared-trtllm-workspace-packed-KV-scrat.patch	27c30a8f3d	perf(qsa): one shared trtllm workspace + packed-KV scratch across QSA backends
+0022-test-qsa-pin-the-shared-scratch-allocation-plan-and-.patch	bcf45ab741	test(qsa): pin the shared-scratch allocation plan and its byte budget
+0023-fix-qsa-normalize-the-device-key-so-cuda-and-cuda-0-.patch	6a5f2da329	fix(qsa): normalize the device key so cuda and cuda:0 share one buffer
+0024-perf-moe-SGLANG_QWENOPT_FUSE_MOE_FINALIZE-alias-for-.patch	705ca532c9	perf(moe): SGLANG_QWENOPT_FUSE_MOE_FINALIZE alias for flashinfer fused finalize
+0025-perf-hc-fused-hyper-connection-chain-behind-SGLANG_Q.patch	f8fc8b5a35	perf(hc): fused hyper-connection chain behind SGLANG_QWENOPT_FUSE_HC=1
+0026-test-qsa-correct-the-selection-width-qsa_token_topk-.patch	22fc5c8ffd	test(qsa): correct the selection width -- qsa_token_topk IS the budget
+0027-perf-moe-lossless-ILP-finalizeMoeRouting-via-private.patch	d0ecae43d8	perf(moe): lossless ILP finalizeMoeRouting via private flashinfer build (SGLANG_QWENOPT_FUSE_MOE_FINALIZE_ILP)
+0028-fix-qsa-bound-the-shared-reservation-by-the-widest-r.patch	837e52ff80	fix(qsa): bound the shared reservation by the widest reachable batch
+0029-perf-moe-4-launch-expert-centric-small-batch-NVFP4-M.patch	12d6193745	perf(moe): 4-launch expert-centric small-batch NVFP4 MoE for T<=16 (SGLANG_QWENOPT_FUSE_SBMOE)
+0030-fix-qsa-reservation-covered-by-an-existing-shared-bu.patch	486b099529	fix(qsa): reservation covered by an existing shared buffer is idempotent
+0031-fix-qsa-regrow-the-shared-scratch-if-autotune-alloca.patch	436fa5cf69	fix(qsa): regrow the shared scratch if autotune allocated it undersized before capture
+0032-feat-spec-ship-the-adaptive-speculation-tier-configs.patch	-	feat(spec): ship the adaptive-speculation tier configs in-tree

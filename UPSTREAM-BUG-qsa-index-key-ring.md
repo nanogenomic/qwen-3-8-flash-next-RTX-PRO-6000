@@ -11,8 +11,7 @@ written so it can be filed more or less as-is.
   fork, and in the older PR #36497 tree (`73a255206f`).
 - **Symptom:** none. No crash, no warning, no NaN. Attention selects the wrong blocks.
 - **Severity:** silent wrong results on the default configuration of a shipped model.
-- **Fix in this fork:** commit `389ad4f`, `feat(qsa): multi-group pending ring for verify
-  windows > compress ratio`.
+- **Fix in this fork:** `patches/0001-feat-qsa-multi-group-pending-ring-for-verify-windows.patch`.
 
 ---
 
@@ -163,7 +162,7 @@ not a measurement.
 > A patch with 117 CPU tests (which assert that the ratio-sized ring aliases) and a GPU
 > correctness test is available at
 > https://github.com/nanogenomic/qwen-3-8-flash-next-RTX-PRO-6000 — see
-> `UPSTREAM-BUG-qsa-index-key-ring.md` and commit `389ad4f`.
+> `UPSTREAM-BUG-qsa-index-key-ring.md` and `patches/0001-*.patch`.
 
 ---
 

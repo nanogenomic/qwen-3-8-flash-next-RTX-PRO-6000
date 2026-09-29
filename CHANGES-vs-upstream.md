@@ -72,7 +72,7 @@ Two follow-up fixes to §2.4's shared workspace. Both were found by real boot fa
 without them the merged tree **failed to boot**.
 
 **(a) A reservation covered by an existing buffer must be idempotent**
-(published `f6bcb92`, originally `486b099529`).
+(patch `0030`, development SHA `486b099529`).
 FlashInfer autotune hands out the shared packed-KV scratch *before*
 `init_cuda_graph_state` reserves it, so a boot-time reservation of the same size raised
 `already allocated at 33792 rows when a backend reserved 33792` — equal values, and it still
@@ -81,15 +81,15 @@ Tests cover allocate-then-reserve equal / smaller / larger, plus a boot-order sm
 (autotune handout → every tier reserves → per-tier capture handout).
 
 **(b) Regrow if autotune allocated undersized before capture**
-(published `a24d7de`, originally `436fa5cf69`).
+(patch `0031`, development SHA `436fa5cf69`).
 Autotune may hand out at the *active* tier width, below the widest reservation made later in
 `init_cuda_graph_state`. Until a handout happens under CUDA-graph capture, no graph holds the
 pointer, so a larger reservation now drops the undersized buffer and the next handout
 allocates at the reserved size. After the first captured handout, growth still raises.
 
-**(c) Two further reservation fixes** in the same area: `d70f519`
+**(c) Two further reservation fixes** in the same area: patch `0023`
 `fix(qsa): normalize the device key so cuda and cuda:0 share one buffer` (two spellings of
-the same device were allocating two buffers) and `bf9f3e6`
+the same device were allocating two buffers) and patch `0028`
 `fix(qsa): bound the shared reservation by the widest reachable batch`.
 
 ### 1.3 Adaptive-state sizing fixes
@@ -643,7 +643,7 @@ decay over uptime).
 ## 9. Commit list
 
 31 functional commits plus one commit that ships the adaptive-speculation tier configs
-in-tree. The original development history had 39 commits: 8 of them were merge commits from
+in-tree. The original development history had 39 commits: 8 were merge commits from
 integrating parallel feature branches, and those are branch bookkeeping that was dropped when
 linearizing onto the upstream base.
 
@@ -651,53 +651,52 @@ linearizing onto the upstream base.
 before publication hygiene was applied. That hygiene — making the optional build and
 checkpoint paths environment-configurable, replacing development-host names in comments with
 their roles, adding SPDX lines, and removing internal tracker ids from source comments — was
-then folded into **every** revision of **every** affected blob rather than added as a commit
-on the end, so no revision in this history contains a development-machine path. It was
-verified to change no executable line: the only differences against the original tree, outside
-the four files whose hardcoded paths became environment variables, are comments and
-docstrings.
+folded into **every** revision of **every** affected blob rather than added as a commit on the
+end, so no revision in `patches/` contains a development-machine path. It changes no
+executable line: outside the four files whose hardcoded paths became environment variables,
+the only differences from the development tree are comments and docstrings.
 
-`Published` is the SHA in this repository; `Original` is the SHA in the development tree, for
-anyone correlating against the engineering notes. `PUBLISHED-SHA-MAP.tsv` has the same table
-in machine-readable form; `make-fork.sh` builds a tree in which these SHAs are live.
+**The patch number is the stable identifier.** `git am` assigns new commit SHAs on every
+application, so this table maps patch file to the SHA in the development tree, for anyone
+correlating against the engineering notes. `COMMIT-MAP.tsv` has the same mapping in
+machine-readable form.
 
-| # | Published | Original | Subject |
-|---|---|---|---|
-| 1 | `389ad4f` | `5d5bbd7a51` | feat(qsa): multi-group pending ring for verify windows > compress ratio |
-| 2 | `316490b` | `1fa1337b1e` | test(qsa): GPU correctness test for the widened pending ring |
-| 3 | `86bca5d` | `53c85dc0aa` | feat(spec): scheduler-side hidden-state dump for MTP draft-head training |
-| 4 | `29162ef` | `195682cce2` | feat(spec): dump writes SERVER.json so the dump client can refuse a non-dump instance |
-| 5 | `1a0b03d` | `6bbc07ec1e` | feat(spec): KEEP_FROM tail-window control for the MTP hidden dump |
-| 6 | `8ecb246` | `d76fed293a` | fix(qsa): require num_steps + 1 >= num_draft_tokens for MTP index sharing |
-| 7 | `90b9e16` | `91dcb90c1c` | feat(gemm): sm120gemv BF16 backend, Triton skinny GEMM for M<=32 on SM12x |
-| 8 | `94e88ef` | `0eec3a1293` | perf(hc_mix): prefetch up-weight before the phase barrier, drop zeroing barrier |
-| 9 | `0d7f29f` | `a06f56e8b9` | fix(mamba): reserve verify intermediate state at the adaptive maximum |
-| 10 | `00ba704` | `00897e9e66` | fix(qsa): one max-width MTP selection buffer serves every adaptive state |
-| 11 | `0a3b208` | `52391633d3` | feat(spec): per-tier adaptive acceptance counters, width-correct accept rate |
-| 12 | `8e123db` | `6395eefe36` | perf(gemm): sm120gemv M>16 tiling and M=1 small-weight fallback |
-| 13 | `4b49a76` | `a98e221c94` | perf(mxfp8): SM120 skinny MXFP8 GEMM on native block-scaled MMA, opt-in |
-| 14 | `91a779f` | `a4aa369ee7` | fix(qwen4_exp): load ModelOpt MIXED_PRECISION QAD checkpoints |
-| 15 | `6fa5951` | `cc1ba2b840` | feat(moe): dynamic expert count (fixed-k / cumprob / learned) fused into the Triton router, off by default |
-| 16 | `0d9cee8` | `63d92e2f47` | feat(moe): dynamic-k per-slot kept-slot counters + stats writer (SGLANG_QWENOPT_DYNK_STATS_FILE) |
-| 17 | `dca918e` | `4309772a86` | test(gemm): CPU dispatch + CLI coverage for the SM120 skinny BF16/MXFP8 GEMM |
-| 18 | `9793449` | `9d08f8ffa5` | feat(moe): dynamic-k live control file (per-slot tau/k_min/k_max on device) for one-boot arm sweeps |
-| 19 | `4b8c591` | `d7e1d0a51b` | feat(qwen4_exp): native NVFP4 PLE table (host-resident, dequant in gather) |
-| 20 | `a7b7916` | `7621d4a796` | perf(moe): learned dynamic-k gate features from the top-10 rounds only (F=16), +0.9 us/call on GPU2 |
-| 21 | `5910baf` | `27c30a8f3d` | perf(qsa): one shared trtllm workspace + packed-KV scratch across QSA backends |
-| 22 | `ca3a47e` | `bcf45ab741` | test(qsa): pin the shared-scratch allocation plan and its byte budget |
-| 23 | `d70f519` | `6a5f2da329` | fix(qsa): normalize the device key so cuda and cuda:0 share one buffer |
-| 24 | `2c365e7` | `705ca532c9` | perf(moe): SGLANG_QWENOPT_FUSE_MOE_FINALIZE alias for flashinfer fused finalize |
-| 25 | `68fc024` | `f8fc8b5a35` | perf(hc): fused hyper-connection chain behind SGLANG_QWENOPT_FUSE_HC=1 |
-| 26 | `e2f3eca` | `22fc5c8ffd` | test(qsa): correct the selection width -- qsa_token_topk IS the budget |
-| 27 | `85c9e91` | `d0ecae43d8` | perf(moe): lossless ILP finalizeMoeRouting via private flashinfer build (SGLANG_QWENOPT_FUSE_MOE_FINALIZE_ILP) |
-| 28 | `bf9f3e6` | `837e52ff80` | fix(qsa): bound the shared reservation by the widest reachable batch |
-| 29 | `58879a4` | `12d6193745` | perf(moe): 4-launch expert-centric small-batch NVFP4 MoE for T<=16 (SGLANG_QWENOPT_FUSE_SBMOE) |
-| 30 | `f6bcb92` | `486b099529` | fix(qsa): reservation covered by an existing shared buffer is idempotent |
-| 31 | `a24d7de` | `436fa5cf69` | fix(qsa): regrow the shared scratch if autotune allocated it undersized before capture |
-| 32 | `0847fe5` | — | feat(spec): ship the adaptive-speculation tier configs in-tree |
+| Patch | Development SHA | Subject |
+|---|---|---|
+| `0001` | `5d5bbd7a51` | feat(qsa): multi-group pending ring for verify windows > compress ratio |
+| `0002` | `1fa1337b1e` | test(qsa): GPU correctness test for the widened pending ring |
+| `0003` | `53c85dc0aa` | feat(spec): scheduler-side hidden-state dump for MTP draft-head training |
+| `0004` | `195682cce2` | feat(spec): dump writes SERVER.json so the dump client can refuse a non-dump instance |
+| `0005` | `6bbc07ec1e` | feat(spec): KEEP_FROM tail-window control for the MTP hidden dump |
+| `0006` | `d76fed293a` | fix(qsa): require num_steps + 1 >= num_draft_tokens for MTP index sharing |
+| `0007` | `91dcb90c1c` | feat(gemm): sm120gemv BF16 backend, Triton skinny GEMM for M<=32 on SM12x |
+| `0008` | `0eec3a1293` | perf(hc_mix): prefetch up-weight before the phase barrier, drop zeroing barrier |
+| `0009` | `a06f56e8b9` | fix(mamba): reserve verify intermediate state at the adaptive maximum |
+| `0010` | `00897e9e66` | fix(qsa): one max-width MTP selection buffer serves every adaptive state |
+| `0011` | `52391633d3` | feat(spec): per-tier adaptive acceptance counters, width-correct accept rate |
+| `0012` | `6395eefe36` | perf(gemm): sm120gemv M>16 tiling and M=1 small-weight fallback |
+| `0013` | `a98e221c94` | perf(mxfp8): SM120 skinny MXFP8 GEMM on native block-scaled MMA, opt-in |
+| `0014` | `a4aa369ee7` | fix(qwen4_exp): load ModelOpt MIXED_PRECISION QAD checkpoints |
+| `0015` | `cc1ba2b840` | feat(moe): dynamic expert count (fixed-k / cumprob / learned) fused into the Triton router, off by default |
+| `0016` | `63d92e2f47` | feat(moe): dynamic-k per-slot kept-slot counters + stats writer (SGLANG_QWENOPT_DYNK_STATS_FILE) |
+| `0017` | `4309772a86` | test(gemm): CPU dispatch + CLI coverage for the SM120 skinny BF16/MXFP8 GEMM |
+| `0018` | `9d08f8ffa5` | feat(moe): dynamic-k live control file (per-slot tau/k_min/k_max on device) for one-boot arm sweeps |
+| `0019` | `d7e1d0a51b` | feat(qwen4_exp): native NVFP4 PLE table (host-resident, dequant in gather) |
+| `0020` | `7621d4a796` | perf(moe): learned dynamic-k gate features from the top-10 rounds only (F=16), +0.9 us/call on GPU2 |
+| `0021` | `27c30a8f3d` | perf(qsa): one shared trtllm workspace + packed-KV scratch across QSA backends |
+| `0022` | `bcf45ab741` | test(qsa): pin the shared-scratch allocation plan and its byte budget |
+| `0023` | `6a5f2da329` | fix(qsa): normalize the device key so cuda and cuda:0 share one buffer |
+| `0024` | `705ca532c9` | perf(moe): SGLANG_QWENOPT_FUSE_MOE_FINALIZE alias for flashinfer fused finalize |
+| `0025` | `f8fc8b5a35` | perf(hc): fused hyper-connection chain behind SGLANG_QWENOPT_FUSE_HC=1 |
+| `0026` | `22fc5c8ffd` | test(qsa): correct the selection width -- qsa_token_topk IS the budget |
+| `0027` | `d0ecae43d8` | perf(moe): lossless ILP finalizeMoeRouting via private flashinfer build (SGLANG_QWENOPT_FUSE_MOE_FINALIZE_ILP) |
+| `0028` | `837e52ff80` | fix(qsa): bound the shared reservation by the widest reachable batch |
+| `0029` | `12d6193745` | perf(moe): 4-launch expert-centric small-batch NVFP4 MoE for T<=16 (SGLANG_QWENOPT_FUSE_SBMOE) |
+| `0030` | `486b099529` | fix(qsa): reservation covered by an existing shared buffer is idempotent |
+| `0031` | `436fa5cf69` | fix(qsa): regrow the shared scratch if autotune allocated it undersized before capture |
+| `0032` | — | feat(spec): ship the adaptive-speculation tier configs in-tree |
 
 The development head these were verified against was `be24acf0a5`, a merge commit whose tree
-this fork reproduces. Note that the `Published` SHAs are therefore **not** the SHAs in the
-engineering notes, and that the environment-variable changes mean four files differ from the
-development tree by design; see §2 of [BENCHMARKS.md](BENCHMARKS.md) for what was and was not
-re-verified after that change.
+the series reproduces. Note that four files differ from the development tree by design (the
+environment-variable change); see §2 of [BENCHMARKS.md](BENCHMARKS.md) for what was and was
+not re-verified after it.
