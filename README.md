@@ -111,38 +111,137 @@ and the open gaps. No strict-mode (≤ 2-point) verdict was issued. The harness 
 The conc-4 WARN is a small but real divergence, which is why fp8 KV ships **labelled lossy
 and opt-in** rather than as a default.
 
-### Context beyond the trained window, with no YaRN
+### Context beyond the trained window, with no YaRN — long-context suite, stage 2 of N
 
-`[measured]` With fp8 KV for the pool and **no rope override of any kind**, this model
-retrieves past its trained 262,144-token window on native RoPE alone. Needle retrieval, one
-needle per request in a real-text haystack:
+> **This is an in-progress suite, not a certification.** Retrieval is now measured well past the
+> trained window. Reasoning at length is **not** established, normal-length equivalence under a
+> larger declared window is **not yet verified**, and **no production deployment has been changed
+> on the strength of any of it** — the reference deployment still serves 262,144 tokens per
+> request. Further results will be added as they land.
+
+`[measured]` With fp8 KV and **no rope override of any kind**, this model retrieves past its
+trained 262,144-token window on native RoPE alone. Booting above the derived window needs
+`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+
+**Headline: needle retrieval holds through at least 530K — 2.02× the trained window — across
+start, middle and end positions.** The full grid runs to 470K (1.79×); 480K–530K is a thinner
+bracket. That result comes from a **different card** from the rest of this repository, so read
+the next two subsections for what that does and does not change.
+
+#### Result on a second card: 44 of 44 retrievals, and a clean over-limit refusal
+
+**Hardware: NVIDIA RTX PRO 6000 Blackwell *Server Edition*, 600 W, 97,887 MiB.** Same SM120
+architecture as the reference card, but **not** the 300 W Max-Q that every other measurement here
+uses. The engine was a replica of the production configuration — this tree's final build, fp8 KV,
+both fuse levers, `sm120gemv`, the stock MTP draft head — booted with `--context-length 540000`.
+KV pool at that declaration: **689,728 tokens**.
+
+Each trial uses a distinct public-domain book window and its own passphrase, inserted as a
+synthetic needle. Temperature 0, thinking off.
+
+| Stage | Prompt | × trained window | Depths | Trials | Result |
+|---|---|---|---|---|---|
+| 1 — grid | 300K | 1.14× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
+| 1 — grid | 400K | 1.53× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
+| 1 — grid | 440K | 1.68× | 2 %, 50 %, 95 % | 3 | **9 / 9** |
+| 1 — grid | 470K | **1.79×** | 2 %, 50 %, 95 % | 3 | **9 / 9** |
+| 2 — bracket | 480K | 1.83× | 2 %, 95 % | 1 | **2 / 2** |
+| 2 — bracket | 500K | 1.91× | 2 %, 95 % | 1 | **2 / 2** |
+| 2 — bracket | 510K | 1.95× | 2 %, 95 % | 1 | **2 / 2** |
+| 2 — bracket | 530K | **2.02×** | 2 %, 95 % | 1 | **2 / 2** |
+| over-limit | 691,728 | — | 2 %, 95 % | 1 | **HTTP 400**, refused immediately |
+
+Every completion was the **exact passphrase** with `finish_reason: stop` — no errors, no empty
+completions, no near-misses. The over-limit request was refused up front with *"input (691,793
+tokens) is longer than the model's context length (540000)"*: a clean refusal, which is the
+behaviour you want, and **not a retrieval failure**.
+
+**Read the two halves differently.** The grid is 9 retrievals per length at start, middle and end.
+The bracket is 2 per length, start and end only, one trial — enough to find that there is **no
+retrieval ceiling below 530K on this card**, not enough to characterise 480K–530K as thoroughly as
+the grid does.
+
+Wall time per request on **this 600 W card only**, prefill-dominated:
+
+| 300K | 400K | 440K | 470K | 480K | 500K | 510K | 530K |
+|---|---|---|---|---|---|---|---|
+| 30.7 s | 46.1 s | 54.3 s | 61.2 s | 63.6 s | 68.5 s | 70.5 s | 76.0 s |
+
+These are deliberately kept out of every throughput table in this repository: a 600 W Server
+Edition card is not comparable to the 300 W Max-Q reference card, and mixing them would be wrong.
+
+#### Result on the reference card, and a revised reading of its 500K case
+
+The original probe on the 300 W reference card, one needle per request:
 
 | Prompt | × trained window | Result | Wall |
 |---|---|---|---|
 | ~200k (in-range control) | 0.76× | **PASS** | — |
 | ~300k | 1.14× | **PASS** | — |
 | ~400k, needle 398k tokens back | 1.53× | **PASS** | 57.1 s |
-| ~500k | 1.91× | **FAIL** — empty completion | 81.7 s |
-| 520,059 | 1.98× | **HTTP 400 — capacity refusal**, pool was 519,040 < prompt. Not a position failure. | — |
+| ~500k | 1.91× | empty completion — **probably capacity, not position** (below) | 81.7 s |
+| 520,059 | 1.98× | **HTTP 400 — capacity refusal**, pool 519,040 < prompt | — |
 
-So **native extrapolation holds to at least 400k and has broken by 500k.** Booting above the
-derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` (SGLang otherwise refuses),
-and reaching a pool that can admit these prompts needs `--kv-cache-dtype fp8_e4m3` — which is
-itself opt-in lossy (decode-path WARN at concurrency 4).
+This was previously written up as *"holds to 400k and has broken by 500k."* **That reading is
+superseded.** The same 500K position passes 2/2 on the second card at the same declared window,
+with no YaRN, on the same engine build — so position alone does not explain the reference card's
+empty completion. The **probable** explanation is capacity: that card's pool was 519,040 at the
+540K declaration, and a ~500K prompt plus the draft head's and state slots' reservations sits at
+that edge. **This is the likely cause, not a confirmed one — the 500K case has not been re-run on
+the reference card.**
 
-**Read this as a capability probe, not a quality result.** Four needles are not a quality
-verdict: **no quality gate was run at 400k**, and the 400k–500k cliff is **unbracketed** —
-nothing between 400k and 500k was tested. If you want the window, gate it first.
+#### Stage 1b — long-document aggregation: argmax 7/8, sum 2/8, and why that is not a context failure
+
+Needle retrieval is a lookup. To start probing reasoning, the suite inserted **five synthetic
+ledger records at 10 %, 30 %, 50 %, 70 % and 90 % depth** of a real-text document and asked for two
+things that need all five: which record is largest (**argmax**) and the **sum**. Direct answer,
+thinking off, scored exactly. Two trials each at 100K, 300K, 400K and 440K, on the second card.
+
+| | 100K (control) | 300K | 400K | 440K | Overall |
+|---|---|---|---|---|---|
+| argmax correct | 2 / 2 | 2 / 2 | 2 / 2 | 1 / 2 | **7 / 8** |
+| sum correct | 1 / 2 | 1 / 2 | 0 / 2 | 0 / 2 | **2 / 8** |
+
+**Do not read the sum column as a long-context failure.** It fails at the **100K control, which is
+inside the native window**, so whatever is going wrong is not caused by exceeding the trained window.
+*What* is going wrong, this run cannot say: five of the six wrong sums are **under**-counts, which
+fits a record being missed just as well as a slip in five-term addition done with thinking disabled.
+The argmax column, which is closer to a lookup, holds at 7/8 with a single miss at 440K.
+
+**No reasoning conclusion is drawn from this yet.** A follow-up that separates recall from
+arithmetic — asking the model to list every record before answering, and repeating the task with
+thinking on — is running, and it is the result that will say something about reasoning at length.
+
+#### What is still not established
+
+- **Reasoning at length.** Retrieval is a lookup test. Stage 1b's arithmetic confound is being
+  separated out; until then, nothing here says the model *reasons* well at 400K+.
+- **Normal-length equivalence under a larger declared window.** Whether booting at 540K changes
+  outputs at ordinary lengths has not been verified. A decode-path equivalence test between a 262K
+  and a 540K boot is part of the suite.
+- **The retrieval ceiling.** It is above 530K on the second card and has not been found. Beyond
+  that, the declared window and the pool become the limit before position does.
+- **Whether the reference card's 500K result was capacity.** Probable, untested.
+- **A quality verdict at any length past 262,144.** None has been issued.
+
+#### Two things that still hold
 
 *Hypothesis, not a finding:* only **12 of 48 layers** are full-attention (the other 36 are
 gated-delta-net linear attention), and `partial_rotary_factor` is **0.25**, so RoPE covers a
 quarter of the dimensions in a quarter of the layers. That is a small positional surface to
-extrapolate, which would be consistent with graceful degradation rather than a hard edge — but
-it was not tested, and it is not an explanation anyone should rely on.
+extrapolate, which would be consistent with the graceful behaviour now seen out to 2.02× — but it
+has not been tested directly, and it is not an explanation anyone should rely on.
 
-This matters practically because it is **cheaper than YaRN**: static YaRN f=4 is process-wide,
-shifts short-context logits by 0.066–0.283 nats/token against native, and needs a separate
-process. Native extrapolation to 400k costs nothing at short context.
+It is **cheaper than YaRN**: static YaRN f=4 is process-wide, shifts short-context logits by
+0.066–0.283 nats/token against native, and needs a separate process. Native extrapolation costs
+nothing at short context — **provided** the normal-length equivalence test above comes back clean,
+which is precisely why it is in the suite.
+
+A reproducibility note: both cards' runs used a speculative token map built from private traffic,
+which is not published. A map only changes which draft tokens are proposed; the target model
+verifies them, so it cannot change a greedy completion — the retrieval and aggregation results do
+not depend on it. Completions here are a handful of tokens and wall time is prefill-dominated, so
+the map has negligible effect on the timings either.
 
 Full methodology, harness, rep counts and noise bands: **[BENCHMARKS.md](BENCHMARKS.md)**.
 Per-lever specification: **[CHANGES-vs-upstream.md](CHANGES-vs-upstream.md)**.

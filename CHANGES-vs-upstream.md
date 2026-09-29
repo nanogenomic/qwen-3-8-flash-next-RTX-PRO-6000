@@ -357,26 +357,38 @@ Host RAM floor during the run: **63 GiB MemAvailable**. Host↔GPU transfer meas
   1M** (from 93.0 at 256k) `[vendor-published]`. Needle retrieval passing is **not** a
   statement about multi-needle reasoning at these depths.
 
-### 3.5 Native RoPE past the trained window — no YaRN needed to 400k
+### 3.5 Native RoPE past the trained window — retrieval holds to at least 530K (suite in progress)
 
-`[measured]` Separately from the YaRN work above, and **more useful than it**: with fp8 KV and
-**no rope override at all**, needle retrieval passes at ~200k (in-range control), ~300k (1.14×
-the trained 262,144) and **~400k with the needle 398k tokens back** (1.53×, 57.1 s), and fails
-at ~500k (1.91×, empty completion, 81.7 s). The 520,059-token case was an **HTTP 400 capacity
-refusal** — pool 519,040 < prompt — and is **not** a position failure. Booting above the
-derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+`[measured]` With fp8 KV and **no rope override at all**, needle retrieval passes well past the
+trained 262,144-token window. Booting above the derived window needs
+`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. Full detail in
+[BENCHMARKS §3.8](BENCHMARKS.md#38-native-context-beyond-the-trained-window-with-no-yarn--suite-stage-2-of-n).
 
-**Native extrapolation therefore holds to at least 400k and has broken by 500k.** This is worth
-more than the YaRN path for an agent lane, because YaRN f=4 is static and process-wide and
-measurably shifts short-context logits, whereas native extrapolation costs nothing at short
-context.
+- **Second card (RTX PRO 6000 Server Edition, 600 W; production-config replica, 540K declaration,
+  pool 689,728):** a 3-depth × 3-trial grid passes **36 / 36** at 300K, 400K, 440K and 470K
+  (1.79×), and a start/end bracket passes **8 / 8** at 480K, 500K, 510K and **530K (2.02×)**. Every
+  completion was the exact passphrase. An over-limit 691,728-token request was cleanly refused with
+  HTTP 400.
+- **Reference card (300 W Max-Q, pool 519,040):** passes at ~200K (control), ~300K and ~400K; the
+  ~500K case returned an empty completion. The earlier conclusion that retrieval *"has broken by
+  500k"* is **superseded** — 500K passes on the second card, so it is **probably capacity, not
+  position**. Not re-tested, so not confirmed.
 
-Three caveats, and they are load-bearing:
-- **No quality gate was run at 400k.** Four needles at one offset each is a capability probe,
-  not a quality verdict.
-- **The 400k–500k cliff is unbracketed** — nothing in between was tested.
-- fp8 KV is required to get a pool that admits these prompts, and fp8 KV is itself opt-in lossy
-  (§3.2).
+This is worth more than the YaRN path for an agent lane, because YaRN f=4 is static and
+process-wide and measurably shifts short-context logits, whereas native extrapolation costs nothing
+at short context — **subject to** the normal-length equivalence test below.
+
+Load-bearing caveats:
+- **It is retrieval, not reasoning.** A long-document aggregation stage (five facts, argmax and sum)
+  scored argmax **7/8** and sum **2/8** — but the sum fails at the 100K in-window control too, so it
+  is not a context-length failure, and the run cannot separate a missed record from an arithmetic
+  slip. A recall-separating follow-up and a thinking-on variant are running.
+- **Normal-length equivalence under a 540K declaration is not yet verified.** A decode-path test
+  between a 262K and a 540K boot is part of the suite.
+- **No quality verdict exists at any length past 262,144**, and **no production deployment has been
+  changed** on this basis — the reference deployment serves 262,144 per request.
+- The second card is a different SKU and power class; its wall times are not comparable to anything
+  measured on the reference card.
 
 *Hypothesis, not a finding:* only **12 of 48 layers are full-attention** and
 `partial_rotary_factor` is **0.25**, so RoPE acts on a quarter of the dimensions in a quarter of
