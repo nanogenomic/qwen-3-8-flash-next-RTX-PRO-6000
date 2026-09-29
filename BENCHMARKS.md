@@ -495,9 +495,15 @@ Leave-one-out calibration confirms the rule is not simply lenient: two lossless 
 scored as candidates against the others give PASS at p 0.95 and 0.65.
 
 **Since the fused kernels provably do not execute during the NLL suite (§4.2), this is a
-statement about the gate, not about the kernels.** The decisive instrument is §4.4. The
-outstanding work that would settle it is an NLL-only re-gate — base twice and the lever once
-on the same boot, at ~96 windows — which **was not run**.
+statement about the gate, not about the kernels.** The decisive instrument is §4.4.
+
+Half of the NLL-only re-gate was run. The **baseline leg ran twice on one boot of the final
+build, at 96 paired windows** (`--nll-ctx 512,4096,16384,65536 --nll-starts 4 --nll-window 64`),
+and it is the source of the base-vs-base spread in §1.1. It confirms the premise of §4.2
+directly: all 24 ctx-512 windows are bit-identical between the two runs (max token |Δ| 0.0),
+and every multi-chunk bucket differs (per-window |dNLL| 0.043 / 0.045 / 0.053 at 4k / 16k /
+64k, SD 0.062–0.069). **The lever leg on that same boot was not run**, so FUSE's NLL verdict
+still rests on the cross-boot comparisons above.
 
 ### 4.6 Statistical power — what these sample sizes can actually resolve
 
@@ -541,6 +547,46 @@ lower-powered suites, at the resolutions above.
   poisoning if it happens during a run but does not provoke it.
 - **GPQA-Diamond is not included** — the dataset is gated.
 
+### 4.8 Radix-cache integrity (the poisoned-prefix race)
+
+Upstream has an unfixed chunked-prefill / radix-insert race (sglang #38319, fix PR #38355 still
+open) that can leave a cached prefix corrupted until the cache is flushed. The same prefix then
+emits an impossible token id on every hit. This fork does not change that code, so the gate
+checks for it rather than assuming it away.
+
+**The first version of the probe never touched the cache.** It scored prompt logprobs of a
+window after each prefix. In this engine, any request that asks for prompt logprobs caps its
+own prefix match (`schedule_batch.py:1414`). Every warm and late request therefore reported
+`cached_tokens = 0`, on the stock engine, on the old engine on the test card and on the new
+engine. What it measured was prefill recompute drift, not cache integrity. That produced one
+false FAIL, which was withdrawn.
+
+**Version 2 is generation-only.** It sends raw input ids, asks for a greedy 32-token
+continuation, and returns output-token logprobs only. There is no prompt-logprob request, so
+the prefix match is not capped. Each of three code-corpus prefixes (8k, 24k and 49k tokens)
+runs three times: cold (first sight), warm (an immediate repeat) and late (after the other
+suites have churned the cache).
+
+The verdict rule:
+
+- **FAIL** on any impossible token id.
+- **FAIL** on a degenerate continuation beyond the reference + 1.
+- **FAIL** if the mean |Δlogprob| over the shared greedy continuation exceeds max(0.1, 3 × the
+  reference).
+- **NOT_COMPARABLE** if no warm or late request actually hit the cache.
+
+`[measured]`
+
+| Run | Cache hits (warm/late pairs) | Largest cached prefix | Max mean \|Δlogprob\| on shared continuation | Impossible ids | Verdict |
+|---|---|---|---|---|---|
+| Stock engine, production lane (reference) | 4 / 6 | 49,088 tokens | 0.111 | 0 | reference |
+| This tree, token-map configuration | 4 / 6 | 49,088 tokens | 0.101 (limit 0.334) | 0 | **PASS** |
+
+The two misses in each row are warm repeats that landed before lazy insertion into the cache.
+Only 3 prefixes were used, and the race needs retraction under memory pressure, which the probe
+does not provoke. So this row says no poisoning occurred during the run. It does not say the
+race cannot happen.
+
 ---
 
 ## 5. Reproducing this
@@ -572,11 +618,11 @@ Recorded so this is not mistaken for a finished evaluation.
 |---|---|
 | Dynamic-k paired GPU A/B (fixed-k, cumprob, learned gate, batch-aware fill) | **never run.** CPU- and GPU2-proxy-verified only. |
 | Learned-gate paired GPU test | **never run.** |
-| NLL-only re-gate of the fuse levers (§4.5) | **never run.** |
+| NLL-only re-gate of the fuse levers (§4.5) | **half run.** Baseline twice on one boot, 96 windows: done, and it is the §1.1 noise seed. The lever leg on that boot: **not run.** |
 | Strict-mode references and any strict verdict | **never built** — the baseline-config twin failed to boot twice. |
-| Same-instance NLL repeat (the true NLL noise floor rather than a cross-instance one) | **never run**, same reason. |
+| Same-instance NLL repeat (the true NLL noise floor rather than a cross-instance one) | **done** on the final build (same boot, 96 paired windows; §1.1, §4.5). It was never done for the stock-engine baseline configuration, whose twin failed to boot. |
 | IFEval, decpath and degen on the YaRN f=4 / 1M configuration | **not measured** — the run was stopped mid-suite, and the later gate returned INVALID. |
-| Cache-integrity (v2, cache-exercising) prefix probe on this engine | **not measured.** |
+| Cache-integrity (v2, cache-exercising) prefix probe on this engine | **measured once, PASS** (§4.8) — on the token-map configuration only, 3 prefixes. Not repeated on the final lossless stack. |
 | A multi-client / multi-subagent capacity benchmark (aggregate throughput and per-turn latency at a realistic mix of one long-context primary plus N small subagents) | **not run.** §3.3b gives the constants to size with and one live oversubscription reading; there is no swept measurement of the mixed workload, so the sizing guidance is arithmetic plus a single observation, not a benchmark. |
 | Prefill re-cost under deliberate prefix eviction (how many seconds a turn actually costs once a ~250k prefix has been evicted) | **not measured directly.** Inferred from the measured prefill rate, not timed under induced eviction. |
 | A deep single-stream context sweep on the exact shipping bf16-KV configuration (beyond 95.4k, up to its 279,680-token pool) | **not run.** The harness cells stopped at 95.4k, so §3.1b's deeper rows come from the fp8-KV and host-KV arms instead. This is the single most useful missing measurement for anyone sizing a long-context agent lane on the shipping config. |

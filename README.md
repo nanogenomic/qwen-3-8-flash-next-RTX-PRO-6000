@@ -76,6 +76,25 @@ degenerate outputs**. Neither that test nor the NLL suite certifies *bitwise* eq
 because decode on this stack is nondeterministic even for the unmodified baseline (4–7 of
 96 identical output pairs within the baseline itself).
 
+**How "lossless" was decided.** The obvious instrument, teacher-forced NLL, is the wrong
+one here. It runs prefill in 4,096-token chunks, so it never executes the decode kernels
+these levers change (they gate at `T <= 16`). Beyond one chunk it is also nondeterministic
+run to run, even with no lever on. The gate is therefore built around three rules:
+
+- **Decode-path equivalence is primary.** The test uses 48 real prompts that fit in one
+  prefill chunk. Each is decoded greedily for 384 tokens at concurrency 1 and 4, using
+  output logprobs only. Agreement length and \|Δlogprob\| are compared against a measured
+  baseline-vs-baseline spread.
+- **ctx-512 NLL is a hard check.** It is bit-deterministic on the baseline, so a lossless
+  claim fails on any token moving by more than 1e-4. This check is blind to KV-cache dtype.
+- **Multi-chunk NLL is judged only against a measured baseline repeat.** It is never judged
+  against a fixed budget.
+
+Every verdict is PASS / WARN / FAIL / INVALID / NOT_MEASURABLE. A suite with more than 5 %
+errors is INVALID, never PASS. [BENCHMARKS §4](BENCHMARKS.md#4-quality-instruments--what-each-one-can-and-cannot-see)
+covers what each instrument can and cannot see, the statistical power at each sample size,
+and the open gaps. No strict-mode (≤ 2-point) verdict was issued.
+
 **Optional, lossy, off by default —** `--kv-cache-dtype fp8_e4m3`:
 
 | | Value |
