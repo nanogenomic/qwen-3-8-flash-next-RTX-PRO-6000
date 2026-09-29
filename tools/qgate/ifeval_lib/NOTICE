@@ -1,0 +1,11 @@
+ifeval_lib/ -- IFEval instruction checkers
+
+instructions.py, instructions_registry.py and instructions_util.py are
+Copyright 2023 The Google Research Authors, licensed under the Apache License,
+Version 2.0 (see each file's header and ../../../LICENSE). Original source:
+https://github.com/google-research/google-research/tree/master/instruction_following_eval
+
+They were obtained from EleutherAI lm-evaluation-harness v0.4.9
+(lm_eval/tasks/ifeval/), which redistributes them with Google's headers intact.
+The only modification is the import lines: `from lm_eval.tasks.ifeval import X`
+became `from . import X`. The harness's own MIT-licensed utils.py is not included.

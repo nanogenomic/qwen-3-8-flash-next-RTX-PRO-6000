@@ -1,0 +1,4 @@
+data/
+runs/
+tokenizer/
+__pycache__/

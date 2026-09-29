@@ -93,7 +93,8 @@ run to run, even with no lever on. The gate is therefore built around three rule
 Every verdict is PASS / WARN / FAIL / INVALID / NOT_MEASURABLE. A suite with more than 5 %
 errors is INVALID, never PASS. [BENCHMARKS §4](BENCHMARKS.md#4-quality-instruments--what-each-one-can-and-cannot-see)
 covers what each instrument can and cannot see, the statistical power at each sample size,
-and the open gaps. No strict-mode (≤ 2-point) verdict was issued.
+and the open gaps. No strict-mode (≤ 2-point) verdict was issued. The harness is published in
+[`tools/qgate/`](tools/qgate/README.md), so you can gate your own changes the same way.
 
 **Optional, lossy, off by default —** `--kv-cache-dtype fp8_e4m3`:
 
@@ -177,6 +178,7 @@ make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 32 commits as a git-am-able series against the base commit
 COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
 python/  test/           the 43 changed files, at their exact upstream paths
+tools/qgate/             the quality-gate harness behind BENCHMARKS §4 (not part of the engine)
 ```
 
 The source files sit at their real upstream paths, so you can read them here, diff them
@@ -601,7 +603,11 @@ CHANGES §7).
 - **No trained MTP draft head.** The retrained head that was evaluated is traffic-derived
   and is not published. It also **regressed in-engine** and was not deployed — see
   CHANGES §Adaptive speculation and draft head.
-- **No benchmark corpora.** The harness prompt sets included a private code corpus.
+- **No benchmark corpora and no run data.** The quality-gate harness **is** included
+  ([`tools/qgate/`](tools/qgate/README.md)), with a script that downloads the public datasets from
+  their publishers. It does not include the baseline and candidate result files behind the
+  published verdicts, or the private code corpus used for some NLL windows. That corpus is
+  optional; the harness falls back to public-domain text without it.
 
 ## License
 

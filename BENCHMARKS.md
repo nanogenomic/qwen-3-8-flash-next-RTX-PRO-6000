@@ -82,7 +82,7 @@ range.
 | **Config verification** | Every instance's configuration was read back from `/get_server_info`, and for env-gated levers from `/proc/<pid>/environ`, rather than trusted from the launch line. |
 | **Concurrency** | 1 and 4. **8 and 16 were dropped** because the shipping profile caps at `--max-running-requests 4`. |
 | **Context sweep** | prefix lengths 4k / 16k / 48k / 96k / 192k at bs=1, fitting ms-per-verify-cycle against context. |
-| **Quality gate** | A separate harness with 8 suites (see §4), a measured noise floor from same-config repeats, and explicit PASS / WARN / FAIL / INVALID / NOT_MEASURABLE verdicts. A suite with >5 % errors or unplanned skips is **INVALID** and is dropped from verdicts rather than reported as PASS or FAIL. |
+| **Quality gate** | A separate harness, published in [`tools/qgate/`](tools/qgate/README.md), with the suites in §4, a measured noise floor from same-config repeats, and explicit PASS / WARN / FAIL / INVALID / NOT_MEASURABLE verdicts. A suite with >5 % errors or unplanned skips is **INVALID** and is dropped from verdicts rather than reported as PASS or FAIL. |
 
 **One difference between the measured tree and the published tree.** Publication made four
 files' hardcoded paths environment-configurable (see CHANGES §9). Three of the four are an
@@ -93,10 +93,15 @@ instead of silently looking in a fixed directory. **That lever is off in every m
 here, and is redundant when SBMOE is on.** No measurement was re-run after that change, and
 nothing in the measured path was altered by it.
 
-**Benchmark data is not in this repository.** The NLL and reference-agreement suites used a
-private code corpus, and the needle-in-a-haystack haystacks are public-domain Gutenberg texts
-(War and Peace, Moby Dick, Pride and Prejudice, A Tale of Two Cities, Great Expectations).
-GSM8K, IFEval, HumanEval, HumanEval+, MBPP+ and MMLU-Pro are the standard public sets.
+**Benchmark data is not in this repository, and neither are the run results.** The NLL and
+reference-agreement suites used a private code corpus. The needle-in-a-haystack haystacks are
+public-domain Gutenberg texts: War and Peace, Moby Dick, Pride and Prejudice, A Tale of Two
+Cities and Great Expectations. GSM8K, IFEval, HumanEval, HumanEval+, MBPP+ and MMLU-Pro are the
+standard public sets.
+
+`tools/qgate/fetch_data.sh` downloads every public file from its publisher, and checks it
+against content checksums of the exact files used here. All 11 files matched when the script
+was tested. Without the private corpus, the harness scores public-domain text in its place.
 
 ---
 
@@ -404,7 +409,9 @@ gate returned INVALID (rc=2) and there is no decode-path verdict for that config
 
 ## 4. Quality instruments — what each one can and cannot see
 
-This matters more than usual here, because the obvious instrument is the wrong one.
+This matters more than usual here, because the obvious instrument is the wrong one. The
+harness is in [`tools/qgate/`](tools/qgate/README.md); its README gives the commands and the
+verdict labels.
 
 ### 4.1 The suites
 
