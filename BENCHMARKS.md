@@ -248,7 +248,52 @@ bytes read per selected token from 2,048 to **92–223 B**, i.e. a **9–22× re
 traffic**. During the needle phase the hit rate was only **0.35–0.40**, because each needle
 decodes at most 48 tokens right after its prefill.
 
-### 3.8 1M context
+### 3.8 Native context beyond the trained window, with no YaRN
+
+`[measured, 2026-09-29]` Build: this tree's final build plus `--kv-cache-dtype fp8_e4m3`,
+`--context-length 540000`, and **no YaRN and no rope override of any kind**. Booting above the
+derived window requires `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. KV pool 519,040 tokens.
+
+Harness: one needle per request, placed at a fixed offset in a real-text public-domain
+haystack, scored by exact string match on the completion. The 200k case is an in-range control.
+
+| Haystack target | × trained 262,144 | Needle offset | Needle distance | Result | Wall |
+|---|---|---|---|---|---|
+| ~200k | 0.76× | 1,000 | ~199k | **PASS** (control) | — |
+| ~300k | 1.14× | 1,000 | ~299k | **PASS** | — |
+| ~400k | 1.53× | 2,000 | **398k** | **PASS** | 57.1 s |
+| ~500k | 1.91× | — | — | **FAIL** — empty completion | 81.7 s |
+| 520,059 (exact prompt tokens) | 1.98× | 3,000 | ~517k | **HTTP 400 — capacity refusal.** Pool 519,040 < prompt 520,059. | — |
+
+**The 520k row is not a retrieval failure.** The request was refused before inference because
+the prompt did not fit the pool. The genuine position failure is the 500k row.
+
+**Conclusion: native extrapolation holds to at least 400k and has broken by 500k.**
+
+What this does and does not establish:
+
+- **It is a retrieval probe, not a quality verdict.** Four needles at one offset each. **No
+  quality gate was run at 400k** — no accuracy suite, no NLL, no decode-path test. Needle
+  retrieval saturates and only catches catastrophic failure (§4.7).
+- **The 400k–500k cliff is unbracketed.** Nothing between them was tested, so "breaks by 500k"
+  is the only defensible statement; where it actually breaks is unknown.
+- **Timings for the 200k and 300k cases were not recorded** in the run ledger, so they are
+  omitted rather than estimated.
+- fp8 KV is load-bearing here (the pool would not otherwise admit these prompts) and is itself
+  **opt-in lossy** — decode-path WARN at concurrency 4, p = 0.033 (§4.4).
+
+*Hypothesis only, not measured:* the architecture presents a small positional surface —
+**12 of 48 layers are full-attention** (36 are gated-delta-net linear attention) and
+`partial_rotary_factor` is **0.25**, so RoPE acts on a quarter of the dimensions in a quarter
+of the layers. That is consistent with graceful extrapolation, but no experiment here isolates
+it and it should not be cited as the mechanism.
+
+Why this is operationally interesting: it is **cheaper than YaRN**. Static YaRN f=4 is
+process-wide, measurably shifts short-context logits (mean |Δlogprob| 0.066–0.283 nats/token
+against native on real text), and therefore needs its own process. Native extrapolation to
+400k costs nothing at short context — at the price of having no quality verdict at depth.
+
+### 3.9 1M context
 
 See [CHANGES §3.4](CHANGES-vs-upstream.md#34-1m-context-on-one-card--measured-and-not-the-default)
 for the full table — needles 5/5 with 4 beyond native, decode 157.0 / 154.4 / 141.0 tok/s at
@@ -432,7 +477,11 @@ Recorded so this is not mistaken for a finished evaluation.
 | Same-instance NLL repeat (the true NLL noise floor rather than a cross-instance one) | **never run**, same reason. |
 | IFEval, decpath and degen on the YaRN f=4 / 1M configuration | **not measured** — the run was stopped mid-suite, and the later gate returned INVALID. |
 | Cache-integrity (v2, cache-exercising) prefix probe on this engine | **not measured.** |
-| Retrieval between 400k and 500k on native RoPE, and a lossy quality gate at 400k | **not run.** Needle retrieval alone is not a quality verdict. |
+| Bracketing the native-RoPE cliff between 400k and 500k (e.g. 440k, 470k) | **not run.** §3.8 can only say "holds to 400k, broken by 500k". |
+| A lossy quality gate at 400k on native RoPE | **not run**, so the 400k window is a capability probe and not a certified operating point. |
+| Wall times for the ~200k and ~300k native-RoPE needle cases | **not recorded** in the run ledger; omitted rather than estimated. |
+| Why the retrained MTP head won on a B200 under plain upstream SGLang (+1.8 % to +3.7 % in all four cells) and was flat on this tree's SM120 fused path (2.1076 vs 2.1079) | **cause not established.** GPU generation and the fused decode path were never isolated from each other. |
+| Downtime duration of the 2026-09-29 16:45:24 constrained-decoding OOM | **not recorded** in the sources consulted; the failure chain and the mitigation are, so no duration is claimed. |
 | The 900k mixed-stream failure, after the OOM fix | **not re-run.** |
 | Why the long primary never gets a radix-cache hit | **cause not established.** |
 | Accept-length decay over uptime | snapshots recorded per suite; **no trend analysis done.** |

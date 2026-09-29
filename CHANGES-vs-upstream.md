@@ -27,7 +27,7 @@ has the detail.
 - [4. Levers that are present and off](#4-levers-that-are-present-and-off)
 - [5. Incomplete work](#5-incomplete-work)
 - [6. Instrumentation](#6-instrumentation)
-- [7. Why not 2× single-stream](#7-why-not-2x-single-stream)
+- [7. Why not 2x single-stream](#7-why-not-2x-single-stream)
 - [8. Things that are upstream's, not this fork's](#8-things-that-are-upstreams-not-this-forks)
 - [9. Commit list](#9-commit-list)
 
@@ -245,7 +245,13 @@ production. The production figure is larger only because that card carried less 
 Contributions, all measured:
 
 - `--mem-fraction-static 0.98` instead of 0.958, with **3.39 GB of runtime headroom measured
-  on the production card** at that setting.
+  on the production card** at that setting. ⚠ **That headroom is enough for steady-state
+  serving and not always enough for a lazy allocation made after serving starts** — the
+  reference deployment was killed once by a constrained-decoding request taking a lazy Triton
+  kernel-load path with 0.54 GiB free. The mitigation (a grammar-constrained warmup request at
+  startup, which costs no KV pool) and the full failure chain are in
+  [README.md](README.md#operational-warning---mem-fraction-static-098-is-tight). Anyone copying
+  this configuration should read that before treating 0.98 as free.
 - `--max-mamba-cache-size 12` with `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`, instead of 16.
   Mamba slots trade against KV at **~0.093 GB ≈ 3,750 pool tokens per slot**, and **each
   running request costs 3 mamba state slots** (`mamba num: 45` observed at
@@ -344,10 +350,31 @@ Host RAM floor during the run: **63 GiB MemAvailable**. Host↔GPU transfer meas
   1M** (from 93.0 at 256k) `[vendor-published]`. Needle retrieval passing is **not** a
   statement about multi-needle reasoning at these depths.
 
-Also measured, without YaRN: **native RoPE retrieves past 262,144** — needles pass at
-200k / 300k / 400k and fail at 500k (empty output; 520k was a capacity refusal, not a
-position failure). The 400k–500k cliff was not bracketed, and needle retrieval alone is not
-a quality verdict, so this is a lead, not a result.
+### 3.5 Native RoPE past the trained window — no YaRN needed to 400k
+
+`[measured]` Separately from the YaRN work above, and **more useful than it**: with fp8 KV and
+**no rope override at all**, needle retrieval passes at ~200k (in-range control), ~300k (1.14×
+the trained 262,144) and **~400k with the needle 398k tokens back** (1.53×, 57.1 s), and fails
+at ~500k (1.91×, empty completion, 81.7 s). The 520,059-token case was an **HTTP 400 capacity
+refusal** — pool 519,040 < prompt — and is **not** a position failure. Booting above the
+derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+
+**Native extrapolation therefore holds to at least 400k and has broken by 500k.** This is worth
+more than the YaRN path for an agent lane, because YaRN f=4 is static and process-wide and
+measurably shifts short-context logits, whereas native extrapolation costs nothing at short
+context.
+
+Three caveats, and they are load-bearing:
+- **No quality gate was run at 400k.** Four needles at one offset each is a capability probe,
+  not a quality verdict.
+- **The 400k–500k cliff is unbracketed** — nothing in between was tested.
+- fp8 KV is required to get a pool that admits these prompts, and fp8 KV is itself opt-in lossy
+  (§3.2).
+
+*Hypothesis, not a finding:* only **12 of 48 layers are full-attention** and
+`partial_rotary_factor` is **0.25**, so RoPE acts on a quarter of the dimensions in a quarter of
+the layers — a small positional surface, which would be consistent with graceful extrapolation.
+No experiment here isolates that, and it should not be cited as the mechanism.
 
 ---
 
@@ -527,24 +554,90 @@ copy of the scale for small-N layers. That was not guessed at. It remains **opt-
 even when fixed**, because the QAD checkpoint is itself lossy relative to BF16 (this engine
 path is lossless *with respect to the checkpoint*).
 
-### 5.2 MTP draft-head retraining — regressed in-engine, not deployed
+### 5.2 MTP draft-head retraining — no in-engine gain, and a train/serve trap
 
-Offline, on held-out traffic, a retrained draft head improved accepted tokens per step from
-**2.474 → 2.581** at production sampling (T=1.0) and **2.783 → 2.931** greedy. **In the
-engine it regressed**: accepted tokens per step **2.108 → 1.677**, single-stream
-**180.5 → 120–131 tok/s**, 4-concurrent **414 → 309–327**. It was **not deployed**, and the
-size of the regression points to a load/integration mismatch rather than the training.
+**Outcome: two retrained heads, neither deployed. Published as a negative result, because the
+offline-to-engine non-transfer is the interesting part.**
 
-A later variant measured **flat** on this tree (accept 2.1076 vs 2.1079 stock). Gains seen on
-other hardware did not reproduce on the SM120 fused path; cause unknown.
+#### The final head measured flat in-engine
 
-**Neither head is published** — both were trained on private traffic. The hooks that produced
+`[measured]` Offline on held-out traffic, the final head (v3) beat stock everywhere, including
+at full context with the engine's own sparse attention:
+
+| Offline metric (accepted tokens per step) | Stock | v3 |
+|---|---|---|
+| Windowed, sampled / greedy | 2.474 / 2.783 | 2.575 / 2.950 |
+| Out-of-distribution, sampled / greedy | 2.222 / 2.629 | 2.285 / 2.764 |
+| Full ~16k context, sparse attention, sampled / greedy | 2.556 / 2.881 | 2.596 / 2.973 |
+
+`[measured]` **On a B200 running plain upstream SGLang it also won in the real engine, in all
+four cells** (stock is 4 reps; the in-distribution T=1 cell is n=240 at concurrency 4, 2 reps):
+
+| Cell | Stock mean [range] | v3 (reps) | Δ |
+|---|---|---|---|
+| OOD, T=1 | 2.055 [2.027–2.082] | 2.139, 2.125 | **+3.7 %** |
+| OOD, T=0 | 2.505 [2.431–2.541] | 2.562, 2.554 | **+2.1 %** |
+| In-distribution, T=1, n=240 | 2.498 [2.491–2.506] | 2.555, 2.530 | **+1.8 %** |
+| In-distribution, T=0 | 2.904 [2.890–2.921] | 2.971, 2.989 | **+2.6 %** |
+
+`[measured]` **On this tree's fused / SM120 path it was flat.** Same eval-split probe, same
+production configuration, only the checkpoint changed:
+
+| | Stock | v3 |
+|---|---|---|
+| Accept length (counter method) | 2.1079 | **2.1076** |
+| Single-stream | 180.5 | 180.0 / 185.8 |
+| 4-concurrent aggregate | 413.9 | 428.0 / 431.0 (n=1, inside noise) |
+
+**It was not deployed. The cause of the non-transfer is unknown.** The two candidate
+differences are the hardware (SM100 vs SM120) and this tree's fused decode path; neither was
+isolated. What can be said is narrow and worth saying: **a draft head that wins on a different
+GPU generation and a different kernel path is not evidence it will win on yours.**
+
+#### The trap: the first retrain regressed hard, from a train/serve mismatch
+
+This is the part worth reading before retraining an MTP head on this architecture.
+
+`[measured]` The first retrained head **regressed badly in-engine** — accepted tokens per step
+**2.108 → 1.677**, single-stream **180.5 → 120–131 tok/s**, 4-concurrent **414 → 309–327** —
+while its offline numbers looked good (+4.4 % sampled, +5.3 % greedy).
+
+**Root cause: the training reimplementation attended densely where the engine attends
+sparsely.** The MTP layer's QSA indexer (`index_qk_proj`) takes the attention *input* and
+selects the top-512 of 4-token blocks (budget 2,048); decode steps then reuse that selection.
+The PyTorch training model attended **densely** over its windows. The retrain moved exactly the
+weights that feed the indexer — `fc_embedding` by 113 %, `fc_hidden` by 57 %, `attn_hc` by
+8–26 % — so at serving time the indexer was selecting a *different* context subset than the one
+the head had been trained against.
+
+**And the equivalence gate did not catch it, for a structural reason: it only covered ≤ 2,048
+tokens, where dense and sparse selection are identical.** The gate was measuring a regime in
+which the bug cannot exist.
+
+The fix that made offline and in-engine agree was twofold:
+1. **Freeze everything upstream of the attention input** — `fc_embedding`, `fc_hidden`,
+   `pre_fc_norm_*`, `attn_hc`, and the MoE gate router — so the indexer sees exactly stock
+   inputs and selects exactly what the engine selects.
+2. **Train with the engine's own sparse selection**, and extend the gate past the ratio.
+   `[measured]` A sparse-attention gate at 8k (40 held-out sequences, 26,336 generated
+   positions, the engine's own MTP as reference) gives sparse-torch 0.6514 vs engine 0.6511
+   (Δ +0.0003, argmax agreement 0.9778), against dense-torch Δ −0.0008 / 0.9745.
+
+`[measured]` That reframing also deflated the apparent win: the windowed-dense evaluation had
+shown **+4.4 % / +5.3 %**; at real context with sparse attention the same head is **+0.5 % /
++1.4 %**. The offline gain was substantially an artefact of the dense approximation.
+
+**Generalisable lesson:** when a model's attention is sparse and *input-dependent*, any
+training reimplementation must reproduce the selection, and the equivalence gate must run
+**past the compression ratio** — otherwise it certifies a regime where the two implementations
+are trivially equal. This is the same class of error as the QSA ring aliasing in §1.1: a check
+whose window is narrower than the mechanism it is supposed to test.
+
+**Neither head is published**; both were trained on private traffic. The hooks that produced
 their training data are in §6.
 
 Ceiling worth knowing: `[arithmetic]` **even a perfect draft head tops out at 2.72 accepted
 tokens per step** under production sampling.
-
----
 
 ## 6. Instrumentation
 
@@ -572,7 +665,7 @@ naive accept-length counter is not comparable across tiers.
 
 ---
 
-## 7. Why not 2× single-stream
+## 7. Why not 2x single-stream
 
 Stated plainly because it is the most useful negative result here.
 

@@ -57,6 +57,39 @@ because decode on this stack is nondeterministic even for the unmodified baselin
 The conc-4 WARN is a small but real divergence, which is why fp8 KV ships **labelled lossy
 and opt-in** rather than as a default.
 
+### Context beyond the trained window, with no YaRN
+
+`[measured]` With fp8 KV for the pool and **no rope override of any kind**, this model
+retrieves past its trained 262,144-token window on native RoPE alone. Needle retrieval, one
+needle per request in a real-text haystack:
+
+| Prompt | × trained window | Result | Wall |
+|---|---|---|---|
+| ~200k (in-range control) | 0.76× | **PASS** | — |
+| ~300k | 1.14× | **PASS** | — |
+| ~400k, needle 398k tokens back | 1.53× | **PASS** | 57.1 s |
+| ~500k | 1.91× | **FAIL** — empty completion | 81.7 s |
+| 520,059 | 1.98× | **HTTP 400 — capacity refusal**, pool was 519,040 < prompt. Not a position failure. | — |
+
+So **native extrapolation holds to at least 400k and has broken by 500k.** Booting above the
+derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` (SGLang otherwise refuses),
+and reaching a pool that can admit these prompts needs `--kv-cache-dtype fp8_e4m3` — which is
+itself opt-in lossy (decode-path WARN at concurrency 4).
+
+**Read this as a capability probe, not a quality result.** Four needles are not a quality
+verdict: **no quality gate was run at 400k**, and the 400k–500k cliff is **unbracketed** —
+nothing between 400k and 500k was tested. If you want the window, gate it first.
+
+*Hypothesis, not a finding:* only **12 of 48 layers** are full-attention (the other 36 are
+gated-delta-net linear attention), and `partial_rotary_factor` is **0.25**, so RoPE covers a
+quarter of the dimensions in a quarter of the layers. That is a small positional surface to
+extrapolate, which would be consistent with graceful degradation rather than a hard edge — but
+it was not tested, and it is not an explanation anyone should rely on.
+
+This matters practically because it is **cheaper than YaRN**: static YaRN f=4 is process-wide,
+shifts short-context logits by 0.066–0.283 nats/token against native, and needs a separate
+process. Native extrapolation to 400k costs nothing at short context.
+
 Full methodology, harness, rep counts and noise bands: **[BENCHMARKS.md](BENCHMARKS.md)**.
 Per-lever specification: **[CHANGES-vs-upstream.md](CHANGES-vs-upstream.md)**.
 
@@ -124,36 +157,92 @@ git am /path/to/this/patches/0*.patch
 
 ### Run it
 
+This is the configuration the measured results were taken on, transcribed from the reference
+deployment's own service unit rather than reconstructed:
+
 ```bash
+export SGLANG_QWENOPT_FUSE_SBMOE=1     # 4-launch small-batch NVFP4 MoE, bitwise-identical
+export SGLANG_QWENOPT_FUSE_HC=1        # fused hyper-connection chain, within 1 bf16 ulp
+export SGLANG_HC_MIX_PREFETCH=1
+export SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1
+export CUDA_HOME=/usr/local/cuda       # SGLANG_QWENOPT_FUSE_HC JIT-compiles one CUDA kernel
+export FLASHINFER_CUDA_ARCH_LIST=12.0 MAX_JOBS=8
+export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+export TRTLLM_ENABLE_PDL=1
+
 python -m sglang.launch_server \
   --model-path <your Qwen3.8-Flash-Next NVFP4 checkpoint> \
   --quantization modelopt_fp4 --trust-remote-code \
   --context-length 262144 --mem-fraction-static 0.98 \
   --attention-backend flashinfer --sampling-backend flashinfer \
   --moe-runner-backend flashinfer_cutlass \
-  --fp4-gemm-backend flashinfer_cudnn \
   --bf16-gemm-backend sm120gemv \
-  --mamba-ssm-dtype bfloat16 --page-size 64 \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --max-mamba-cache-size 12 --page-size 64 \
   --max-running-requests 4 --cuda-graph-max-bs-decode 4 \
-  --max-mamba-cache-size 12 \
+  --cuda-graph-backend-prefill=disabled \
   --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
-  --speculative-algorithm EAGLE --speculative-num-steps 3 \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-  --ple-offload-embedding --enable-metrics
+  --ple-offload-embedding --enable-metrics --enable-cache-report
 ```
 
-with the levers enabled in the environment:
+Two notes on flags that are easy to get wrong:
 
-```bash
-export SGLANG_QWENOPT_FUSE_SBMOE=1     # 4-launch small-batch NVFP4 MoE, bitwise-identical
-export SGLANG_QWENOPT_FUSE_HC=1        # fused hyper-connection chain, within 1 bf16 ulp
-export SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1
-export CUDA_HOME=/usr/local/cuda       # SGLANG_QWENOPT_FUSE_HC JIT-compiles one CUDA kernel
-export FLASHINFER_CUDA_ARCH_LIST=12.0
-```
+- **`--speculative-algorithm NEXTN`, not `EAGLE`.** NEXTN is what selects this model's MTP
+  head. The server then *reports* `EAGLE` in `/get_server_info`, because NEXTN resolves onto
+  the EAGLE worker internally — so the launch flag and the reported value legitimately differ.
+- **`--fp4-gemm-backend` is left unset here**, which resolves to `auto`, because that is what
+  the measurements ran on. Separately, `flashinfer_cudnn` is the one setting on record as
+  known-safe against a CUTLASS FP4 GEMM race that propagated NaN through speculative
+  verification into repetition loops. Whether `auto` resolves to a safe kernel on SM120 was
+  **not traced**. If you pin `flashinfer_cudnn`, wipe the FlashInfer JIT cache at the same
+  time — stale kernels keep the bug.
 
 `SGLANG_QWENOPT_FUSE_HC=1` needs `CUDA_HOME` set and `ninja` on `PATH` at first use, for
 the `hc_fused_tail` JIT during CUDA-graph warmup.
+
+### Operational warning: `--mem-fraction-static 0.98` is tight
+
+0.98 buys the KV pool, and it leaves only about **3.39 GB of device headroom** on a 96 GB card
+`[measured]`. That is enough for steady-state serving and **not** always enough for a *lazy*
+allocation made after serving starts.
+
+This bit the reference deployment. At 16:45:24 on 2026-09-29 it died with:
+
+```
+Triton kernel 'apply_token_bitmask_inplace_kernel' device-loaded after serving started
+(free device mem: 0.54 GiB). Pre-load it during engine init to avoid CUDA OOM.
+```
+
+→ scheduler exception → `SIGQUIT` → `kill_process_tree`. A constrained-decoding request
+(tool-call / JSON, i.e. `response_format`, a grammar, or a tool schema) took a **lazy Triton
+kernel-load path with no VRAM left to load into**. Nothing in this fork's levers caused it;
+it is what a high static memory fraction costs.
+
+The mitigation that was applied — and the one to prefer, because it **costs no KV pool** —
+is to issue one grammar-constrained request at startup, so the kernel loads while memory is
+still plentiful:
+
+```bash
+curl -sf "127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+  "model":"<served-model-name>",
+  "messages":[{"role":"user","content":"Reply with a JSON object containing one key \"ok\" set to true."}],
+  "max_tokens":16, "temperature":0, "response_format":{"type":"json_object"}}'
+```
+
+Run it after `/health` returns, and make it non-fatal — a warmup hiccup must never keep the
+lane down. If you would rather not depend on a warmup step, lower `--mem-fraction-static`
+and accept the smaller pool.
+
+### Deployment gotcha: a router that pins the context window
+
+If a router or gateway fronts the backend and advertises its own `max_model_len`, **raise it
+when the KV pool grows.** The reference deployment's router kept advertising 241,728 after
+the pool became 331,456, so every client silently ran about 20,400 tokens short of the real
+262,144 window until it was corrected. The backend does not complain, and neither does the
+client — requests simply get truncated to a window nobody asked for.
 
 **A speculative token map is supported and helps materially, but no map ships here.** The
 maps used in the measurements were built from private serving traffic. `--speculative-token-map`
@@ -202,6 +291,15 @@ Everything is off unless listed otherwise. Details and measured effects per leve
 | `SGLANG_MTP_HIDDEN_DUMP_GATE`, `..._MAX_TOKENS`, `..._QUEUE`, `..._SHARD_GIB` | Dump window, budget, queue depth and shard size. |
 | `SGLANG_QSA_PENDING_RING_SLOTS` | Pins the pending index-key ring to a fixed row count. `0` derives it correctly. **Set it only to reproduce an older build's (aliasing) addressing in an A/B.** |
 
+### Upstream variables this fork's results depend on
+
+Not ours, listed because a result above needs them.
+
+| Variable / flag | Why it appears here |
+|---|---|
+| `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Required to boot with `--context-length` above the window SGLang derives from the checkpoint. Needed for the native-extrapolation result and for any YaRN configuration. |
+| `--kv-cache-dtype fp8_e4m3` | Opt-in lossy. Required to reach a KV pool that admits ~400k-token prompts. |
+
 ### Build helpers (optional levers only)
 
 | Variable | Used by |
@@ -248,7 +346,7 @@ active-parameter count is not independently verified here. Only the routed exper
 NVFP4 — **86.6 % of decode weight traffic is BF16 the quantization never touched**, which
 is why the wins in this tree are kernel-launch and capacity wins rather than bandwidth wins,
 and why single-stream throughput on this engine is hard-capped well below 2× (see
-CHANGES §Why not 2×).
+CHANGES §7).
 
 ---
 
