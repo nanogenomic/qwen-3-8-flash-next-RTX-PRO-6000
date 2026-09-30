@@ -1,0 +1,65 @@
+clients/hermes/ -- Hermes Agent modifications for a shared backend
+==================================================================
+
+THIS DIRECTORY IS MIT-LICENSED. The rest of the repository it sits in is
+Apache-2.0; this directory alone carries upstream Hermes Agent's MIT licence,
+because everything in it is a modification of, or documentation about, an MIT
+work. Nothing here is relicensed in either direction.
+
+This directory is a MODIFIED version of:
+
+    hermes-agent 0.20.4
+    Copyright (c) 2025 Nous Research
+    MIT License (see LICENSE, shipped unmodified)
+    Upstream: https://github.com/NousResearch/hermes-agent
+    Baseline commit: tag v2026.8.18 (the tag whose pyproject.toml declares
+                     version = "0.20.4"); see BASELINE.md
+
+The LICENSE file in this directory is upstream's, byte-for-byte
+(md5 1864e6648a4c302b984b2efd215c7918). The Nous Research copyright notice
+above and in LICENSE is preserved as MIT requires.
+
+Modifications in this directory are Copyright (c) 2026 Ligandal, Inc. and are
+offered under the SAME MIT terms as the upstream work. Nothing here is
+relicensed.
+
+WHAT WAS MODIFIED
+-----------------
+Two changes (this directory currently covers patches 0001-0002 against
+upstream 0.20.4; see README.md for the refresh in progress), both concerning
+several Hermes sessions sharing ONE self-hosted model backend:
+
+  patches/0001-status-bar-own-vs-backend-accounting.patch
+      cli.py -- the status bar's delegation segment now distinguishes this
+      session's own live subagents from the shared backend's global occupancy,
+      and reports how many dispatch slots are actually free.
+
+  patches/0002-delegation-explicit-child-context-window.patch
+      tools/delegate_tool.py -- a subagent's context window is resolved and
+      logged explicitly at dispatch time instead of being inherited implicitly
+      from the parent profile's model.context_length. Adds an "auto" ladder
+      sized from live backend pressure, plus a runtime child-concurrency cap.
+
+upstream-modified/tools/delegate_tool.py is pristine upstream 0.20.4 with
+patch 0002 applied, provided so the change is readable in full.
+
+WHAT WAS CHANGED FOR PUBLICATION
+--------------------------------
+Patch 0002 as it runs on its original deployment carried three
+deployment-specific strings. They are replaced here; nothing else differs:
+
+  * the default backend probe URL is a private address on the original
+    deployment. Published as http://127.0.0.1:30000 (SGLang's own default
+    bind). Override with HERMES_KV_BACKEND. The probe fails open, so a wrong
+    value costs the sizing signal and nothing else.
+  * a profile name in one comment is generalised to "the parent (main-thread)
+    profile".
+  * the served model is referred to generically rather than by its local lane
+    name. The architectural reasoning is unchanged and applies to any
+    hybrid-attention model that pins a fixed recurrent state per in-flight
+    request.
+
+A quantity of surrounding operational tooling on the original deployment is
+deliberately NOT published, because it encodes that deployment's architecture
+rather than anything reusable. The reusable part of it -- the patterns -- is
+written up generically in docs/design-notes.md.

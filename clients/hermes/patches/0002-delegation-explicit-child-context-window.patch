@@ -1,0 +1,423 @@
+From 9ff0a3947154a5686194dc59f44ce38f792b8b69 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Tue, 29 Sep 2026 14:19:00 -0400
+Subject: [PATCH] delegation: size the subagent context window explicitly
+ instead of inheriting it
+
+_build_child_agent() constructed the child AIAgent without ever stating a
+context window, so every subagent silently adopted the parent profile's
+`model.context_length`. A capacity tool that lowers that value to relieve
+backend pressure therefore reshapes every subsequently spawned subagent, with
+no log line saying so.
+
+Observed failure: the profile window was lowered to 65,536 while
+`delegation.max_tokens` stayed at 24,576. The child's effective input budget
+became 40,960; the compressor's threshold floor (MINIMUM_CONTEXT_LENGTH =
+64,000) exceeds that, so the degenerate branch set the compaction trigger to
+0.85 * 40,960 = 34,816 tokens. At the trigger the child held ~34.9K, of which
+~25K was system prompt + tool schemas + protected head and ~10.2K was
+protected tail -- both incompressible. Roughly 10K was summarisable, so
+compaction could not get under the threshold and the agent stalled with
+"compression is blocked (ineffective)".
+
+Two defects, both addressed:
+
+  1. The child window is now RESOLVED and LOGGED at dispatch time rather than
+     inherited implicitly. Resolution order, first hit wins:
+       HERMES_CHILD_CONTEXT_LENGTH     int | "auto" | "inherit"
+       delegation.child_context_length int | "auto"
+       <absent>                        -> inherit (today's behaviour)
+     Absent config is a no-op, so this cannot change behaviour for anyone who
+     has not opted in.
+
+  2. 65,536 with a 24,576 output cap is not a viable child geometry, so the
+     "auto" ladder never selects it. The ladder floor is 81,920, its nominal
+     rung 98,304, its ceiling 131,072, chosen against the arithmetic above.
+     "auto" sizes from live backend pressure read from /v1/loads, cached, and
+     fails open in every error path -- a monitoring endpoint must never be able
+     to delay or fail a dispatch.
+
+Also caps child CONCURRENCY at runtime from the same pressure signal. On a
+hybrid-attention backend each in-flight request pins a fixed recurrent state
+that does not shrink with the context window, so admitting fewer children is a
+stronger lever than shaving windows once the windows are already small. The cap
+only ever lowers the worker count for one dispatch: all requested tasks still
+run, serialised rather than rejected, and the on-disk
+`delegation.max_concurrent_children` is untouched.
+
+The window is applied post-construction because AIAgent.__init__ has no
+context_length parameter; the compressor's context_length setter already
+re-derives threshold_percent, threshold_tokens, tail_token_budget and
+max_summary_tokens coherently, which is the whole contract needed.
+---
+ tools/delegate_tool.py | 340 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 339 insertions(+), 1 deletion(-)
+
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 8699edb..9474106 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1009,6 +1009,328 @@ def _get_max_spawn_depth() -> int:
+     return floored
+ 
+ 
++# ===========================================================================
++# CHILD CONTEXT WINDOW — EXPLICIT, NEVER A SILENT INHERITANCE
++# ===========================================================================
++# ⛔ WHY THIS EXISTS (real incident, 2026-09-29)
++# A KV governor wrote `model.context_length: 65536` into the parent (main-thread) profile
++# to relieve pool pressure. Nothing in this file passed a context window to the
++# child `AIAgent(...)` below, so EVERY subagent silently adopted 65,536 as well.
++# With `delegation.max_tokens: 24576` that child's compaction trigger becomes
++#     (65536 - 24576) = 40,960 effective input budget
++#     max(0.75 * 40960, MINIMUM_CONTEXT_LENGTH=64000) = 64,000 >= 40,960
++#       -> degenerate branch, agent/context_compressor.py:_compute_threshold_tokens
++#     0.85 * 40,960 = 34,816   <- the trigger that wedged
++# and the child wedged there. MEASURED from the compression telemetry, not
++# inferred (the profile's own agent.log, two consecutive compaction attempts):
++#     {"main_context_limit":65536,"effective_threshold":34816,
++#      "current_estimated_tokens":34924,"protected_tail_tokens":10229,
++#      "failure_class":"no_progress","commit_status":"aborted"}
++# i.e. at the trigger the child held ~34.9K of which ~10.2K was protected tail
++# and ~25K was system prompt + tool schemas + protected head — incompressible.
++# Only ~10K was summarisable, so compaction could not make progress and the
++# session stalled with nothing left to try.
++#
++# Two separate defects, both fixed here:
++#   1. the child window was never STATED, so a main-thread config edit reshaped
++#      every future subagent. It is now resolved explicitly and logged.
++#   2. 65,536 with a 24,576 output cap is not a viable child geometry at all.
++#      The auto ladder therefore never selects it (see _CHILD_CTX_AUTO_FLOOR).
++#
++# Resolution order (first hit wins):
++#   HERMES_CHILD_CONTEXT_LENGTH   int | "auto" | "inherit"   (per-run override)
++#   delegation.child_context_length   int | "auto"           (profile config)
++#   <absent>                      -> None -> INHERIT the parent window, i.e.
++#                                    exactly today's behaviour for anyone who
++#                                    has not opted in.
++_CHILD_CTX_ENV = "HERMES_CHILD_CONTEXT_LENGTH"
++_CHILD_CTX_CONFIG_KEY = "child_context_length"
++
++# Hard floor. agent/model_metadata.MINIMUM_CONTEXT_LENGTH is 64,000 and
++# agent_init refuses to construct below it; a post-construction assignment would
++# bypass that check, so re-assert it here rather than silently allowing a window
++# the rest of the runtime considers invalid.
++_CHILD_CTX_HARD_FLOOR = 64_000
++
++# Ceiling for the AUTO ladder only. Subagent work here is bounded (one goal, a
++# fresh conversation, skip_context_files + skip_memory), so a child does not
++# need the main thread's 262,144 — and giving it one is how three children
++# evict the parent's radix prefix. An explicit integer may exceed this; auto
++# never does.
++_CHILD_CTX_AUTO_CEILING = 131_072
++# Floor for the AUTO ladder. Deliberately ABOVE 65,536: see the measurement
++# above. At 81,920 the trigger is 0.85 * (81920-24576) = 48,742, which clears
++# the ~25K incompressible floor with room for a real summarisable middle.
++_CHILD_CTX_AUTO_FLOOR = 81_920
++# Normal-pressure rung, and the value recommended as an explicit default.
++# Trigger = max(0.75 * (98304-24576), 64000) = 64,000 (non-degenerate), leaving
++# ~27K of compressible middle above the measured ~25K incompressible floor.
++_CHILD_CTX_AUTO_NOMINAL = 98_304
++
++_CHILD_CTX_AUTO_WORDS = frozenset({"auto", "adaptive", "dynamic"})
++_CHILD_CTX_INHERIT_WORDS = frozenset({"inherit", "parent", "off", "none", ""})
++
++# ---------------------------------------------------------------------------
++# Live backend pressure — cached, fail-open
++# ---------------------------------------------------------------------------
++# `/v1/loads` on the SGLang backend is richer than /get_server_info and is the
++# right signal: it carries num_running_reqs, num_waiting_reqs, token_usage and
++# cache_hit_rate together. Only the backend port publishes it (the router at
++# :8000 returns 404), hence the separate URL.
++#
++# ⛔ FAIL OPEN, ALWAYS. This probe sizes a child; it must never be able to
++# delay or fail a dispatch. Any error, any timeout -> None -> the configured
++# value is used unchanged.
++_KV_PRESSURE_URL_ENV = "HERMES_KV_BACKEND"
++# Neutral default: SGLang's own default bind. Override per deployment with
++# HERMES_KV_BACKEND. The probe fails open, so a wrong value costs nothing
++# but the sizing signal.
++_KV_PRESSURE_URL_DEFAULT = "http://127.0.0.1:30000"
++_KV_PRESSURE_TTL_S = 5.0
++_KV_PRESSURE_TIMEOUT_S = 1.5
++_kv_pressure_lock = threading.Lock()
++_kv_pressure_cache: Dict[str, Any] = {"at": 0.0, "value": None}
++
++
++def _kv_pressure(force: bool = False) -> Optional[Dict[str, Any]]:
++    """Live backend pool pressure, cached for a few seconds. None when unknown.
++
++    Cached because a fan-out of N children resolves its window N times and must
++    not make N HTTP calls. The lock is held across the fetch on purpose: a
++    simultaneous fan-out then makes ONE request and the rest read the result,
++    which is the behaviour we want (the alternative, a stampede of 4 probes
++    against the very backend we are trying not to load, is the bug).
++    """
++    now = time.monotonic()
++    with _kv_pressure_lock:
++        if not force and (now - _kv_pressure_cache["at"]) < _KV_PRESSURE_TTL_S:
++            return _kv_pressure_cache["value"]
++        value = None
++        try:
++            import urllib.request
++
++            base = (os.environ.get(_KV_PRESSURE_URL_ENV) or _KV_PRESSURE_URL_DEFAULT).rstrip("/")
++            with urllib.request.urlopen(
++                f"{base}/v1/loads", timeout=_KV_PRESSURE_TIMEOUT_S
++            ) as resp:
++                payload = json.load(resp)
++            rows = payload.get("loads") or []
++            if rows:
++                # Single-GPU backend today; if data parallelism is ever enabled,
++                # the busiest replica is the honest one to budget against.
++                row = max(
++                    rows,
++                    key=lambda r: (
++                        float(r.get("token_usage") or 0.0),
++                        int(r.get("num_waiting_reqs") or 0),
++                    ),
++                )
++                value = {
++                    "token_usage": float(row.get("token_usage") or 0.0),
++                    "running": int(row.get("num_running_reqs") or 0),
++                    "waiting": int(row.get("num_waiting_reqs") or 0),
++                    "used_tokens": int(row.get("num_used_tokens") or 0),
++                    "pool": int(row.get("max_total_num_tokens") or 0),
++                    "max_running": int(row.get("max_running_requests") or 0),
++                    "cache_hit_rate": float(row.get("cache_hit_rate") or 0.0),
++                }
++        except Exception:
++            # Deliberately silent at this level — debug only. A dispatch must
++            # not be noisy because a monitoring endpoint blinked.
++            logger.debug("child sizing: /v1/loads probe failed", exc_info=True)
++            value = None
++        _kv_pressure_cache["at"] = now
++        _kv_pressure_cache["value"] = value
++        return value
++
++
++def _child_ctx_from_pressure(pressure: Optional[Dict[str, Any]]) -> tuple:
++    """AUTO ladder: (window, reason). Small and legible on purpose.
++
++    A clever formula nobody can reason about is worse than three rungs whose
++    boundaries an operator can check against `/v1/loads` by eye.
++
++      idle      token_usage < 0.35 and nothing queued   -> ceiling  (131,072)
++      normal    token_usage < 0.70 and nothing queued   -> nominal   (98,304)
++      hot       anything queued, or token_usage >= 0.70 -> floor     (81,920)
++      unknown   probe failed                            -> nominal   (98,304)
++    """
++    if not pressure:
++        return _CHILD_CTX_AUTO_NOMINAL, "auto/unknown (pressure probe unavailable)"
++    tu = pressure.get("token_usage") or 0.0
++    waiting = pressure.get("waiting") or 0
++    if waiting > 0:
++        return _CHILD_CTX_AUTO_FLOOR, f"auto/hot (queue depth {waiting})"
++    if tu >= 0.70:
++        return _CHILD_CTX_AUTO_FLOOR, f"auto/hot (token_usage {tu:.2f})"
++    if tu < 0.35:
++        return _CHILD_CTX_AUTO_CEILING, f"auto/idle (token_usage {tu:.2f}, no queue)"
++    return _CHILD_CTX_AUTO_NOMINAL, f"auto/normal (token_usage {tu:.2f}, no queue)"
++
++
++def _coerce_child_ctx(raw: Any, source: str) -> tuple:
++    """(window|None, reason). None means 'inherit the parent', unchanged."""
++    if raw is None:
++        return None, ""
++    if isinstance(raw, bool):
++        logger.warning(
++            "%s=%r is a boolean, not a window; inheriting the parent window",
++            source, raw,
++        )
++        return None, ""
++    if isinstance(raw, str):
++        word = raw.strip().lower()
++        if word in _CHILD_CTX_INHERIT_WORDS:
++            return None, ""
++        if word in _CHILD_CTX_AUTO_WORDS:
++            window, reason = _child_ctx_from_pressure(_kv_pressure())
++            return window, f"{source}={raw!r} -> {reason}"
++        try:
++            raw = int(word.replace("_", "").replace(",", ""))
++        except (TypeError, ValueError):
++            logger.warning(
++                "%s=%r is neither an integer nor 'auto'/'inherit'; inheriting "
++                "the parent window", source, raw,
++            )
++            return None, ""
++    try:
++        window = int(raw)
++    except (TypeError, ValueError):
++        logger.warning(
++            "%s=%r is not a valid integer; inheriting the parent window",
++            source, raw,
++        )
++        return None, ""
++    if window <= 0:
++        logger.warning(
++            "%s=%d is not positive; inheriting the parent window", source, window,
++        )
++        return None, ""
++    if window < _CHILD_CTX_HARD_FLOOR:
++        logger.warning(
++            "%s=%d is below the runtime minimum context window (%d); raising to "
++            "the minimum. agent_init refuses to CONSTRUCT below it, and a child "
++            "assigned a smaller window post-construction would be a geometry "
++            "the rest of the runtime rejects.",
++            source, window, _CHILD_CTX_HARD_FLOOR,
++        )
++        window = _CHILD_CTX_HARD_FLOOR
++    return window, f"{source}={window:,}"
++
++
++def _resolve_child_context_length() -> tuple:
++    """(window|None, reason) for this dispatch. None == inherit (status quo)."""
++    env_raw = os.environ.get(_CHILD_CTX_ENV)
++    if env_raw is not None:
++        return _coerce_child_ctx(env_raw, _CHILD_CTX_ENV)
++    cfg = _load_config()
++    return _coerce_child_ctx(
++        cfg.get(_CHILD_CTX_CONFIG_KEY), f"delegation.{_CHILD_CTX_CONFIG_KEY}"
++    )
++
++
++def _apply_child_context_length(child: Any, task_index: int) -> None:
++    """Stamp the resolved window onto a freshly built child.
++
++    ⛔ WHY POST-CONSTRUCTION AND NOT AN ``AIAgent(context_length=...)`` KWARG.
++    ``AIAgent.__init__`` has no such parameter; adding one means editing
++    run_agent.py AND agent/agent_init.py, where the window is entangled with
++    LM Studio runtime loading, ollama num_ctx capping, plugin engine selection
++    and the MINIMUM_CONTEXT_LENGTH construction gate. The compressor's
++    ``context_length`` setter already re-derives threshold_percent,
++    threshold_tokens, tail_token_budget and max_summary_tokens coherently
++    (agent/context_compressor.py:2053), which is the entire contract we need,
++    so this is the surgical form. ``_config_context_length`` is set too so
++    later resolution paths (display, /model switch) see the same number.
++
++    Never raises: a child that came up on the inherited window is strictly
++    better than a dispatch that died trying to resize it.
++    """
++    window, reason = _resolve_child_context_length()
++    if window is None:
++        return
++    try:
++        compressor = getattr(child, "context_compressor", None)
++        before = getattr(compressor, "context_length", None) if compressor else None
++        child._config_context_length = window
++        if compressor is not None:
++            compressor.context_length = window
++        after = getattr(compressor, "context_length", None) if compressor else None
++        trigger = getattr(compressor, "threshold_tokens", None) if compressor else None
++        # ⛔ INFO, once per child, on purpose: the whole point of this change is
++        # that the child window is VISIBLE in ~/.hermes/logs/agent.log instead
++        # of being an invisible consequence of a main-thread config edit.
++        logger.info(
++            "[subagent-%s] child context window: %s -> %s tokens (%s); "
++            "compaction trigger %s, output cap %s",
++            task_index,
++            f"{before:,}" if isinstance(before, int) else before,
++            f"{after:,}" if isinstance(after, int) else after,
++            reason,
++            f"{trigger:,}" if isinstance(trigger, int) else trigger,
++            getattr(child, "max_tokens", None),
++        )
++    except Exception:
++        logger.warning(
++            "[subagent-%s] could not apply child context window %s; the child "
++            "keeps the inherited window", task_index, window, exc_info=True,
++        )
++
++
++def _runtime_child_concurrency_cap(configured: int) -> tuple:
++    """(effective_workers, note) — a RUNTIME cap, never a config write.
++
++    ⛔ CONCURRENCY IS THE STRONGER LEVER ON THIS BACKEND, and the reason is
++    architectural rather than empirical taste. 36 of the served model's 48 layers are
++    GDN linear attention, so each in-flight request carries a FIXED recurrent
++    state (3 mamba slots) that does NOT shrink with the context window, plus a
++    token-linear KV cost for the 12 full-attention layers. Measured geometry:
++        max_mamba_cache_size 12 / 3 slots per request = 4 requests
++        max_running_requests 4 ;  cuda_graph_max_bs_decode 4
++    Three independent numbers agree that FOUR is the hard in-flight ceiling.
++    So marginal arithmetic at the small end of the ladder:
++        drop one child at 81,920   saves 48,742 resident + 24,576 decode
++        shrink a child 98,304 -> 81,920  saves 15,258
++        shrink a child 81,920 -> 64,000  saves 15,232 and re-enters the wedge
++    Admitting fewer children beats shaving windows once the windows are small.
++
++    This only ever LOWERS the worker count for one dispatch. All requested tasks
++    still run — they are serialised, not rejected — and
++    delegation.max_concurrent_children on disk is untouched.
++    """
++    if configured <= 1:
++        return configured, ""
++    pressure = _kv_pressure()
++    if not pressure:
++        return configured, ""
++    max_running = pressure.get("max_running") or 0
++    running = pressure.get("running") or 0
++    waiting = pressure.get("waiting") or 0
++    tu = pressure.get("token_usage") or 0.0
++
++    # Free scheduler slots right now. Requests beyond max_running_requests
++    # QUEUE (they do not fail), so overshooting costs latency and prefix-cache
++    # eviction rather than errors — which is exactly the stall being avoided.
++    free = max(1, (max_running - running)) if max_running else configured
++    if waiting > 0:
++        # Already a queue: adding parallel children can only lengthen it.
++        cap, why = 1, f"backend queue depth {waiting}"
++    elif tu >= 0.70:
++        cap, why = min(free, 2), f"pool at {tu:.0%}"
++    elif tu >= 0.45:
++        cap, why = min(free, 3), f"pool at {tu:.0%}"
++    else:
++        cap, why = configured, ""
++    cap = max(1, min(configured, cap))
++    if cap >= configured:
++        return configured, ""
++    return cap, (
++        f"runtime concurrency cap {configured} -> {cap} ({why}; "
++        f"{running}/{max_running} slots busy). Tasks are serialised, not "
++        f"dropped; delegation.max_concurrent_children is unchanged."
++    )
++
++
+ def _get_orchestrator_enabled() -> bool:
+     """Global kill switch for the orchestrator role.
+ 
+@@ -1985,6 +2307,14 @@ def _build_child_agent(
+                 except Exception:
+                     pass
+             raise
++    # ⛔ THE CHILD WINDOW IS STATED HERE, NOT INHERITED BY ACCIDENT.
++    # Before this call existed, AIAgent(...) above was constructed with no
++    # context window at all, so the child silently adopted whatever
++    # `model.context_length` the parent profile happened to hold — which is how
++    # a KV-governor edit to the MAIN thread's window reshaped every subagent on
++    # 2026-09-29. A no-op unless the operator opted in; see
++    # _resolve_child_context_length.
++    _apply_child_context_length(child, task_index)
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
+     # Ownership transfer for the dedicated handle: the child's close() must
+     # release it (nothing else holds a reference), and no parent teardown can
+@@ -3919,7 +4249,15 @@ def delegate_task(
+             # normally, but if the parent is interrupted while a child is
+             # wedged, the abandoned worker must not block interpreter exit.
+             from tools.daemon_pool import DaemonThreadPoolExecutor
+-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
++            # ⛔ RUNTIME CONCURRENCY CAP, not a task rejection. Every task in
++            # `children` still runs; a hot backend just runs fewer of them at
++            # once. Applied here rather than at the `len(tasks) > max_children`
++            # gate above because that gate returns an ERROR to the model, and
++            # "the pool is busy" must never turn a valid fan-out into a failure.
++            _workers, _cap_note = _runtime_child_concurrency_cap(max_children)
++            if _cap_note:
++                logger.info("delegate_task: %s", _cap_note)
++            with DaemonThreadPoolExecutor(max_workers=_workers) as executor:
+                 futures = {}
+                 for i, t, child in children:
+                     child_context = contextvars.copy_context()
+-- 
+2.43.0
+

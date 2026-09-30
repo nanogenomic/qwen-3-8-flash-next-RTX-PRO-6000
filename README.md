@@ -158,6 +158,11 @@ result. Treat the formula as a safe estimate, then measure your own hit rate.
 **The cost** is KV pool: about 50K tokens per 12 slots on the card measured. For an agent workload
 that is overwhelmingly worth it — the alternative is a 7× longer time-to-first-token on every turn.
 
+**If you are writing or configuring the client side**, this is one of eight rules in the
+[client contract](clients/README.md) — priority-tagging control-plane calls, sizing subagent
+windows explicitly, never advertising more window than the pool holds, growing instead of
+compacting, isolating test state, and more, each with the incident that motivated it.
+
 ## Context past the trained window — long-context suite, complete
 
 `[measured]` **No YaRN, no rope override: native RoPE only.** Booting above the derived window
@@ -323,6 +328,8 @@ make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 32 commits as a git-am-able series against the base commit
 COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
 python/  test/           the 43 changed files, at their exact upstream paths
+clients/README.md        the client contract: what any orchestrator must do to use this well
+clients/hermes/          Hermes Agent reference implementation -- MIT, not Apache-2.0
 tools/qgate/             the quality-gate harness behind BENCHMARKS §4 (not part of the engine)
 ```
 
@@ -816,6 +823,13 @@ CHANGES §7).
 
 ## License
 
-Upstream SGLang is **Apache-2.0**, and `LICENSE` in this repository is upstream's, unmodified.
-The files added by this fork carry `SPDX-License-Identifier: Apache-2.0` alongside their
-copyright line and are offered under the same terms.
+**This repository is Apache-2.0, with one exception: [`clients/hermes/`](clients/hermes/) is MIT.**
+
+- Upstream SGLang is **Apache-2.0**, and `LICENSE` at the root is upstream's, unmodified. The
+  files added by this fork carry `SPDX-License-Identifier: Apache-2.0` alongside their
+  copyright line and are offered under the same terms. That covers everything outside
+  `clients/hermes/`, including the framework-agnostic [client contract](clients/README.md).
+- [`clients/hermes/`](clients/hermes/) contains modifications of Hermes Agent, which is **MIT
+  licensed by Nous Research**. That directory ships upstream's MIT `LICENSE` verbatim with the
+  Nous Research copyright, and a `NOTICE` stating that the modifications are offered under the
+  same MIT terms. Nothing is relicensed in either direction.
