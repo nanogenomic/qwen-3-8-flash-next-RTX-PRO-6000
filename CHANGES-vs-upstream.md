@@ -244,15 +244,17 @@ needed.
 production. The production figure is larger only because that card carried less foreign VRAM.
 Contributions, all measured:
 
-- `--mem-fraction-static 0.98` instead of 0.958, with **3.39 GB of runtime headroom measured
-  on the production card** at that setting. ⚠ **That headroom is enough for steady-state
-  serving and not always enough for a lazy allocation made after serving starts** — the
-  reference deployment was killed once by a constrained-decoding request taking a lazy Triton
-  kernel-load path with 0.54 GiB free, and its recorded history has the same failure class
-  killing the lane **twice in one day at 0.99** (2.20 GB headroom), once after 18 h 52 m of
-  uptime. The mitigation (a grammar-constrained warmup request at startup, which costs no KV
+- `--mem-fraction-static 0.98` instead of 0.958. ⚠ **0.98 is measured to be too tight to run
+  and the recommendation is now 0.97** — see
+  [README](README.md#operational-warning-use---mem-fraction-static-097-not-098). The 3.39 GB
+  figure this section previously quoted is SGLang's **boot-time** `available_gpu_mem`; actual
+  device-free VRAM while serving at 0.98 measured **287 MiB**, flat for 13 h 22 min, and the lane
+  died in prefill under a 14-deep queue with the KV pool only 73 % used. The same failure class
+  killed it twice in one day at 0.99, once after 18 h 52 m of uptime. Lowering to 0.97 buys
+  1.22 GB of boot-reported headroom (~1.74 GB device-free) and costs **71,616 pool tokens** —
+  1.9× what per-token arithmetic predicts. The mitigation (a grammar-constrained warmup request at startup, which costs no KV
   pool) and the full failure chain are in
-  [README.md](README.md#operational-warning---mem-fraction-static-098-is-tight). Anyone copying
+  [README.md](README.md#operational-warning-use---mem-fraction-static-097-not-098). Anyone copying
   this configuration should read that before treating 0.98 as free — in particular, **a memory
   fraction that survives a soak can still kill the lane hours later.**
 - `--max-mamba-cache-size 12` with `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`, instead of 16.

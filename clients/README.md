@@ -24,6 +24,7 @@ Contents:
 6. [Hybrid models: warm conversations need state slots too](#6-hybrid-models-warm-conversations-need-state-slots-too)
 7. [Isolate test state from live state](#7-isolate-test-state-from-live-state)
 8. [Set the compaction threshold explicitly — beware step functions](#8-set-the-compaction-threshold-explicitly--beware-step-functions)
+9. [Throttle fan-out on VRAM headroom, not only on pool utilisation](#9-throttle-fan-out-on-vram-headroom-not-only-on-pool-utilisation)
 
 ---
 
@@ -133,8 +134,10 @@ theoretical maximum.
 pool is refused: a 520,059-token prompt against a 519,040-token pool returned HTTP 400, and
 a ~500K prompt at the very edge of that pool came back as an empty completion. This matters
 on this backend because the declared window and the pool are separate numbers. The
-reference deployment declares `--context-length 540000` but has a **522,880-token pool** —
-so the right per-request window to advertise is about 393,216, not 540,000.
+reference deployment declares `--context-length 540000` and has a **451,264-token pool** — so
+the right per-request window to advertise is about 393,216, not 540,000. Note that the pool
+moved twice in two days as the server was retuned (643,456 → 522,880 → 451,264), which is the
+point of this rule: **re-read it, do not hard-code it.**
 
 **Too small.** `[observed on the reference deployment]` After an engine change grew the pool
 to 331,456 tokens, a router kept advertising `max_model_len` 241,728. Every client silently
@@ -252,12 +255,42 @@ The fix belongs upstream: the trigger in tokens should be non-decreasing in the 
 continuous floor — raising the threshold above 512,000 only as far as needed to keep the
 trigger at or above the 511,999 case — does that. Until then, set it explicitly.
 
+## 9. Throttle fan-out on VRAM headroom, not only on pool utilisation
+
+**Rule.** If your client throttles dispatch on backend pressure, read **device-free VRAM** as
+well as KV-pool utilisation. A pool-based rule cannot see the failure that actually takes the
+lane down.
+
+**Why.** `[measured on the reference deployment, 2026-09-30]` The backend died of a CUDA OOM
+while its **KV pool was only 73 % used**. Two agent sessions had fanned out; 14 requests were
+queued; the scheduler was chunking 4,096-token prefills; and device-free VRAM was **280.94 MiB**
+when prefill asked for 560 MiB. A client reading `token_usage` saw 0.73 and had every reason to
+send more.
+
+The asymmetry is structural. KV-pool utilisation describes memory the engine has already
+reserved and is managing. What runs out under a deep queue is the **working set for prefill**,
+which lives *outside* the pool, in memory no admission knob accounts for. So:
+
+- **`token_usage` is necessary but not sufficient.** It is the right signal for "will this
+  request's KV fit". It is silent about "will the engine have room to prefill it".
+- **Queue depth is the better proxy** if headroom is not exposed to you. In the incident the
+  pool reading rose gently from 0.64 to 0.73 while the queue sat flat at 14 — the queue was
+  saying "prefill is the bottleneck" the whole time.
+- **Prefer serialising to rejecting**, as in rule 3's reference implementation: a fan-out that
+  runs its children one at a time still completes.
+
+**And an alert is not a control.** On the reference deployment a 20-second-cadence monitor had
+flagged critical headroom on **every sample that day**, sent a low-VRAM alert **16 h 15 min**
+before the crash, and sent a queue-depth alert **53 s** before it. All of it was correct, and
+none of it reached anything that could defer work. If your client can read headroom, it should
+**act** on it — reduce concurrency, defer a fan-out, wait — not merely log it.
+
 ---
 
 ### A note on where the measurements come from
 
-Rules 1, 3, 4 (the router incident), 7 and 8 were measured or reproduced on the reference
-deployment and its client framework directly. Rules 2, 5 and 6 cite the long-context suite,
+Rules 1, 3, 4, 7, 8 and 9 were measured or reproduced on the reference deployment and its client
+framework directly. Rules 2, 5 and 6 cite the long-context suite,
 which ran on a second card — an RTX PRO 6000 Server Edition at 600 W rather than the 300 W
 Max-Q used everywhere else in this repository. Its pass/fail results and ratios transfer;
 its absolute tok/s and pool sizes do not. See

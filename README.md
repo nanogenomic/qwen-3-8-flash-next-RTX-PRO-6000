@@ -285,19 +285,23 @@ These are the conclusions of the suite, measured on the second card and read acr
 
 | Setting | Recommendation | Why |
 |---|---|---|
+| `--mem-fraction-static` | **0.97**, not 0.98 | 0.98 left 287 MiB of device-free VRAM and died in prefill under a 14-deep queue; 0.97 leaves ~1.74 GB. Costs 71,616 pool tokens |
 | `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
 | Per-request window to advertise | **~400K (393,216)** on a shared card | Where the pool binds. One request that size needs most of the pool, so gate it as exclusive use rather than an ordinary slot |
 | `--max-mamba-cache-size` | **36** at 4 running requests | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations |
 | `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
 | `--enable-priority-scheduling` | only **if fan-out grows past 4** — and set `--default-priority-value` | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
 
-**The reference deployment adopted this configuration on 2026-09-29.** Its production card came up
-at `--context-length 540000`, 36 slots and 4 running requests with a **522,880-token pool**
-`[measured, read from /get_server_info]` — priority scheduling left off, as recommended at 4 streams.
-That is well above a projection of ~420K made beforehand, which had subtracted the slot cost from
-the *test* card's 519,040; the production card carries less foreign VRAM, and its own 262K baseline
-(643,456) predicts ~524K. A ~393K request takes about 75 % of 522,880, which is why it is still best
-treated as exclusive use rather than an ordinary slot.
+**The reference deployment now runs exactly this.** It adopted 540,000 / 36 slots / 4 streams on
+2026-09-29 at `--mem-fraction-static 0.98`, with a 522,880-token pool. That configuration **died of
+a runtime CUDA OOM on 2026-09-30** and was moved to **0.97**, where it has a **451,264-token pool**
+`[measured, read from /get_server_info]`, ~1.74 GB of device-free VRAM while serving, and priority
+scheduling off. A ~393,216-token request takes about 87 % of that pool, so it must be gated as
+exclusive use rather than treated as an ordinary slot.
+
+Both pool figures came out above a projection of ~420K made earlier from the *test* card's 519,040;
+the production card carries less foreign VRAM. Note the direction of travel: every pool number in
+this repository is specific to one card's spare memory, and the headroom you must leave is not.
 
 ## The correctness fix, separately
 
@@ -365,9 +369,15 @@ git am /path/to/this/patches/0*.patch
 ### Run it
 
 This is the configuration the headline results were measured on, transcribed from the reference
-deployment's own service unit rather than reconstructed. **For serving agents, use the
-[Recommended configuration](#recommended-configuration) instead** — it changes `--context-length` to
-540000 and `--max-mamba-cache-size` to 36, and the reference deployment has since moved to it:
+deployment's own service unit rather than reconstructed, **with one deliberate change: it shows
+`--mem-fraction-static 0.97`, not the 0.98 the benchmarks ran at.** 0.98 later killed the lane with
+a runtime CUDA OOM and is not safe to copy — see
+[the operational warning](#operational-warning-use---mem-fraction-static-097-not-098). Expect a
+slightly smaller KV pool than the benchmark tables show, and nothing else to differ.
+
+**For serving agents, use the [Recommended configuration](#recommended-configuration) instead** —
+it also sets `--context-length 540000` and `--max-mamba-cache-size 36`, and the reference
+deployment has since moved to it:
 
 ```bash
 export SGLANG_QWENOPT_FUSE_SBMOE=1     # 4-launch small-batch NVFP4 MoE, bitwise-identical
@@ -382,7 +392,7 @@ export TRTLLM_ENABLE_PDL=1
 python -m sglang.launch_server \
   --model-path <your Qwen3.8-Flash-Next NVFP4 checkpoint> \
   --quantization modelopt_fp4 --trust-remote-code \
-  --context-length 262144 --mem-fraction-static 0.98 \
+  --context-length 262144 --mem-fraction-static 0.97 \
   --attention-backend flashinfer --sampling-backend flashinfer \
   --moe-runner-backend flashinfer_cutlass \
   --bf16-gemm-backend sm120gemv \
@@ -412,11 +422,21 @@ Two notes on flags that are easy to get wrong:
 `SGLANG_QWENOPT_FUSE_HC=1` needs `CUDA_HOME` set and `ninja` on `PATH` at first use, for
 the `hc_fused_tail` JIT during CUDA-graph warmup.
 
-### Operational warning: `--mem-fraction-static 0.98` is tight
+### Operational warning: use `--mem-fraction-static 0.97`, not 0.98
 
-0.98 buys the KV pool, and it leaves only about **3.39 GB of device headroom** on a 96 GB card
-`[measured]`. That is enough for steady-state serving and **not** always enough for a *lazy*
-allocation made after serving starts.
+**0.98 killed the reference deployment.** It is the value the headline benchmarks were measured
+at, and it is too tight to run. Use **0.97**. The evidence is below, including the two numbers
+that made 0.98 look safe when it was not.
+
+**⛔ "Available" memory at boot is not device-free memory while serving.** SGLang reports an
+`available_gpu_mem` figure at the end of start-up. At `--mem-fraction-static 0.98` that read
+**3.42 GB** — comfortable. Measured on the same card by a 20-second-cadence monitor during
+steady serving, actual device-free VRAM was **287 MiB**, and it sat there flat for **2,406
+consecutive samples — 13 h 22 min** `[measured, 2026-09-30]`. The gap is PyTorch's caching
+allocator, which keeps growing its reservation after the boot figure is printed. **Size headroom
+from the second number, never the first.** An earlier revision of this section quoted the
+boot-time figure as "device headroom"; that was wrong, and it is the mistake this whole section
+exists to stop you repeating.
 
 **This failure class is recurring, not a one-off.** The reference deployment's own recorded
 operational history has it happening twice in a single day at `--mem-fraction-static 0.99`, on
@@ -440,9 +460,12 @@ hours later.** The 18 h 52 m death is the important one — nothing in a start-u
 five-minute soak would have caught it. Anything else resident on the card, or anything that
 grows, eats the same budget.
 
-At the shipped 0.98 the headroom is 3.39 GB rather than 2.20 GB, which is more margin — and
-**the same class of failure still occurred.** At 16:45:24 on 2026-09-29 the deployment died
-with:
+0.98 reports more boot-time headroom than 0.99 did — 3.42 GB against 2.20 GB — and **the same
+class of failure still killed it, twice more.**
+
+#### Incident two: a lazy kernel load, 2026-09-29
+
+At 16:45:24 the deployment died with:
 
 ```
 Triton kernel 'apply_token_bitmask_inplace_kernel' device-loaded after serving started
@@ -469,6 +492,81 @@ curl -sf "127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/jso
 Run it after `/health` returns, and make it non-fatal — a warmup hiccup must never keep the
 lane down. If you would rather not depend on a warmup step, lower `--mem-fraction-static`
 and accept the smaller pool.
+
+#### Incident three: prefill's working set under a deep queue, 2026-09-30
+
+This is the one that changed the recommendation. At **16:44:17**, with `--mem-fraction-static
+0.98`, 36 state slots and a 522,880-token pool:
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB.
+GPU 0 has a total capacity of 95.01 GiB of which 280.94 MiB is free.
+```
+
+→ scheduler exception → `SIGQUIT` → `kill_process_tree`. The lane was down **12 min 54 s**
+(crash 16:44:17, serving again 16:57:11).
+
+**The KV pool was not the problem.** The scheduler's own numbers at the moment it died:
+
+| Quantity | Value |
+|---|---|
+| `full token usage` | **0.73** — the pool had 27 % free |
+| `#queue-req` | **14** |
+| `#pending-token` | ~1.49 M (1,514,521 five seconds earlier) |
+| `mamba usage` | **0.06** — the state slots were nearly idle |
+| `#running-req` | 1 |
+
+It died inside `_forward_prefill_batch`, in the eager runner, chunking 4,096-token prefills
+against a 14-deep queue. A separate process held 676 MiB of the card at the time. So the
+exhausted resource was **driver-level VRAM outside the pool**, and **no KV-pool admission knob
+can see it** — a pool-utilisation guard reads 0.73 and says healthy.
+
+The rule to take away: **headroom outside the pool is not spare memory. It is the working set
+for prefill under a deep queue.**
+
+#### The fix, and what it actually costs
+
+`[measured on the production card]` Four configurations, each read from that boot's own log:
+
+| `--mem-fraction-static` | Slots | Declared ctx | KV pool | Boot `available_gpu_mem` | Device-free while serving |
+|---|---|---|---|---|---|
+| 0.98 | 12 | 262,144 | 643,456 | 3.39 GB | — |
+| 0.98 | 36 | 540,000 | 522,880 | 3.42 GB | **287 MiB** |
+| **0.97** | **36** | **540,000** | **451,264** | **4.64 GB** | **1,737–1,739 MiB** |
+
+Two things in that table are worth reading carefully, because both are counter-intuitive:
+
+- **Raising the state slots from 12 to 36 did not consume headroom.** Boot-reported headroom went
+  3.39 → 3.42 GB, i.e. unchanged. Slots are allocated *inside* `--mem-fraction-static`, so they
+  cost **pool**, not headroom — about 100K tokens of it, on top of ~3 % for the larger declared
+  context. **So 36 slots did not cause this crash and there is no reason to give them up**; they
+  remain the single biggest agent-workload win in this repository (5 % → 96 % prefix reuse). 0.98
+  was already too thin at 12 slots; the deep queue is what found out.
+- **The pool cost of 0.01 of memory fraction is larger than the naive arithmetic predicts.** 1 %
+  of a 96 GiB card is ~983 MiB, which at this model's ~27 KB per context token implies ~38K
+  tokens. The **measured** cost was **71,616 tokens — 1.9× that.** Lowering the fraction shrinks
+  the total reservation, and the non-pool overheads inside it do not shrink proportionally. Do not
+  derive this figure; measure it.
+
+451,264 still comfortably exceeds the ~393,216 per-request window this repository recommends
+advertising, so 0.97 costs nothing you were using.
+
+#### The monitoring lesson: an alert nobody consumes is not a control
+
+A 20-second-cadence VRAM monitor saw all of this, early and correctly:
+
+| Signal | When | Relative to the crash |
+|---|---|---|
+| Free VRAM pinned at 287 MiB, flat | from 03:22:24Z | **13 h 22 min before** |
+| Critical-headroom flag raised on every sample | from 00:00:04Z | all day |
+| Low-VRAM alert sent | 00:28:44Z | **16 h 15 min before** |
+| Queue-depth alert sent | 16:43:24Z | **53 s before** |
+| Unit-down alert sent | 16:44:24Z | 8 s after — too late to matter |
+
+Nothing consumed any of it. The signal was not missing, late or wrong; it simply did not reach
+anything that could refuse or defer work. **Alerting on VRAM headroom is not enough — it has to
+feed back into admission or dispatch**, on the server or in the client. For the client side of
+that, see the [client contract](clients/README.md#9-throttle-fan-out-on-vram-headroom-not-only-on-pool-utilisation).
 
 > **⛔ If you wire this into a service manager, detach it.** A post-start hook generally runs
 > *inside* the unit's start timeout. On the reference deployment that timeout is **90 s**, while
@@ -646,7 +744,9 @@ confirmations on cards with different amounts of foreign VRAM resident**:
 Agreeing to three decimal places across different occupancy is worth stating plainly: **the
 1.94× is a property of the dtype change, not of one card's spare memory.** **643,456 tokens is
 the largest pool measured on this hardware**, at `--context-length 262144`,
-`--mem-fraction-static 0.98` and `--max-running-requests 4`.
+`--mem-fraction-static 0.98` and `--max-running-requests 4` — note that 0.98 is
+[no longer recommended](#operational-warning-use---mem-fraction-static-097-not-098), so treat
+that as the ceiling this hardware can reach rather than a setting to copy.
 
 That is the single biggest capacity change available, and it buys roughly one extra long-context
 session or a handful of subagents.

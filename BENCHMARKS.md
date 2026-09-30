@@ -577,26 +577,108 @@ tag every request, or a client's untagged auxiliary calls will queue behind all 
 
 ### 3.12 The recommended configuration on the production card
 
-`[measured, 2026-09-29, read from /get_server_info]` The reference deployment's production card
-(300 W Max-Q) was switched to the configuration recommended by §3.8–§3.11 and came up with:
+`[measured, read from /get_server_info]` The reference deployment's production card (300 W Max-Q)
+was switched to the configuration recommended by §3.8–§3.11, first at `mem_fraction_static` 0.98
+and then — after the OOM in §3.14 — at 0.97, which is what it runs now:
 
-| Setting | Value |
-|---|---|
-| `context_length` | 540,000 (no YaRN) |
-| `max_mamba_cache_size` | 36 |
-| `max_running_requests` | 4 |
-| `kv_cache_dtype` | fp8_e4m3 |
-| `enable_priority_scheduling` | off |
-| **`max_total_num_tokens`** | **522,880** |
+| Setting | 2026-09-29 (0.98) | **2026-09-30 (0.97), current** |
+|---|---|---|
+| `context_length` | 540,000 (no YaRN) | 540,000 (no YaRN) |
+| `max_mamba_cache_size` | 36 | 36 |
+| `max_running_requests` | 4 | 4 |
+| `kv_cache_dtype` | fp8_e4m3 | fp8_e4m3 |
+| `enable_priority_scheduling` | off | off |
+| `mem_fraction_static` | 0.98 | **0.97** |
+| **`max_total_num_tokens`** | 522,880 | **451,264** |
 
-This closes the one measurement the suite left for the reference hardware. A projection of ~420K,
+**The 0.98 row is what died** (§3.14); it is kept because the pool projection below was made
+against it. This closes the one measurement the suite left for the reference hardware. A projection of ~420K,
 made beforehand by subtracting the 36-slot cost from 519,040, was wrong because 519,040 was the
 *test* card's pool at 540,000; the production card carries less foreign VRAM. From its own measured
 262,144 baseline of 643,456, the second card's ratios (−2.9 % for the declaration, ≈ −99,840 for 24
 extra slots) predict ≈ 524,900 — within 0.4 % of the measured 522,880.
 
 Only the resulting pool is measured here. Prefix-cache hit rate and time to first token under the
-production workload at 36 slots have not yet been measured on this card.
+production workload at 36 slots have not yet been measured on this card, at either fraction.
+
+### 3.13 Static memory fraction: the headroom/pool trade, measured
+
+Four production configurations, each figure read from that boot's own log rather than derived.
+"Boot `available_gpu_mem`" is what SGLang prints at the end of start-up; "device-free while
+serving" is nvidia-smi free on the same card in steady state, sampled every 20 s.
+
+| `--mem-fraction-static` | Slots | Declared ctx | KV pool | Boot `available_gpu_mem` | Device-free while serving |
+|---|---|---|---|---|---|
+| 0.98 | 12 | 262,144 | 643,456 | 3.39 GB | — |
+| 0.98 | 36 | 540,000 | 522,880 | 3.42 GB | **287 MiB** |
+| 0.97 | 36 | 540,000 | **451,264** | **4.64 GB** | **1,737–1,739 MiB** |
+
+**The two columns on the right are not the same measurement, and the difference is large enough
+to be dangerous.** At 0.98 the boot figure read 3.42 GB while the card actually had 287 MiB free
+during serving — flat across **2,406 consecutive samples, 13 h 22 min**. The gap is PyTorch's
+caching allocator continuing to reserve after the boot figure is printed. Earlier revisions of
+this repository quoted the boot figure as "device headroom"; that was wrong.
+
+**Slots cost pool, not headroom.** 12 → 36 slots moved boot-reported headroom 3.39 → 3.42 GB —
+unchanged — while the pool fell 643,456 → 522,880. Decomposed, the ~3 % declared-context cost
+(§3.3b) accounts for ~19K of that and the 24 extra slots for ~102K, matching the ~100K estimated
+in §3.10. So the state-slot recommendation is not implicated in the OOM below, and does not need
+to be revised.
+
+**The pool cost of 0.01 of memory fraction is ~1.9× the naive prediction.** 1 % of a 96 GiB card
+is ~983 MiB; at ~27 KB per context token that implies ~38K tokens. Measured: **71,616**. Lowering
+the fraction shrinks the whole reservation, and the non-pool overheads inside it do not shrink in
+proportion. Measure this per deployment rather than deriving it.
+
+### 3.14 Runtime CUDA OOM under a deep queue (2026-09-30) — why 0.98 is not usable
+
+`[measured, production card]` At 16:44:17, at `--mem-fraction-static 0.98` with a 522,880-token
+pool:
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB.
+GPU 0 has a total capacity of 95.01 GiB of which 280.94 MiB is free.
+Process <other> has 676.00 MiB memory in use.
+Including non-PyTorch memory, this process has 93.92 GiB memory in use.
+```
+
+→ scheduler exception → `SIGQUIT` → `kill_process_tree`. Down **12 min 54 s** (serving again at
+16:57:11). The traceback ends in `_forward_prefill_batch` → `model_runner.forward` → the **eager**
+runner: prefill, not decode, and not graph capture.
+
+Scheduler state through the final nine seconds, from its own log:
+
+| Time | `full token usage` | `#queue-req` | `#pending-token` | `mamba usage` | `#running-req` |
+|---|---|---|---|---|---|
+| 16:44:09 | 0.64 | 14 | 1,530,905 | 0.06 | 1 |
+| 16:44:12 | 0.67 | 14 | 1,514,521 | 0.06 | 1 |
+| 16:44:15 | 0.71 | 14 | 1,498,137 | 0.06 | 1 |
+| 16:44:17 | **0.73** | 14 | 1,485,849 | 0.06 | 1 |
+
+**The KV pool had 27 % free and the state slots were 6 % used.** What was exhausted was
+driver-level VRAM outside the pool — the working set for chunked 4,096-token prefill against a
+14-deep queue, with another process holding 676 MiB of the card. **No KV-pool admission signal
+can see this**: a guard reading `token_usage` sees 0.73 and admits more. Peak queue depth that
+day measured 16.
+
+This is the third instance of one failure class, all on this lane: **an allocation arriving after
+the static pool is committed.** The other two were two runtime OOMs in one day at 0.99 (one after
+18 h 52 m of uptime) and a lazy Triton kernel load at 0.98 with 0.54 GiB free. The fix for the
+third was 0.97; the fix for the second was a warm-up request; the first is what set 0.98.
+
+#### The monitoring signal existed and was not consumed
+
+| Signal | Sent / first seen | Relative to crash |
+|---|---|---|
+| Free VRAM flat at 287 MiB | 03:22:24Z | −13 h 22 min |
+| Critical-headroom flag, every sample | 00:00:04Z | all day |
+| Low-VRAM alert | 00:28:44Z | −16 h 15 min |
+| Queue-depth alert | 16:43:24Z | **−53 s** |
+| Unit-down alert | 16:44:24Z | +8 s |
+
+Correct, early, and inert: none of it fed admission or dispatch. **Monitoring headroom is not the
+same as controlling for it.** The client-side obligation is
+[client contract rule 9](clients/README.md#9-throttle-fan-out-on-vram-headroom-not-only-on-pool-utilisation).
 
 ## 4. Quality instruments — what each one can and cannot see
 
@@ -828,7 +910,10 @@ Recorded so this is not mistaken for a finished evaluation.
 | Whether the reference card's 500K empty completion was capacity | **probable, not confirmed** — 500K has not been re-run on the reference card (§3.8a). |
 | A quality gate or accuracy benchmark at any length past 262,144 | **not run.** §3.8 establishes retrieval, recall and short-context equivalence, not accuracy at length. |
 | Reasoning at length beyond n = 2 per cell | **not run.** §3.8c is a signal per cell, not a rate. |
-| Prefix-cache hit rate and TTFT on the production card at 36 slots, under its real workload | **not yet measured.** §3.12 measures only the resulting pool (522,880). |
+| Prefix-cache hit rate and TTFT on the production card at 36 slots, under its real workload | **not yet measured.** §3.12 measures only the resulting pool. |
+| The lowest safe `--mem-fraction-static` for this workload | **not bracketed.** 0.99 and 0.98 both died (§3.14); 0.97 has ~1.74 GB device-free while serving and has not. Nothing between 0.97 and 0.98 was tried, and no headroom figure is known to be *sufficient* — only that 287 MiB is not. |
+| How much prefill working set a queue of depth N actually needs | **not measured.** §3.14 shows a 14-deep queue exhausting ~287 MiB of headroom; the relationship to queue depth, chunk size and prompt length was not characterised, so 0.97 is a measured-safe point rather than a derived margin. |
+| Whether the production OOM recurs at 0.97 under a deeper queue | **open.** Peak queue depth on the incident day measured 16; 0.97 has not yet been exercised at that depth. |
 | A quality gate at any length past 262,144 | **not run.** Retrieval passes are a capability probe, not a certified operating point. |
 | Wall times for the ~200k and ~300k native-RoPE needle cases | **not recorded** in the run ledger; omitted rather than estimated. |
 | Why the retrained MTP head won on a B200 under plain upstream SGLang (+1.8 % to +3.7 % in all four cells) and was flat on this tree's SM120 fused path (2.1076 vs 2.1079) | **cause not established.** GPU generation and the fused decode path were never isolated from each other. |
