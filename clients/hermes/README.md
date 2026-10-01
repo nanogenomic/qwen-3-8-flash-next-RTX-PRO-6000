@@ -11,12 +11,13 @@ The reference implementation of the [client contract](../README.md) for
 > [`NOTICE`](NOTICE) for the attribution and the exact list of changes, and
 > [`BASELINE.md`](BASELINE.md) for how the 0.20.4 baseline was identified and verified.
 
-> **Status: two patches, plus four write-ups.** This directory ships **patches
+> **Status: two patches, plus six write-ups.** This directory ships **patches
 > 0001–0002 against upstream 0.20.4** (tag `v2026.8.18`) as applicable code. The later
 > work — a cross-session pool broker with share-bounded grants, a live-share status bar,
 > interrupt-provenance classification for autonomous loops, background-priority
 > demotion, task-sized child windows, grow-instead-of-compact, an overflow toggle to a
-> hosted provider, and a test-isolation guard — is published as **write-ups in
+> hosted provider, a test-isolation guard, a prefill-capacity admission gate that
+> replaced a free-VRAM divisor, and delegated goal waits — is published as **write-ups in
 > [`docs/`](docs/)** and as framework-agnostic rules in [`../README.md`](../README.md).
 > A rebase onto upstream **0.21.5** (`v2026.9.24`) is in progress.
 
@@ -233,6 +234,8 @@ docs/
   design-notes.md             generic patterns for sharing one backend
   shared-pool-grants.md       share-bounded grant ceilings + the live-share status bar
   autonomous-loop-provenance.md  why a loop stops unasked; background priority and payload
+  prefill-capacity-throttle.md   the free-VRAM divisor that stopped throttling when the pool moved
+  goal-wait-delegation.md        a wait nothing could end, and the zero-model-call watcher that ends it
 ```
 
 `cli.py` is **not** shipped as a whole file. It is ~1 MB and this fork's copy

@@ -31,6 +31,11 @@ Contents:
 12. [More client concurrency is net-negative here, and the usual instrument hides it](#12-more-client-concurrency-is-net-negative-here-and-the-usual-instrument-hides-it)
 13. [Give background work an explicit priority, and stop paying for calls nobody reads](#13-give-background-work-an-explicit-priority-and-stop-paying-for-calls-nobody-reads)
 14. [Classify an interrupt by provenance, or your autonomous loop will stop on its own](#14-classify-an-interrupt-by-provenance-or-your-autonomous-loop-will-stop-on-its-own)
+15. [A proxy stops being a proxy when the thing it proxied for moves](#15-a-proxy-stops-being-a-proxy-when-the-thing-it-proxied-for-moves) — ⚠️ **corrects rule 9**
+16. [Delegate the wait; never park the goal on it](#16-delegate-the-wait-never-park-the-goal-on-it)
+
+If you read only one of these, read **15**. It is the only rule here that fired because the
+*backend* improved, and it is the shape most likely to be hiding in your own client.
 
 ---
 
@@ -262,6 +267,13 @@ continuous floor — raising the threshold above 512,000 only as far as needed t
 trigger at or above the 511,999 case — does that. Until then, set it explicitly.
 
 ## 9. Throttle fan-out on VRAM headroom, not only on pool utilisation
+
+> ⚠️ **Read rule 15 with this one.** This rule is correct about the *failure* and wrong as a
+> *throttle*, and the reference deployment proved it the hard way about 30 hours after this rule
+> was written. Everything below still holds for detecting the OOM. But device-free VRAM stops
+> being a capacity proxy the moment the KV pool leaves the device — and a client that had turned
+> this rule into a divisor silently stopped throttling at the exact moment the pool grew. Rule 15
+> is what replaced it. **Keep VRAM as a floor; do not make it the gate.**
 
 **Rule.** If your client throttles dispatch on backend pressure, read **device-free VRAM** as
 well as KV-pool utilisation. A pool-based rule cannot see the failure that actually takes the
@@ -542,18 +554,178 @@ like a human one, and must not retry without limit either.
 **And distinguish "busy" from "broken" when the judge itself fails.** That is rule 1's second half,
 and it is the same error class seen from the other side.
 
+## 15. A proxy stops being a proxy when the thing it proxied for moves
+
+**Rule.** Never build an admission gate by dividing a resource reading by a per-request cost unless
+you can say *why that reading responds to load*. When it stops responding, the division does not
+fail loudly — it silently returns a large number, and your throttle becomes a multiplier.
+
+**Why.** `[measured on the reference deployment, 2026-09-30]` This is the most portable lesson in
+this file, because the client code was *correct* and the deployment changed underneath it.
+
+The client throttled subagent fan-out with `affordable = free_mib // 560`, where 560 MiB was the
+largest prefill allocation **measured** to be fatal (rule 9's incident: `Tried to allocate 560.00
+MiB`, 280.94 MiB free). That was a sound gate while a prefill's transient VRAM was the scarce
+thing. Then two changes landed on the same evening:
+
+- the KV pool moved from VRAM into pinned host RAM — pool 451,264 → 1,310,720 tokens, free device
+  VRAM **935–1,533 MiB → 6,463 MiB**;
+- a bounded prefill gather flattened prefill transients to **32 MiB at every context length**, down
+  from 1,024 MiB at 512K.
+
+Both pushed the same divisor the same way. `6,463 // 560` licensed **eleven** children where it had
+licensed about **one**. Nothing errored. Nothing logged a warning. The throttle reported capacity
+it had no basis for, and the consequences were measured on the lane within minutes:
+
+| | observed |
+|---|---|
+| Children the old rule permitted | **~1 → ~11** |
+| Main lanes' own turn-average decode | **11–17 tok/s** (against a 158–178 tok/s solo rate) |
+| Requests queued | **15** |
+| Uncached tokens waiting to be prefilled | **588,268** at the moment the gate was rewritten, and **668,196** read live an hour later — up to **51 %** of the entire pool sitting in the prefill queue |
+| KV pool utilisation at the same moment | **14–32 %** — i.e. the pool was fine and said nothing |
+
+**The generalisation.** Free device VRAM was never the quantity that mattered. It was a *proxy* for
+prefill working set, and prefill working set left the device. The same trap is waiting in any gate
+keyed on a resource whose consumer has been moved, cached, compressed or offloaded — and offloading
+is exactly what capacity work does. **Write down what each signal is a proxy for, and re-derive the
+gate when that changes.**
+
+### What replaced it
+
+Three conjunctive legs, each read live from the backend's own numbers, none of them a round number:
+
+**(A) Slots, with one reserved per live main *before* any child is counted.** A main that cannot get
+a scheduler slot waits however much pool and VRAM are free, and every main needs a slot for its own
+control-plane calls (compaction, titling, the goal judge). So children are counted against what is
+left after the mains are seated — and the total stream count is capped. The cap is derived from the
+measured concurrency curve rather than chosen: on the production geometry a lane keeps **100 % / 74 %
+/ 57 %** of its solo decode rate at concurrency 1 / 2 / 3, so **2** is the largest concurrency at
+which a lane keeps two thirds of itself. Raising it buys aggregate throughput at a lane's expense,
+which is a product decision and therefore a runtime key, not a constant.
+
+> ⛔ **Do not look for an interior aggregate maximum below the backend's own
+> `--max-running-requests`.** There isn't one. Aggregate decode rises monotonically through
+> concurrency 3 on both pool geometries measured
+> ([BENCHMARKS §3.20](../BENCHMARKS.md#320-throughput-versus-concurrency-warm-segmented--and-the-071-retraction)).
+> "Cap concurrency where tok/s peaks" has no answer in aggregate terms — the cap has to be keyed on
+> a *lane's own* rate, which is the thing a human is actually reading.
+
+**(B) Prefill backlog against a drain budget.** `num_waiting_uncached_tokens` divided by a prefill
+rate the client calibrates **from the server's own cumulative counters** —
+`total_prefill_uncached_tokens ÷ total_prefill_busy_us` — measured at **8,481 tok/s** and
+independently at **8,377 tok/s** an hour later on the same lane. That is checked against a fixed
+drain budget (here, the control-plane judge timeout, 30 s). Self-calibrating from the server's own
+counters is the point: the divisor then survives a model swap, a quantisation change or a card
+change without anyone editing a constant. Log-derived chunk-saturated prefill rates on the same lane
+— median **8,958 tok/s**, p25–p75 7,257–10,191 — agree with the counter form to within 6 %.
+
+**(C) Pool residency, with backlog charged before children.** Correctly does not bind at 14–32 %
+used. It is in the gate so that it binds when it should.
+
+**And VRAM survives as a floor, not a divisor.** `560 + max_running_requests × 32 = 688 MiB` — the
+largest allocation measured fatal, plus one measured transient per slot the scheduler can fill.
+Below it, admit nothing and let in-flight work drain. Above it, VRAM contributes **no cap at all**.
+The floor separates the three geometries that matter — 287 MiB critical, 935 MiB and 6,463 MiB both
+clear — which is the test a threshold has to pass to be worth having. ⛔ It must read **runtime**
+free VRAM: on this deployment the boot-time `available_gpu_mem` field reported 3.42 GB while the
+card had 287 MiB free while serving.
+
+**Verified effect:** at the live geometry that had yielded eleven children (588,268 uncached waiting
+≈ 69 s of backlog, 2 mains, 3 running, 5,651 MiB free), the replacement gate yields **0** child
+streams. No main's window, growth ceiling or request priority is touched by any of it.
+
+**Two design notes that generalise past this gate.**
+
+- **Make every threshold resolve at call time** — environment, then a config file, then the module
+  default. Retuning a throttle must not mean relaunching the sessions being throttled.
+- **Refuse the *second* concurrent child outright rather than letting six start and self-clamping.**
+  A gate that admits and then recovers has already paid the prefill, the eviction and the queue. The
+  observed state it was meant to prevent — three children on three of four slots with fifteen queued
+  — is reachable by a gate that is merely *eventually* correct.
+
+## 16. Delegate the wait; never park the goal on it
+
+**Rule.** When a long-running job blocks a goal, the goal does not stop. **Something that makes no
+model calls** watches the job and reports back; the agent keeps advancing on work it can quote
+verbatim from its own goal. And whatever you build to release the wait must not need a turn to run,
+because a parked agent fires no turns.
+
+**Why.** `[measured on the reference deployment]` An autonomous session sat at **turn 1 of 400**,
+parked 1,131 s on one external process, with **399 turns unspent** — on a turn whose own report
+named three other pieces of available work. The operator's pane read:
+
+```
+⏳ Goal parked — waiting on session <id>: the goal is not complete because the final
+   cut and scoring depend on the running job, which the agent is waiting on.
+↻ Loop: next in 30m.
+```
+
+Three defects compounded, and the third is the one that generalises:
+
+1. **An un-itemised goal cannot escalate.** With no enumerated sub-criteria, the "are all items
+   blocked?" test returns false by design, so the judge is left with a binary: continue, or park
+   *everything*. Nothing enumerated the work it was about to abandon.
+2. **The whole-goal barrier had no age ceiling** — while per-item barriers had carried one since
+   they existed, on the stated reasoning that a process which never exits must not permanently
+   remove an item from the work set. The barrier that removed the **whole goal** had none.
+3. **⛔ The release was lazy, and lived on a path that itself required a turn.** The barrier was
+   re-tested inside the "am I waiting?" check, which ran only from the post-turn hook — and a parked
+   goal fires no turns. The stall detector then skipped parked goals *on the grounds that their
+   barrier would release them*. So a park had **no backstop at all**: the one component that could
+   have noticed deliberately looked away, and the one component that could have released it could
+   only run if the thing it was releasing had already been released.
+
+**That third defect is a shape, not a bug.** Any state whose exit condition is evaluated only by
+machinery that the state itself suppresses is a deadlock with a progress bar. Check for it wherever
+you have a wait: *what runs the predicate, and can it run while the predicate is false?*
+
+### The fix pattern
+
+- **A watcher owns the wait, and makes zero model calls.** It re-tests the barrier's own release
+  predicate and reports a bounded outcome. Zero model calls is what makes it free: no context, no
+  toolset, **no stream for a concurrency cap or a VRAM floor to throttle**, and nothing to pay the
+  measured contention tax with — which on this backend runs from **2,622 wasted prefill tokens**
+  with no contention to **114,385** against five in-flight peers (rule 12). Dispatch it on whatever
+  rail already delivers background completions, so the report re-enters the session as a real turn
+  and **re-judges the goal** — which means a *correctly* parked goal is no longer a dead end either.
+- **⛔ Stamp the watcher with a routable owner, or it reports to nobody.** The completion drain
+  compares the event's session key against its own and fails closed on an empty one. On the CLI
+  surface that key resolved **empty**, so the watcher's report would have queued forever on exactly
+  the surface the fix was written for. Fall back to a durable session id, and **refuse to dispatch
+  at all when neither resolves** rather than promise a report nobody can claim.
+- **Do not give a watcher a liveness probe.** A stale-progress monitor kills a delegation whose
+  progress token is frozen, and a watcher's token is frozen by design.
+- **Decide "is there other work?" with a code filter, not a prompt instruction.** Asking a model
+  "anything else to do?" reliably produces something, and busy-work is worse than the park. So
+  require every proposed item to carry a **verbatim quote**, and check mechanically that the quote
+  really appears in the goal, its criteria, or the agent's own report. The work has to have already
+  been written down — by the user or by the agent itself. Drop any item that merely restates the
+  wait. **Every failure direction — no client, transport error, malformed response, an honest
+  "nothing", nothing verified — resolves to the park.** A verified probe converts a whole-goal park
+  into an *item* barrier, and the continuation names the items and forbids polling.
+- **Bound the watchers per goal**, and give the whole-goal barrier the age ceiling the item barriers
+  already had.
+
+**Three failures already in rule 14 belong to this same family**, and are not repeated here: a judge
+prompt that instructed *"blocked → treat as DONE"*; machine-origin interrupts (provider stalls
+measured at **31–137 s**) labelled as human `Ctrl+C`, which is the one class a resume supervisor must
+never auto-resume; and a resume command that flipped status without re-arming the continuation,
+making the backstop a no-op. **Rule 14's defect 3 and this rule's defect 3 are the same error seen
+from two sides** — a state transition that does not arm whatever is supposed to carry it forward.
+
 ---
 
 ### A note on where the measurements come from
 
-Rules 1, 3, 4, 7, 8, 9 and 10–14 were measured or reproduced on the reference deployment and its
+Rules 1, 3, 4, 7, 8, 9 and 10–16 were measured or reproduced on the reference deployment and its
 client framework directly. Rules 2, 5 and 6 cite the long-context suite,
 which ran on a second card — an RTX PRO 6000 Server Edition at 600 W rather than the 300 W
 Max-Q used everywhere else in this repository. Its pass/fail results and ratios transfer;
 its absolute tok/s and pool sizes do not. See
 [BENCHMARKS §3.8–§3.11](../BENCHMARKS.md#38-long-context-suite--complete-second-card).
 
-**Rules 10–14 carry a caveat of their own.** They come from a single deployment, a single client
+**Rules 10–16 carry a caveat of their own.** They come from a single deployment, a single client
 framework, and in several cases a single 24-hour window on one agent profile. Where a figure is
 derived rather than measured, or where the extraction that produced it was not preserved, that is
 said in place — see the parenthetical in rule 13 for the clearest example. The *mechanisms* are
