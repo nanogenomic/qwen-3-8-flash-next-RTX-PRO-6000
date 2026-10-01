@@ -326,12 +326,14 @@ context-linear KV, and decode's top-k reads a **compressed index**, not the K/V 
 can live in host RAM behind a small on-GPU direct-mapped cache, while the index stays on the card at
 **832 B/token** instead of 13,312.
 
-The cache is what keeps PCIe off the decode path: **81.2 % hit in steady decode over 1.34 billion
-selected tokens, at 198 host bytes read per selected token** — a 62× reduction against the 12,288
-bytes per token of resident K/V. ⛔ The lane's *first* 30-second sample reports 97.3 % and 27
-bytes/token, because the counters are cumulative from boot; that figure is an artifact and this
-repository has [a whole section](#operational-warning-use---mem-fraction-static-097-not-098) about
-why the early sample is the one that misleads you.
+The cache is what keeps PCIe off the decode path: **81.1 % cumulative hit over 13.2 billion selected
+tokens, at a median 193 host bytes read per selected token** — a 64× reduction against the 12,288
+bytes per token of resident K/V. Individual 30-second windows run **0.59–0.90**, so quote the
+cumulative; the draft layer runs higher, 87.6 % cumulative. ⛔ The lane's *first* 30-second sample
+reports 97.3 % and 27 bytes/token, because
+the counters are cumulative from boot; that figure is an artifact and this repository has
+[a whole section](#operational-warning-use---mem-fraction-static-097-not-098) about why the early
+sample is the one that misleads you.
 
 What it buys, measured: **two 250K/200K main agents plus two subagents both keep their prefixes
 (TTFT 1.2 s and 1.0 s, 106 and 117 tok/s), where the same card with a 451,840-token pool loses both
@@ -347,14 +349,31 @@ Three things to get right before you copy it:
   **~89 GiB of pinned host RAM**. The flag is what turns freed VRAM into headroom instead of into an
   unbounded host allocation. `SGLANG_QSA_HOST_KV_MAX_GB` is the fail-fast behind it.
 - **⛔ You have traded a VRAM budget for a host-RAM budget, and pinned pages cannot be reclaimed.**
-  The cutover was **OOM-killed twice at boot** before it came up, on a 251 GiB host, in the phase
-  that pins the pool ([§3.18a](BENCHMARKS.md#318a-host-ram-is-a-new-boot-time-failure-mode)).
-  Budget host RAM with the same care §3.13 applies to VRAM, and account for whatever page cache the
-  previous instance left behind.
-- **The steady-state VRAM floor on this configuration is not soaked yet.** 8.23 GB is a *boot*
-  figure and this repository has a section about why that matters. One `nvidia-smi` reading six
-  minutes in was 5,863 MiB free, against 1,737–1,739 MiB on the on-GPU configuration — but that
-  earlier figure is the flat floor of 13 h 22 min of samples, and this one is not.
+  Budget host RAM with the same care §3.13 applies to VRAM
+  ([§3.18a](BENCHMARKS.md#318a-host-ram-is-a-boot-time-budget--and-a-correction-to-this-section)).
+  ⚠️ An earlier revision of this page said the cutover was *"OOM-killed twice at boot"*. **That was
+  wrong and is retracted**: one of the two kills was the outgoing instance being stopped on
+  command, and the other was a CUDA-graph capture failure
+  ([§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build)).
+  `dmesg` records **zero** kernel OOM events. The host-RAM caution is sound arithmetic; it has no
+  measured instance behind it.
+- **⛔ Set a restart policy before you cut over.** The first boot of the host-KV build died 2 s into
+  CUDA-graph capture with `cudaErrorStreamCaptureInvalidated`; the next boot, 36 s later, same
+  binary and same flags, came up and stayed up. It is **nondeterministic — one failure in two
+  attempts**, cause not established, no fix in this tree. `Restart=always` with `RestartSec=30`
+  self-heals at a cost of ~5 min 44 s per failed attempt. A one-shot launcher would have left the
+  card dark. Details and the full set of ruled-out causes: [§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build).
+- **The steady-state VRAM floor is 5.5–5.7 GiB, and ~1 GiB of it is the hot cache.** 8.23 GB is a
+  *boot* figure and this repository has a section about why that matters. Two `nvidia-smi` readings
+  while serving — 5,863 MiB at six minutes and **5,631 MiB at seventy** — against 1,737–1,739 MiB
+  on the on-GPU configuration. Still not a soak (§3.13's figure is 2,406 samples over 13 h 22 min),
+  but the magnitude is no longer open. ⛔ **One consequence worth acting on: `--mem-fraction-static
+  0.97` was derived for an on-GPU pool, where lowering it cost context. With `--max-total-tokens`
+  set, it no longer does — so a lower fraction now buys device headroom for free.** Not yet
+  bracketed; see [§3.15e](BENCHMARKS.md#315e-two-open-opportunities-the-cutover-created-stated-as-opportunities).
+- **⛔ `/v1/loads` reports the host pool under `memory.kv_cache_gb`.** On this configuration that
+  field reads **15.938 GB and it is host RAM, not VRAM**. Any tool that sums `weight_gb +
+  kv_cache_gb + graph_gb` to estimate device occupancy over-counts the card by ~16 GB.
 
 ## The correctness fix, separately
 
@@ -379,7 +398,10 @@ This repository holds **only what this fork changes**, plus the documentation an
 series — not a second copy of all of SGLang. Concretely:
 
 ```
-README.md  CHANGES-vs-upstream.md  BENCHMARKS.md  UPSTREAM-BUG-qsa-index-key-ring.md
+README.md  CHANGES-vs-upstream.md  BENCHMARKS.md
+UPSTREAM-BUG-qsa-index-key-ring.md             a filable upstream correctness bug + its fix here
+UPSTREAM-BUG-cuda-graph-capture-invalidated.md ⛔ a DRAFT, unfiled: one nondeterministic boot
+                                               failure, no cause, no fix. Evidence on record only
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 38 commits as a git-am-able series against the base commit
@@ -862,6 +884,19 @@ streams.
 clean boot. An apparent drop to ~1.85 at higher stream counts was a measurement artefact: a synthetic
 workload of forced continuations from random mid-document windows drafts at ~1.85 at *every* stream
 count, including 4. The content moved it, not the batch size.
+
+> **⛔ The interior peak in that table is at 6 streams, and it does not help you pick a cap at 4.**
+> The table above is a synthetic sweep on the second card, up to 12 streams, and it does show
+> aggregate turning over between 6 and 8. **Below 4 — the range the production card actually runs in
+> — there is no interior maximum at all.** On the production lane's own traffic, aggregate decode
+> rises monotonically through concurrency 3 on both pool geometries: 173.9 → 272.3 → 336.6 → 361.8
+> tok/s on the on-GPU pool, and 158.2 → 233.7 → 269.1 on the host-resident pool, while a single
+> lane keeps only 78 % / 65 % / 52 % and 74 % / 57 % of its solo rate respectively. The two results
+> are not in conflict; they cover different ranges. The consequence for anyone writing a throttle:
+> **you cannot read a cap at or below 4 off the aggregate curve, because there is no peak there.**
+> The cap is a deliberate trade against per-stream latency, and the number to key it on is a lane's
+> own rate, not the aggregate. Full tables, method, and the single-stream retraction:
+> [BENCHMARKS §3.20](BENCHMARKS.md#320-throughput-versus-concurrency-warm-segmented--and-the-071-retraction).
 
 **Priority scheduling** (`--enable-priority-scheduling`), at 12 streams saturated by 14 background
 streams at priority 0, with a main stream at priority 100:

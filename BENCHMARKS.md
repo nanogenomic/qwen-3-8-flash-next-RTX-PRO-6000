@@ -694,8 +694,8 @@ draft; the GPU-side compressed index is **832 B/token** (768 for 12 layers at 1 
 128 dim / ratio 4 × 2 B, plus 64 for the draft layer). A token costs ~16× less VRAM in the host-KV
 layout than in the on-GPU one, which is where the 2.9× comes from.
 
-**The production boot, line for line from the engine's own log** (delta, `--mem-fraction-static
-0.97`, `--kv-cache-dtype fp8_e4m3`, 36 slots, declared context 540,000):
+**The production boot, line for line from the engine's own log** (production card,
+`--mem-fraction-static 0.97`, `--kv-cache-dtype fp8_e4m3`, 36 slots, declared context 540,000):
 
 | | On-GPU KV (16:56:52Z) | **Host-resident KV (23:34:00Z)** |
 |---|---|---|
@@ -725,19 +725,78 @@ GiB GPU`.
 
 **⛔ Read the hit rate at steady state, not at the first sample.** The cache's counters are
 cumulative from boot, so the first 30-second window reports itself as the cumulative figure and
-looks far better than the lane sustains. Both readings, from the same production lane:
+looks far better than the lane sustains. The first sample on this lane (23:34:21Z) read **0.9734**
+for the target layers over only 8,589,408 selected tokens, and **0.8991** for the draft. The very
+next sample, 30 s later, read `last 30s hit 0.0000` with the cumulative unchanged — there were no
+selections in that window at all. Neither is a steady-state figure.
 
-| Layer group | First 30 s after ready (23:34:21Z) | **Steady state (23:45:51Z)** | Selected tokens behind the steady figure |
-|---|---|---|---|
-| 12 target layers | 0.9734 hit · 27 host B/token | **0.8121 hit · 198 host B/token** | 1.34 × 10⁹ |
-| MTP draft layer | 0.8991 hit · 103 host B/token | **0.8774 hit · 118 host B/token** | 1.68 × 10⁸ |
+**The steady-state distribution**, over every 30-second sample from 180 s after ready to a frozen
+boundary at 2026-10-01 01:00 UTC — 86 minutes of the lane's real traffic:
 
-**Publish the right-hand column.** 198 host bytes per selected token against 12,288 bytes per
-token of resident K/V is still a **62× reduction** in PCIe traffic, and that is the real result;
-the left-hand column would have claimed 455×. An independent run on the second card measured
-0.89–0.95 in steady decode, cumulative 0.92, at 92–223 bytes/token — consistent with the right-hand
-column and not with the left. This is the same boot-versus-steady-state error §3.13 exists to warn
-about, applied to a different counter.
+| Layer group | samples | last-30 s median | p10–p90 | min–max | **cumulative** | over N selected tokens | host B/token (median) |
+|---|---|---|---|---|---|---|---|
+| 12 target layers | 103 | **0.812** | 0.733–0.859 | 0.587–0.901 | **0.8112** | **1.32 × 10¹⁰** | 102–423 (193) |
+| MTP draft layer | 187 | **0.869** | 0.803–0.907 | 0.746–0.940 | **0.8764** | **1.65 × 10⁹** | 62–260 (134) |
+
+**This confirms the single 23:45:51Z readings an earlier revision published** — 0.8121 target and
+0.8774 draft — to within 0.001 and 0.001 respectively, now over **10× more selected tokens**. Those
+samples were right; they were just single samples, and a single sample could not say so. What the
+distribution adds is the **spread**: an individual 30-second window on this lane runs anywhere from
+**0.587 to 0.901** for the target layers. Quote the cumulative, not a window.
+
+⚠️ **The selected-token totals are an order of magnitude larger than the earlier figures** (1.32 ×
+10¹⁰ against 1.34 × 10⁹ for the target layers) because they are cumulative-from-boot counters read
+86 minutes in rather than 11. If you see "over 1.3 billion" anywhere, it is the 11-minute reading.
+
+At the measured median of **193 host bytes per selected token** against 12,288 bytes per token of
+resident K/V, the PCIe traffic reduction is **~64×**. The first-sample figure would have claimed
+455×. An independent run on the second card measured 0.89–0.95 in steady decode, cumulative 0.92, at
+92–223 bytes/token — higher than this lane, consistent in order of magnitude, and consistent with
+the distribution above rather than with the first sample. This is the same boot-versus-steady-state
+error §3.13 exists to warn about, applied to a different counter.
+
+#### 3.15e Two open opportunities the cutover created, stated as opportunities
+
+Neither of these is a result. Both are consequences of the cutover that have not been acted on, and
+they are published because the reasoning is more useful than the silence.
+
+**1. The hot cache is sized for a card that no longer exists.** `[measured + arithmetic]` The cache
+costs **1.02 GiB** of GPU (0.94 target + 0.08 draft) while `nvidia-smi` reads **5,631 MiB free** on
+the card with the lane serving — a second reading, ~70 minutes after boot, against the 5,863 MiB
+read six minutes in. So the steady floor on this configuration is roughly **5.5–5.7 GiB**, and the
+cache occupies under a fifth of it. The cache size is
+`layers × slots × SGLANG_QSA_HOST_KV_CACHE_SETS × 4 tokens × 1,024 B`, which is independent of pool
+size: doubling sets to 8,192 would cost 1.88 GiB and still fit twice over. Whether a larger cache
+*buys* anything is exactly what has not been measured — the hit rate is already 0.82, so the
+headroom is in the 18 % of misses, and nothing here establishes that they are capacity misses
+rather than first-touch ones.
+
+**2. The cache is fair-share across request slots, and the workload is not.** `[measured, from the
+boot log]` `12 layers × 5 request slots × 4096 sets × 4 tokens` gives every slot the **same 16,384
+tokens** of cache. A subagent that lives for one 8K turn is therefore allotted exactly as much
+cache as a main agent holding 500K, and because the cache is direct-mapped per (layer, slot) rather
+than shared, a short-lived child cannot *borrow* a long-lived main's residency — but it does occupy
+a slot, and the slot's cache is cold when it arrives and discarded when it leaves. The fairness is
+structural, not a tuning accident. A residency-weighted allocation is the obvious thing to try and
+has not been tried.
+
+**3. `--mem-fraction-static 0.97` is now mis-tuned, and its derivation no longer applies.**
+`[reasoning, from the measured configuration]` 0.97 was bracketed in §3.13 and §3.14 against an
+**on-GPU** pool, where the fraction bought pool tokens directly: lowering it cost context. That
+premise is gone. With `--max-total-tokens 1310720` set explicitly (§3.15a), the pool size is fixed
+by the flag and the fraction only decides how much of the card torch reserves for itself. The
+pool's GPU-side cost is ~1.02 GiB regardless. So the trade the bracket was exploring has inverted:
+**a lower fraction would now cost no pool capacity at all and buy real device headroom** — the
+headroom whose absence killed the lane twice in §3.14. The lowest safe fraction is still not
+bracketed (§6), but the question is now cheap to answer and the answer is worth more than it was.
+
+⚠️ One accounting detail that does **not** resolve, and should not be glossed. §3.15's 832 B/token
+on-GPU compressed index comes to `768 × 1,310,720 = 1,006,632,960 B` for the 12 target layers —
+which is **bit-for-bit the same number** as the logged 0.94 GiB hot cache
+(`12 × 5 × 4096 × 4 × 1024 = 1,006,632,960 B`). The coincidence is arithmetic (983,040 × 1024 =
+1,310,720 × 768), and it means the boot-time accounting — 0.91 GB consumed across the main host-KV
+step — **cannot distinguish an index allocation from the hot cache**. One of the two is either not
+a separate allocation or is not on the device. See §6.
 
 #### 3.15a `--max-total-tokens` is mandatory, not tuning
 
@@ -758,7 +817,7 @@ each re-sending its full history, with two subagents added on the third turn. Th
 
 **Be precise about the control's pool.** It was **not** pinned to the production lane's size. It
 ran with `max_total_tokens: None` and sized itself off the static budget, landing at **451,840** —
-within 0.13 % of delta's 451,264 by coincidence, not by construction. A second control boot of the
+within 0.13 % of the production card's 451,264 by coincidence, not by construction. A second control boot of the
 same configuration self-sized to 451,648. That the three agree so closely is a property of the
 model and the memory fraction; it is not a control variable anyone set.
 
@@ -848,8 +907,12 @@ Do not cite "the host-KV configuration failed its quality gate". Do not cite "it
   lose it. The pool holds 1,310,720 and the two mains need ~1.0M, so this is not capacity. Decode
   for the main that *kept* its cache fell to **7.1–7.2 tok/s** while its peer cold-prefilled 500K
   — far worse than the 24–27 tok/s at 250K. **2 × 500K is demonstrated to run, not recommended.**
-- **The host-KV steady-state VRAM floor is not soaked** (above).
-- **Host RAM is now a boot-time failure mode.** See §3.18a.
+- **The host-KV steady-state VRAM floor is not soaked** (above) — two readings, 5,863 and 5,631 MiB.
+- **Boot is a new failure mode, but not the one first published.** Host RAM becomes a budget you
+  must size (§3.18a); the cutover's one real boot failure was a **nondeterministic CUDA-graph
+  capture invalidation** (§3.19), not host-RAM exhaustion.
+- **Per added stream, host-resident KV costs more than it does at concurrency 1** (§3.20), and that
+  comparison is not a controlled A/B.
 
 ### 3.16 Bounded QSA prefill gather — the transient that scaled with context
 
@@ -1007,23 +1070,250 @@ An earlier estimate of 3.6–4.1 minutes for the post-move boot was **optimistic
 figure is **4 min 45 s**, because the estimate did not include the ~110 s the host-KV pinning and
 CUDA-graph capture phase takes after the last weight lands. The measured number supersedes it.
 
-#### 3.18a Host RAM is a new boot-time failure mode
+#### 3.18a Host RAM is a boot-time *budget* — and a correction to this section
 
-`[measured, 2026-09-30]` The cutover to host-resident KV did not come up first time. Two boots
-were killed with `status=9/KILL` — at 23:23:09 and 23:28:58 — before the 23:29:34 boot succeeded.
-The unit recorded a **202.1 GiB memory peak** on a **251 GiB** host, and the failed boot at
-23:23:44 had already finished loading weights (`Load weight end. elapsed=184.70 s`) and died
-afterwards, in the phase that pins the host KV.
+> ⛔ **An earlier revision of this section said the cutover was OOM-killed twice at boot. Both
+> halves of that claim were wrong and are retracted here.** The 23:23:09 kill was the *outgoing*
+> instance being torn down on command, not a boot failure; the 23:28:58 death was a CUDA-graph
+> capture invalidation, not host-RAM exhaustion. §3.19 is the corrected account, with the
+> exclusions. The design consequence below survives, because it is arithmetic about pinned pages
+> rather than an inference from those two events.
 
-The lane is configured `MemoryMax=infinity`, so nothing bounded it but the host. The mechanism to
-take away: **pinned pages are neither swappable nor reclaimable**, so a host-resident KV pool
-converts a VRAM budget into a host-RAM budget, and the host-RAM budget has to be reasoned about
-with the same care §3.13 applies to VRAM — including whatever page cache the previous instance
-left behind. `SGLANG_QSA_HOST_KV_MAX_GB` fails fast on a *mis-sized pool*; it does not protect
-against the host simply being full at the moment of the pin.
+`[measured, 2026-09-30, from the user-manager journal of the lane's own unit]` What actually
+happened across the cutover:
 
-Weight-load time is also not stable under that pressure: the boot that died took **184.70 s** to
-load the target weights where the boot that succeeded took **130.67 s**, on the same NVMe.
+| time (UTC) | event | what it was |
+|---|---|---|
+| 23:23:03 | `Sent signal SIGTERM to main process … on client request` | **commanded stop** of the pre-cutover instance |
+| 23:23:09 | `Main process exited, code=killed, status=9/KILL` | the same stop, escalated after SIGTERM was not honoured. `Consumed 7h 1min 7.968s CPU time` — a long-running instance, not a boot |
+| 23:23:44 | restart counter 6, `Started` | **first boot of the host-KV build** |
+| 23:28:58 | `status=9/KILL` after 314 s | **the one real failure** — §3.19 |
+| 23:29:34 | restart counter 7, `Started` | **succeeded**; still the running instance |
+
+So the cutover was **one failed boot out of two attempts**, not two out of three.
+
+**The design consequence stands on its own.** `[arithmetic]` A host-resident KV pool converts a
+VRAM budget into a host-RAM budget, and **pinned pages are neither swappable nor reclaimable**, so
+that budget has to be reasoned about with the same care §3.13 applies to VRAM.
+`SGLANG_QSA_HOST_KV_MAX_GB` fails fast on a *mis-sized pool*; it does not protect against the host
+simply being full at the moment of the pin. Budget it deliberately. What this repository does
+**not** have is a measured instance of that failure — see §3.19 for why the one candidate was not
+it, and §6 for the measurement that is still missing.
+
+**Weight-load time is not stable boot to boot**, on the same NVMe and the same shards: the boot
+that died took **184.70 s** to load the target weights where the boot that succeeded took
+**130.67 s** — a 1.41× spread with no change of configuration. `[measured]` Cause not
+established; the obvious candidate is page cache left by the outgoing instance, which was not
+instrumented. Do not treat §3.18's 130.67 s as a repeatable figure without a second sample.
+
+### 3.19 Nondeterministic CUDA-graph capture failure on the host-KV build
+
+`[measured, production card, 2026-09-30]` This is the one result in this repository whose main
+value is a list of things it is **not**. The host-KV build's first boot died 314 s in, 2 s into
+CUDA-graph capture, with:
+
+```
+RuntimeError: info.status != cudaStreamCaptureStatusInvalidated INTERNAL ASSERT FAILED
+  at "c10/cuda/CUDACachingAllocator.cpp":2213 … Invalid stream capture status
+Exception: Capture cuda graph failed: CUDA error: operation failed due to a previous error
+  during capture
+```
+
+The next boot, 36 s later, with the same binary, the same flags and the same model, **came up and
+has stayed up.** That is the whole result: it is nondeterministic, and it reproduced once in two
+attempts.
+
+#### The evidence that matters is the comparison of the two boots
+
+Both boots logged the capture phase identically up to the failure:
+
+| | failed boot (23:23:44) | succeeded boot (23:29:34) |
+|---|---|---|
+| Target weight load | 184.70 s, `mem usage=81.34 GB` | 130.67 s, `mem usage=81.34 GB` |
+| Draft weight load | 23.10 s, `0.64 GB` | 20.75 s, `0.64 GB` |
+| Host KV pin, 12 target layers | **logged OK** — `15.00 GiB pinned+mapped host memory (UVA zero-copy)` | logged OK, same 15.00 GiB |
+| Host KV pin, draft layer | **logged OK** — `1.25 GiB` | logged OK, same 1.25 GiB |
+| GPU hot caches | `0.94 GiB` + `0.08 GiB` | identical |
+| FlashInfer autotune | completed, 59 s | completed, 61 s |
+| `Capture target verify CUDA graph begin` | `backend=full, num_tokens_per_req=4, bs=[1,2,3,4], avail mem=`**`8.47 GB`** | `… avail mem=`**`8.47 GB`** |
+| Capture outcome | **died at bs=2**, ~2 s in | `end. elapsed=2.33 s, mem usage=0.15 GB` |
+
+**The free-memory figure at the moment of capture is identical to two decimal places on the boot
+that died and the boot that worked.** That single row is what excludes capacity as the cause.
+
+#### Ruled out, each with its own evidence
+
+| Candidate | Why not |
+|---|---|
+| **Host-RAM OOM during the pin** | Both pinning steps **logged success** before the crash, at 15.00 GiB and 1.25 GiB, and the two GPU hot caches allocated after them. The process died three phases later. |
+| **Kernel OOM killer** | `dmesg \| grep -ci "out of memory"` returns **0**. Nothing was OOM-killed on this host. |
+| **Host memory pressure generally** | The failed boot's `Consumed` line reports **67.9 MiB** of swap peak. A host genuinely out of memory does not swap 68 MiB. (The *outgoing* instance, by contrast, had touched 2.6 GiB of swap over 6½ hours.) |
+| **The 202.1 GiB `memory peak` a previous revision cited** | systemd reports the cgroup's peak charge, which for this unit is dominated by file-backed and shared pages, not anonymous ones. Live breakdown of the same cgroup while serving: `memory.current` **98.72 GiB**, of which `file` **91.63 GiB** and `shmem` **80.33 GiB**, against `anon` of only **6.69 GiB** and `unevictable` **0**. The host itself reported **137 GiB available** of 251 GiB with 210 GiB in buff/cache. A peak dominated by reclaimable and shared accounting is not evidence of an allocation failure. |
+| **VRAM OOM** | `avail mem=8.47 GB` at capture begin, and the exception is a **capture-status assert**, not an allocation failure. The allocator did not report being out of memory; it reported being asked to allocate on a stream whose capture had already been invalidated. |
+| **`TimeoutStartSec`** | 90 s, but the unit is `Type=simple`, so systemd marks it started at `exec` and the start timeout is never armed against readiness. The boot that *succeeded* took **285 s** and was never at risk from it. |
+| **Deterministic bug in the new code path** | It is not deterministic: 1 failure in 2 attempts, and ~13 h of uptime since on the same binary. |
+
+#### ⛔ The traceback frame is the detection point, not the cause
+
+This is the part worth getting right before anyone files it anywhere. The innermost frame is this
+fork's own skinny GEMM:
+
+```
+qwen3_5.py:1049  out_proj      (inside self.linear_attn — the GDN linear-attention layer)
+  → linear.py:1654 → unquant.py:522 → _bf16_gemm_dispatch_impl
+  → sm120_bf16_skinny_gemm.py:186   y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+```
+
+`torch.empty` is simply the **first allocator call after the invalidation**, which is where
+PyTorch notices. CUDA reports `cudaErrorStreamCaptureInvalidated` to the *next* API call, not to
+the operation that caused it — and the engine's own secondary message says so explicitly:
+*"operation failed due to a previous error during capture"*. So:
+
+- **The frame does not localise the bug.** The cause is somewhere earlier in the same capture.
+- **It is specifically not evidence for the host-KV path**, because this frame is in the **GDN
+  linear-attention** layer, which does not touch the host-resident K/V at all. Anything that
+  blames the UVA path has to explain why the detection point is in the one attention family that
+  is not host-resident.
+
+`[hypothesis, untested]` The leading candidate remains something on the host-KV UVA path being
+capture-illegal — it is the only thing that changed — but **nothing here establishes that**, and
+the detection frame argues against the simplest version of it. A fix is being investigated
+separately. **No fix is claimed, and none exists in this tree.**
+
+#### The mitigation that already applies
+
+`[measured, from the unit's own configuration]` `Restart=always`, `RestartSec=30`, and
+`StartLimitBurst=10` in `StartLimitIntervalSec=600`. A failed attempt therefore costs **~344 s**
+— the 314 s the attempt itself ran, plus the 30 s restart delay — and the supervisor has nine
+more attempts inside the burst window before it gives up. The lane self-heals; it just does so
+visibly, at roughly five and a half minutes per failure.
+
+**If you run this configuration, set a restart policy before you cut over.** A one-shot launcher
+would have left the card dark.
+
+A draft upstream report is in
+[`UPSTREAM-BUG-cuda-graph-capture-invalidated.md`](UPSTREAM-BUG-cuda-graph-capture-invalidated.md).
+It is a draft: it has one occurrence, no reduction, and no fix.
+
+### 3.20 Throughput versus concurrency, warm-segmented — and the 0.71× retraction
+
+`[measured, production card]` **Source and method, because the method is what makes these
+numbers mean anything.** All figures below are mined from the lane's own
+`Decode batch` scheduler log, frozen at **2026-10-01 01:00 UTC**:
+
+- Samples are the engine's `gen throughput (token/s)` on `Decode batch` lines. `decode_log_interval`
+  is **40**, so each sample is a 40-step average, not an instant.
+- **Bucketed by `#running-req`** — the engine's own count of streams decoding in that step.
+- **Warm:** the first **180 s** after each boot's `fired up and ready` is dropped.
+- **Uncontended:** a sample is kept only when `#queue-req == 0`. This is the single most important
+  filter and it replaces an earlier, weaker one. Earlier passes at this curve segmented on whether
+  a large uncached prefill ran nearby; that criterion is noisy, and under it the "contended"
+  bucket came out *faster* than the warm bucket at concurrency 1 — which is a sign the criterion
+  was not measuring contention. Queue depth read from the decode sample itself is unambiguous.
+- Medians are reported, with p25/p75, because the distributions are wide and right-skewed.
+
+#### Two pool geometries, same day, same card
+
+| | **on-GPU KV**, 451,264 pool (boot 16:57:11) | **host-resident KV**, 1,310,720 pool (boot 23:34:19) |
+|---|---|---|
+| conc 1 | **173.9** tok/s · n = 207 · p25–p75 147.0–232.9 | **158.2** · n = 406 · 130.0–201.8 |
+| conc 2 | **272.3** · n = 310 · 233.4–312.5 | **233.7** · n = 335 · 180.7–266.1 |
+| conc 3 | **336.6** · n = 195 · 272.1–376.0 | **269.1** · n = 71 · 195.6–316.2 |
+| conc 4 | **361.8** · n = 110 · 287.4–419.1 | 267.4 · **n = 21** · 53.6–328.8 |
+| per-stream share of solo | 100 % / 78.3 % / 64.5 % / 52.0 % | 100 % / 73.9 % / 56.7 % / (42.2 %) |
+| median accept length | 2.38–2.52 across all cells | 2.52–2.54 across all cells |
+
+⚠️ **The concurrency-4 cell on the host-KV build is n = 21 with a p25 of 53.6 and is not a rate.**
+It is printed so the table is not silently truncated. Nothing is concluded from it.
+
+**Accept length is flat across every cell on both builds** (2.38–2.54), which rules out
+speculative-decoding acceptance as the explanation for any of the differences below.
+
+#### Finding 1 — there is no interior aggregate maximum below `--max-running-requests 4`
+
+Aggregate decode throughput rises monotonically with concurrency on **both** pool geometries
+through concurrency 3, and the concurrency-4 cell is informative only on the on-GPU build, where
+it also rises. So **a concurrency cap cannot be read off the aggregate curve** — there is no peak
+to cap at. The cap is a deliberate trade: every stream you add buys aggregate throughput and
+takes it out of each individual lane's latency. On the on-GPU geometry the third stream costs a
+lane 14 points of its solo rate (78.3 % → 64.5 %) and buys 24 % aggregate; on the host-KV
+geometry the same step costs 17 points (73.9 % → 56.7 %) and buys 15 %.
+
+Which side of that trade to take is a product decision, not a measurement. What the measurement
+says is only that **"cap concurrency where aggregate tok/s peaks" has no answer here.**
+
+#### Finding 2 — the 0.71× single-stream regression is retracted
+
+`[retraction]` An earlier measurement put host-KV single-stream decode at **0.71×** the
+pre-cutover build. That figure does not survive. Solo decode, under the filter above
+(`#running-req == 1` **and** `#queue-req == 0`), across every boot in the log with enough samples:
+
+| boot (UTC) | KV | pool | n | p25 | **median** | p75 | median ctx |
+|---|---|---|---|---|---|---|---|
+| 2026-09-29 03:56:14 | GPU | 331,456 | 12,941 | 152.7 | **177.3** | 211.0 | 65,984 |
+| 2026-09-29 16:56:26 | GPU | 331,456 | 370 | 149.3 | **176.1** | 224.3 | 85,056 |
+| 2026-09-29 18:31:08 | GPU | 643,456 | 808 | 153.1 | **178.6** | 218.8 | 69,984 |
+| 2026-09-29 23:10:37 | GPU | 522,880 | 268 | 142.4 | **171.5** | 225.2 | 56,800 |
+| 2026-09-29 23:42:45 | GPU | 522,880 | 17,985 | 143.1 | **167.5** | 205.1 | 65,920 |
+| 2026-09-30 16:57:11 | GPU | 451,264 | 207 | 147.0 | **173.9** | 232.9 | 42,880 |
+| **2026-09-30 23:34:19** | **HOST** | **1,310,720** | 406 | 130.0 | **158.2** | 201.8 | 83,968 |
+
+Six pre-cutover boots span **167.5–178.6** tok/s. The host-KV build measures **158.2**. That is
+**0.89–0.95×**, not 0.71×. The 0.71× figure came from a window dominated by a post-restart prefill
+storm and is withdrawn.
+
+**But do not replace it with "no regression" either.** 158.2 is below all six pre-cutover medians,
+and this repository's noise band (§1.1) does not cover a gap that is one-directional across six
+comparison boots. The honest statement is: **single-stream decode on the host-KV configuration
+measures ~6–11 % below the pre-cutover range, with heavily overlapping distributions
+(130.0–201.8 against 142.4–232.9).**
+
+#### Finding 3 — host-resident KV costs more per *added* stream than it does at concurrency 1
+
+This is the new result, and it is the one worth re-measuring on your own lane. The per-stream
+share of solo rate degrades faster on the host-KV build:
+
+| concurrency | on-GPU share | host-KV share | difference |
+|---|---|---|---|
+| 2 | 78.3 % | **73.9 %** | −4.4 pts |
+| 3 | 64.5 % | **56.7 %** | −7.8 pts |
+
+`[measured, but not an A/B]` The direction is what a shared PCIe/UVA fetch path predicts: at
+concurrency 1 one stream has the whole link, and each added stream divides it. **It is not a
+controlled comparison** — different boots, different hours, different pool sizes, different client
+mixes, and n = 71 in the host-KV concurrency-3 cell. Treat it as a hypothesis with supporting
+evidence, not a measured factor, and see §6.
+
+#### ⛔ The `0.8–0.9×` PCIe Gen4-versus-Gen5 decode factor has no measured source
+
+It appeared in an early draft of this repository and was removed. It was never measured, on either
+card. **Nothing in this section reintroduces it**, and the host-KV penalty above is a
+concurrency-scaling observation on *one* card, not a bus-generation factor. §3.15d still states
+that no cross-SKU factor is published because none was measured.
+
+#### Prefill rate, for anyone sizing a backlog gate
+
+`[measured]` Input throughput on **chunk-saturated** prefills — `#new-token == 4096`, the
+configured `chunked_prefill_size` — warm, same frozen window:
+
+| boot | n | p25 | median | p75 |
+|---|---|---|---|---|
+| 16:57:11, on-GPU KV | 39,029 | 7,934 | **9,477** tok/s | 10,629 |
+| 23:34:19, host KV | 6,471 | 7,257 | **8,958** tok/s | 10,191 |
+
+Cross-checked against the server's own cumulative counters on `/v1/loads`,
+`total_prefill_uncached_tokens ÷ total_prefill_busy_us`, read twice on the host-KV build:
+**8,481 tok/s** at 23:54Z and **8,377 tok/s** at 00:52Z (28,285,018 tokens over 3,375.99 s).
+Two independent instruments, 5–6 % apart. Either is a usable self-calibrating divisor; the
+counter form is the better one for a client, because it needs no log access and carries its own
+denominator.
+
+#### ⛔ Operational trap: `/v1/loads` reports the host pool as `memory.kv_cache_gb`
+
+`[measured]` On the host-KV build `/v1/loads` returns `"memory":{"weight_gb":81.344,
+"kv_cache_gb":15.938,"graph_gb":0.148,…}`. **That 15.938 GB is pinned host RAM, not VRAM.** Any
+sizing tool that sums those three fields to estimate device occupancy will over-count the card by
+~16 GB on this configuration. The field name does not change when the pool moves.
 
 ## 4. Quality instruments — what each one can and cannot see
 
@@ -1272,16 +1562,34 @@ Added by the 2026-09-30 cutover (§3.15–§3.18):
 
 | Item | Status |
 |---|---|
-| Steady-state device-free VRAM on the host-KV configuration | **not soaked.** One reading of 5,863 MiB about six minutes after boot (§3.15), against §3.13's 13 h 22 min flat floor for the on-GPU configuration. The comparison is boot-fresh against soaked and should not be read as a like-for-like margin. |
+| Steady-state device-free VRAM on the host-KV configuration | **two readings, still not soaked.** 5,863 MiB at ~6 minutes and **5,631 MiB at ~70 minutes** after boot (§3.15, §3.15e) — stable to within 4 % across that span, against §3.13's 13 h 22 min flat floor of 1,737–1,739 MiB for the on-GPU configuration. Two points are not a soak, but they no longer leave the magnitude open: call it 5.5–5.7 GiB. |
 | Why one main re-prefills every turn at 2 × 500K | **cause not established** (§3.15d). Not capacity: the pool holds 1,310,720 and the two mains need ~1.0M. It alternates between the two mains across turns. |
 | Cross-SKU scaling from the validation card to the production card | **not measured.** Modal is a Server Edition at 600 W on PCIe Gen5; production is a Max-Q at 300 W on Gen4 (§3.15d). Every absolute tok/s in §3.15b belongs to the Server Edition. No factor is published because none was measured. |
 | Non-fatal OOM on the **merged ship tree** at any useful sample size | **2 events.** The 39-injection battery ran on the `oom-retract` branch with host KV off; the ship-tree re-run passed with only 2 injections / 2 recoveries (§3.17). Not a comparable sample. |
 | Why the bounded gather showed no peak-VRAM benefit at the production 2 × 250K cell | **cause not established** (§3.16). Both trees measured +1,248 MiB over idle. The micro and needle A/Bs both show the benefit; this cell does not. |
-| Steady-state hot-cache hit rate as a function of workload | **one steady reading per card.** 0.8121 on the production lane at 11 minutes, 0.92 cumulative on the second card. No sweep over context mix, and the first-30-s figure (0.9734) is an artifact of cumulative counters (§3.15). |
+| Steady-state hot-cache hit rate as a function of workload | **distribution now measured on the production lane, but not as a function of anything.** 103 target-layer and 187 draft samples over 86 minutes: cumulative **0.8112 / 0.8764** over 1.32 × 10¹⁰ and 1.65 × 10⁹ selected tokens, 30-second windows spanning 0.587–0.901 and 0.746–0.940 (§3.15). That **confirms** the earlier single 0.8121 / 0.8774 readings to within 0.001, and the second card's 0.92 cumulative is consistent in order of magnitude. **No sweep over context mix, request length or concurrency**, so the 0.587–0.901 spread has a measured range and no explanation. The first-30-s figure (0.9734) remains an artifact of cumulative counters. |
 | NVMe-versus-array sequential bandwidth | **artifact not retained** (§3.18). Method recorded, result self-asserted, and a second figure for the array (290.6 MB/s) disagrees slightly from a different method. |
 | Host-UVA kernel time under the bounded gather | **did not reproduce.** Run 1 disagrees with runs 2 and 3 by 30–55× in the opposite direction, and reports a different peak (§3.16). Unexplained; no claim made. |
 | A single assembled quality verdict covering both the decode path and retrieval past 262,144 | **not built.** Both legs pass in separate bundles; the composite verdict returns FAIL on a scope rule, not on a measurement (§3.15c). |
 | Whether the host-KV lane survives a deep queue at 0.97 | **not exercised.** The bounded gather removes the transient that killed §3.14's boot, and non-fatal OOM is meant to absorb what is left, but neither has been tested against a 14–26-deep queue on the production card. |
 | Prefix-cache hit rate and TTFT on the production card under its real workload | **still not measured**, at any memory fraction or pool size. §3.15's hot-cache hit rates are host-KV cache hits, which is a different quantity. |
-| How much host RAM the pinning phase needs at boot, and under what contention | **not characterised.** Two boots were OOM-killed before one succeeded (§3.18a); the relationship to page cache left by the previous instance was not measured. |
-| Whether `SGLANG_QSA_HOST_KV_CACHE_SETS` 2048 or 4096 is the better trade | **not A/B'd on one boot.** 4096 measured 0.9734 cumulative hit for 0.94 GiB of GPU; 2048 was reported at ~0.92 for half the VRAM, on a different run. |
+| How much host RAM the pinning phase needs at boot, and under what contention | **not characterised, and the one candidate event was not it.** An earlier revision cited two OOM-killed boots; §3.18a and §3.19 retract that — one was a commanded stop, the other a CUDA-graph capture failure, and `dmesg` records **zero** kernel OOM events. So the host-RAM failure mode remains a reasoned consequence of pinning (§3.18a) with **no measured instance at all**. |
+| Whether `SGLANG_QSA_HOST_KV_CACHE_SETS` 2048 or 4096 is the better trade | **not A/B'd on one boot.** The 0.9734 figure previously cited for 4096 was a first-sample artifact; the steady figure is **0.8214 cumulative over 9.7 × 10⁹ selected tokens** (§3.15). 2048 was reported at ~0.92 for half the VRAM, on a different run and a different card, so the two are not comparable. Neither has been tested against the ~5.5 GiB now free on the card (§3.15e). |
+
+Added by the 2026-10-01 analysis (§3.18a, §3.19, §3.20, §3.15e):
+
+| Item | Status |
+|---|---|
+| Cause of the CUDA-graph capture invalidation at boot | **not established, and the traceback does not localise it** (§3.19). One occurrence in two attempts; no reduction; no fix. The detection frame is in the GDN linear-attention `out_proj`, which is *not* the host-resident path, so the obvious UVA hypothesis is unsupported by the only frame available. Reproduction attempts have not been made — the lane has stayed up and restarting it deliberately to chase this has a serving cost. |
+| How often the capture failure recurs | **n = 1 failure in 2 attempts, then ~13 h of uptime.** No rate can be quoted from that. A deliberate restart loop would be needed and has not been run. |
+| Whether the capture failure predates the host-KV cutover | **not checked.** It appeared on the first boot of the new build, which is suggestive and not evidence; the pre-cutover build's boots were not audited for the same assert. |
+| Whether host RAM can actually exhaust at pin time | **no measured instance** (see the row above). The arithmetic is in §3.18a; the event is not. |
+| Why weight-load time varied 130.67 s → 184.70 s on the same NVMe, same shards | **cause not established** (§3.18a). Page cache from the outgoing instance is the obvious candidate and was not instrumented. 1.41× spread, n = 2, so §3.18's 130.67 s should not be treated as repeatable. |
+| A controlled A/B of the concurrency curve across the two pool geometries | **not run** (§3.20). The two curves come from different boots, hours, pool sizes and client mixes. The −4.4 / −7.8 point per-stream shares at concurrency 2 / 3 on the host-KV build are a hypothesis with supporting evidence, not a measured factor. |
+| Whether the host-KV per-stream penalty is PCIe/UVA bandwidth sharing | **not established.** It is what a shared fetch path predicts, and the direction matches. Nothing isolates it from pool size, workload or context length. The instrument that would settle it is a paired same-boot run with `SGLANG_QSA_HOST_KV` toggled, which §3.15b's control did for latency but not for the concurrency curve. |
+| The host-KV concurrency-4 cell | **n = 21, p25 53.6 — not a rate** (§3.20). The lane's concurrency-4 time is almost entirely spent with a non-empty queue, so an uncontended concurrency-4 sample is rare on this workload. |
+| Single-stream host-KV decode, properly bounded | **one boot, 406 samples.** 158.2 median against a 167.5–178.6 pre-cutover range across six boots. The 0.71× figure is retracted (§3.20); "no regression" is **also** not supported. A same-boot toggle would settle it. |
+| Whether a larger `SGLANG_QSA_HOST_KV_CACHE_SETS` buys anything at 0.82 hit | **not measured** (§3.15e). ~5.5 GiB is free on the card and the cache uses 1.02 GiB, so the experiment is cheap; whether the 18 % of misses are capacity misses or first-touch misses is unknown, and only the first kind would respond. |
+| Residency-weighted hot-cache allocation instead of fair-share-per-slot | **not implemented, not tested** (§3.15e). Every request slot gets the same 16,384 tokens whether it lives for one turn or holds 500K. |
+| The lowest safe `--mem-fraction-static` **on the host-KV configuration** | **not bracketed, and the question has changed** (§3.15e). 0.97 was derived for an on-GPU pool where the fraction bought pool tokens; with `--max-total-tokens` set it no longer does, so a lower fraction would now cost no capacity and buy device headroom. The bracket was not re-attempted after the cutover. |
+| Whether the on-GPU compressed index and the GPU hot cache are two allocations or one | **cannot be distinguished from the boot log** (§3.15e). The two figures are bit-for-bit identical at this pool size and slot count by arithmetic coincidence, and the boot accounting shows only 0.91 GB for the step that would contain both. Needs a device-side allocation trace. |
