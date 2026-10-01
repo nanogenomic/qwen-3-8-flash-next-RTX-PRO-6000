@@ -491,7 +491,7 @@ No experiment here isolates that, and it should not be cited as the mechanism.
 | | |
 |---|---|
 | **Enabled by** | `SGLANG_QSA_HOST_KV=all` (or `target`). ⛔ **`--max-total-tokens` becomes mandatory.** |
-| **Also** | `SGLANG_QSA_HOST_KV_MAX_GB` (startup fail-fast), `SGLANG_QSA_HOST_KV_CACHE_SETS` (hot-cache size), `SGLANG_QSA_HOST_KV_STATS` |
+| **Also** | `SGLANG_QSA_HOST_KV_MAX_GB` (startup fail-fast), `SGLANG_QSA_HOST_KV_CACHE_SETS` (hot-cache size), `SGLANG_QSA_HOST_KV_STATS` — ⛔ leave it off: in this series its reporter thread can invalidate CUDA-graph capture at boot (BENCHMARKS §3.19); the fix is not yet in the series |
 | **Files** | `qsa/host_kv_cache.py` (new), `mem_cache/qsa_host_kv.py` (new), `model_executor/pool_configurator.py` (new), `qwen_sparse_attn_backend.py`, `mem_cache/kv_cache_configurator.py`, `mem_cache/qsa_kv_pool.py` |
 | **Patches** | `0033`, `0034`; tests in `0038` |
 | **Quality verdict** | decode-path equivalence **PASS** at concurrency 1 and 4 against the on-GPU arm, degeneracy PASS, prefix-cache integrity PASS. The composite verdict returns FAIL on a scope rule, not a measurement — [§3.15c](BENCHMARKS.md#315c-quality-gate-decode-path-lossless-composite-verdict-not-assembled). |
@@ -891,6 +891,11 @@ pins the flag. Related upstream issues referenced during this work: `#38290`, `#
 `#37111` (NaN router bias → repeated-token collapse under NEXTN), `#38851` (FP8-KV NEXTN
 accept length collapse), `#38319` / `#38355` (poisoned prefix cache), `#37326` (accept-length
 decay over uptime).
+
+A second configuration recommendation, also not a fix here: **`--mamba-max-states-per-path 2`**.
+The recurrent-state checkpoint path cap that BENCHMARKS §3.21 shows is decisive for two long
+agents on one card is upstream's flag and upstream's code. This fork contributes only the
+diagnosis, the measurements, and the recommendation to set it to 2.
 
 ---
 

@@ -1,5 +1,21 @@
 # DRAFT upstream report: nondeterministic `cudaErrorStreamCaptureInvalidated` during decode CUDA-graph capture
 
+> ⛔⛔ **RESOLVED — DO NOT FILE. This is not an upstream bug.** The cause is in this fork: the
+> host-KV hot cache's statistics thread (`SGLANG_QSA_HOST_KV_STATS=1`) issued a device-to-host copy
+> plus `synchronize()` every 30 s from a side thread, and under PyTorch's default
+> `capture_error_mode="global"` that invalidates any CUDA-graph capture in flight. Timing (a tick
+> due at 23:28:57; capture began 23:28:56 and died 23:28:58), incidence (the only capture
+> invalidation in the whole production log, and the reporter exists only with a host-resident
+> pool) and an out-of-engine reproduction (7 of 24 captures fail with that thread, 0 of 24 under
+> `"relaxed"`, without the thread, or with the fixed reporter) agree. Mitigation:
+> `SGLANG_QSA_HOST_KV_STATS=0`. The fix — counters published by the forward thread into a pinned
+> host mirror, reporter makes no CUDA call — is on a development branch and not yet in this patch
+> series. Full write-up: [BENCHMARKS §3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build).
+>
+> The original draft follows unchanged except for one correction (the "~13 h of uptime" figure),
+> because its ruled-out list is still right and its prior — *"the honest prior is that this is
+> ours"* — turned out to be correct.
+
 > ⛔ **THIS IS A DRAFT AND HAS NOT BEEN FILED.** It is published here so the evidence is on
 > record, not because it is ready. It describes **one occurrence**, has **no minimal
 > reproduction**, **no identified cause**, and **no fix**. Filing it as-is would be filing a
@@ -14,11 +30,11 @@
   fork's change set, running Qwen3.8-Flash-Next NVFP4 on one RTX PRO 6000 Blackwell Max-Q
   (SM120), PyTorch's bundled CUDA allocator.
 - **Symptom:** server exits during startup, 2 s into `Capture target verify CUDA graph`.
-- **Frequency:** **1 failure in 2 boot attempts**, then ~13 h of uptime on the same binary,
+- **Frequency:** **1 failure in 2 boot attempts**, then 2 h 38 min of uptime until a commanded restart (an earlier revision said "~13 h"; wrong) on the same binary,
   same flags, same model. Nondeterministic.
 - **Severity:** startup only; no observed effect on a server that reaches ready. Self-heals
   under a restart policy at ~5 min 44 s per failed attempt.
-- **Fix in this fork:** **none.**
+- **Fix in this fork:** **none** at the time of drafting. *(Now: mitigation `SGLANG_QSA_HOST_KV_STATS=0`; fix on a development branch — see the banner.)*
 
 ---
 
@@ -99,7 +115,7 @@ binary, flags and model. That pairing is most of the evidence.
 | **Host-RAM exhaustion / OOM killer** | `dmesg \| grep -ci "out of memory"` → **0**. Both host-KV pinning steps logged success (15.00 GiB and 1.25 GiB) three phases earlier, and both GPU hot caches allocated after them. The failed attempt's cgroup swap peak was **67.9 MiB**. |
 | **A misreported "202 GiB memory peak"** | systemd's cgroup peak for this unit is dominated by file-backed and shared pages: live breakdown while serving is `memory.current` 98.72 GiB, `file` 91.63 GiB, `shmem` 80.33 GiB, against `anon` 6.69 GiB and `unevictable` 0. Not an anonymous-allocation ceiling. |
 | **Start timeout** | The unit is `Type=simple`, so the 90 s start timeout is never armed against readiness. The boot that *succeeded* took 285 s. |
-| **A deterministic bug in the changed code** | It is not deterministic: 1 in 2, then ~13 h of uptime. |
+| **A deterministic bug in the changed code** | It is not deterministic: 1 in 2, then 2 h 38 min of uptime to a commanded restart. |
 | **FlashInfer autotune state** | Autotune completed normally on both boots (59 s failed / 61 s succeeded) and logged completion before capture began. Not excluded as a *contributor*, but it did not fail. |
 
 ## The one thing that changed

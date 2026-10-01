@@ -205,6 +205,14 @@ conversations you keep open between turns, and tell whoever runs the backend.** 
 evidence and the limits of the rule are in
 [If you run agents on this model](../README.md#if-you-run-agents-on-this-model-set---max-mamba-cache-size-first).
 
+**If two or more of those conversations are long (hundreds of thousands of tokens), slots are not
+enough on their own.** One deep cold prefill donates a checkpoint per 4,096-token chunk and can
+evict every other conversation's checkpoint regardless of slot count. The backend needs
+`--mamba-max-states-per-path 2`; see
+[the README](../README.md#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
+From the client side the symptom is a long agent whose turn reports `cached_tokens` near zero
+right after another lane's cold prefill — measure it, and tell whoever runs the backend.
+
 ## 7. Isolate test state from live state
 
 **Rule.** A client framework's own test suite must never be able to write a live allocation,

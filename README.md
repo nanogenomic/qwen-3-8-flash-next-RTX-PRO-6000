@@ -15,6 +15,11 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 > pin the old, aliasing layout for an A/B) and `SGLANG_QSA_SHARE_SCRATCH`, which defaults
 > to on and only changes *where* a buffer is allocated.
 
+> **Serving long context — 250K+ per agent, or several long agents on one card?** Start at
+> **[CONTEXT-PROFILES.md](CONTEXT-PROFILES.md)**: two copyable flag profiles (on-GPU KV, and a
+> host-RAM KV pool of 1.31M tokens), which one to pick, and what each costs in step time and in
+> delivered throughput. And add **`--mamba-max-states-per-path 2`** — [below](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
+
 ---
 
 ## Headline measured results
@@ -112,10 +117,42 @@ and the open gaps. No strict-mode (≤ 2-point) verdict was issued. The harness 
 The conc-4 WARN is a small but real divergence, which is why fp8 KV ships **labelled lossy
 and opt-in** rather than as a default.
 
+## Two or more long agents on one card: add `--mamba-max-states-per-path 2`
+
+**The most transferable finding in this repository, and the one with the largest effect on a
+real agent workload.** `[measured]` It is an upstream SGLang flag (default `-1`, unlimited); it
+costs no VRAM and needs no code from this fork.
+
+On a hybrid model a cached prefix is reusable only up to a saved recurrent-state checkpoint for
+the linear-attention layers, and under `--mamba-radix-cache-strategy extra_buffer_lazy` **every
+4,096-token prefill chunk donates one**. A cold 350K prefill therefore inserts ~86 checkpoints
+into a 36-slot pool and pushes out every other conversation's turn-boundary checkpoint. Their KV
+stays resident but unusable, the next turn re-prefills everything, and two long agents fall into
+a re-prefill ping-pong. Nothing errors. The cap keeps only the 2 deepest checkpoints per path.
+
+| | cap unlimited (production before) | `--mamba-max-states-per-path 2` |
+|---|---|---|
+| Two mains at 300K / 330K plus a cold subagent per round — controlled A/B on Modal, production replica | **0 / 10** turns cached, **31–37 s** per turn | **10 / 10** cached, **0.7–0.85 s** per turn |
+| Production card, cold deep-prefill arrivals per hour | 131 | **15** |
+| Production card, new prefill tokens per minute | 347K | **70K** |
+
+**Do not lower `--max-mamba-cache-size` to reclaim VRAM**: the logged `mamba usage` excludes
+checkpoints held by the cache, so the pool looks mostly empty when it is full (≤ 3 of 36 free in
+99.3 % of one-second samples before the cap). **Do not use cap 1**: an agent's next turn reuses
+the checkpoint at the previous prompt's end, which a cap of 1 frees.
+
+This is not specific to this model or this fork. It follows from how SGLang caches prefixes for
+any hybrid model with recurrent-state layers served through its mamba radix cache with per-chunk
+checkpointing; it was measured only here. Evidence:
+[BENCHMARKS §3.21](BENCHMARKS.md#321-the-mamba-checkpoint-path-cap--the-flag-that-makes-multi-lane-high-context-work).
+Speed and delivered-throughput consequences: [CONTEXT-PROFILES](CONTEXT-PROFILES.md).
+
 ## If you run agents on this model, set `--max-mamba-cache-size` first
 
-**This is the most useful single finding for anyone serving this model to agents, and it is
-invisible in every standard benchmark.** `[measured, second card — see note below]`
+**Together with the path cap above, this is the most useful finding for anyone serving this model
+to agents, and both are invisible in every standard benchmark.** `[measured, second card — see
+note below]` The two compose: slots keep 60–80K conversations warm between turns (this section);
+the cap stops one deep cold prefill from flushing them all (the section above).
 
 A multi-turn agent simulation: 6 conversations at 4 running requests, each re-sending its
 full, growing history every turn (starting at 60K tokens, adding 2–4K of real text plus its own
@@ -289,7 +326,8 @@ These are the conclusions of the suite, measured on the second card and read acr
 | `--mem-fraction-static` | **0.97**, not 0.98 | 0.98 left 287 MiB of device-free VRAM and died in prefill under a 14-deep queue; 0.97 leaves ~1.74 GB. Costs 71,616 pool tokens |
 | `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
 | Per-request window to advertise | **~400K (393,216)** on a shared card with an on-GPU pool; **two concurrent 250–300K mains** once the pool is host-resident | Where the pool binds. At 451,264 one ~400K request needs most of the pool, so gate it as exclusive use. At 1,310,720 it stops being the constraint — see below |
-| `--max-mamba-cache-size` | **36** at 4 running requests | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations |
+| `--max-mamba-cache-size` | **36** at 4 running requests — **do not lower it** | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations. The logged `mamba usage` makes it look over-provisioned; it is not |
+| `--mamba-max-states-per-path` | **2** whenever more than one long conversation shares the card | Two 300K+ mains: 0/10 → 10/10 turns cached, 31–37 s → 0.7–0.85 s per turn ([§3.21](BENCHMARKS.md#321-the-mamba-checkpoint-path-cap--the-flag-that-makes-multi-lane-high-context-work)). Upstream flag, no VRAM. Not 1 |
 | `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
 | `--enable-priority-scheduling` | only **if fan-out grows past 4** — and set `--default-priority-value` | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
 | `--max-queued-requests` | **64**, never unbounded | Unset is unbounded. That is how the 2026-09-30 OOM accumulated a 14-deep queue and ~1.49 M pending tokens. At 4 running requests, 64 is 16 batches of runway; over the cap the server returns an error, so the client sees backpressure instead of a silent multi-minute wait |
@@ -359,18 +397,23 @@ Three things to get right before you copy it:
   measured instance behind it.
 - **⛔ Set a restart policy before you cut over.** The first boot of the host-KV build died 2 s into
   CUDA-graph capture with `cudaErrorStreamCaptureInvalidated`; the next boot, 36 s later, same
-  binary and same flags, came up and stayed up. It is **nondeterministic — one failure in two
-  attempts**, cause not established, no fix in this tree. `Restart=always` with `RestartSec=30`
-  self-heals at a cost of ~5 min 44 s per failed attempt. A one-shot launcher would have left the
-  card dark. Details and the full set of ruled-out causes: [§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build).
+  binary and same flags, came up and stayed up. **The cause is now established and it is this
+  fork's**: the hot cache's statistics thread (`SGLANG_QSA_HOST_KV_STATS=1`) issued a
+  copy-plus-`synchronize()` every 30 s, and a tick landing inside graph capture invalidates it.
+  **Run with `SGLANG_QSA_HOST_KV_STATS=0`** until the fix (on a development branch) joins this
+  series. Keep the restart policy anyway: `Restart=always` with `RestartSec=30` self-heals at a
+  cost of ~5 min 44 s per failed attempt, and a one-shot launcher would have left the card dark.
+  Evidence: [§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build).
 - **The steady-state VRAM floor is 5.5–5.7 GiB, and ~1 GiB of it is the hot cache.** 8.23 GB is a
   *boot* figure and this repository has a section about why that matters. Two `nvidia-smi` readings
   while serving — 5,863 MiB at six minutes and **5,631 MiB at seventy** — against 1,737–1,739 MiB
   on the on-GPU configuration. Still not a soak (§3.13's figure is 2,406 samples over 13 h 22 min),
-  but the magnitude is no longer open. ⛔ **One consequence worth acting on: `--mem-fraction-static
-  0.97` was derived for an on-GPU pool, where lowering it cost context. With `--max-total-tokens`
-  set, it no longer does — so a lower fraction now buys device headroom for free.** Not yet
-  bracketed; see [§3.15e](BENCHMARKS.md#315e-two-open-opportunities-the-cutover-created-stated-as-opportunities).
+  but the magnitude is no longer open. **`--mem-fraction-static` has no effect in this mode**
+  `[measured, Modal]`: 0.94 and 0.97 boot identically, because `--max-total-tokens` fixes the pool.
+  (An earlier revision predicted a lower fraction would buy headroom; it buys nothing.) The lever
+  for spending the free memory is the hot cache: **16,384 sets** lift the target-layer hit
+  0.776 → 0.908 and cut step time 6–7 % for +3.05 GiB
+  ([§3.22](BENCHMARKS.md#322-what-high-context-costs-in-speed--per-step-versus-delivered)).
 - **⛔ `/v1/loads` reports the host pool under `memory.kv_cache_gb`.** On this configuration that
   field reads **15.938 GB and it is host RAM, not VRAM**. Any tool that sums `weight_gb +
   kv_cache_gb + graph_gb` to estimate device occupancy over-counts the card by ~16 GB.
@@ -400,8 +443,9 @@ series — not a second copy of all of SGLang. Concretely:
 ```
 README.md  CHANGES-vs-upstream.md  BENCHMARKS.md
 UPSTREAM-BUG-qsa-index-key-ring.md             a filable upstream correctness bug + its fix here
-UPSTREAM-BUG-cuda-graph-capture-invalidated.md ⛔ a DRAFT, unfiled: one nondeterministic boot
-                                               failure, no cause, no fix. Evidence on record only
+UPSTREAM-BUG-cuda-graph-capture-invalidated.md  NOT an upstream bug after all: cause found in this
+                                               fork's stats thread (§3.19). Kept as the record
+CONTEXT-PROFILES.md      high-context flag profiles and their measured speed costs
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 38 commits as a git-am-able series against the base commit
@@ -451,8 +495,9 @@ a runtime CUDA OOM and is not safe to copy — see
 slightly smaller KV pool than the benchmark tables show, and nothing else to differ.
 
 **For serving agents, use the [Recommended configuration](#recommended-configuration) instead** —
-it also sets `--context-length 540000` and `--max-mamba-cache-size 36`, and the reference
-deployment has since moved to it:
+it also sets `--context-length 540000`, `--max-mamba-cache-size 36` and
+`--mamba-max-states-per-path 2`, and the reference deployment has since moved to it. For complete
+copyable commands per context profile, see [CONTEXT-PROFILES.md](CONTEXT-PROFILES.md):
 
 ```bash
 export SGLANG_QWENOPT_FUSE_SBMOE=1     # 4-launch small-batch NVFP4 MoE, bitwise-identical
@@ -493,7 +538,7 @@ because `--max-total-tokens` is not optional here:
 export SGLANG_QSA_HOST_KV=all           # 'target' leaves the MTP draft layer's K/V on the GPU
 export SGLANG_QSA_HOST_KV_MAX_GB=24     # hard fail-fast at startup, not a soft limit
 export SGLANG_QSA_HOST_KV_CACHE_SETS=4096   # GPU hot cache: 4 tokens/set per (layer, slot)
-export SGLANG_QSA_HOST_KV_STATS=1
+export SGLANG_QSA_HOST_KV_STATS=0          # ⛔ =1 can invalidate CUDA-graph capture at boot (§3.19)
 export SGLANG_OOM_MAX_REQ_RETRACTIONS=3
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -506,8 +551,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 At `--max-total-tokens 1310720` and fp8 that reserves **16.25 GiB of pinned host RAM** and about
 **1.02 GiB of GPU** for the hot cache. Size the host budget before you raise the token count:
-pinned pages are neither swappable nor reclaimable, and this cutover was OOM-killed twice at boot
-on a 251 GiB host before it came up.
+pinned pages are neither swappable nor reclaimable. (An earlier revision said this cutover was
+OOM-killed twice at boot; that is retracted — see [§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build).)
+What the per-step tax of this mode is, and what it buys in delivered throughput:
+[CONTEXT-PROFILES §5](CONTEXT-PROFILES.md#5-speed-what-high-context-costs-and-which-number-to-look-at).
 
 Two notes on flags that are easy to get wrong:
 
@@ -1052,10 +1099,10 @@ Everything is off unless listed otherwise. Details and measured effects per leve
 
 | Variable / flag | Default | Effect |
 |---|---|---|
-| `SGLANG_QSA_HOST_KV` | off | `all` puts the 12 full-attention layers' **and** the MTP draft layer's K/V in pinned, UVA-mapped host RAM, leaving only the compressed index on the GPU. `target` leaves the draft layer on the card (costs ~2 GiB more VRAM at a 1.31M pool). ⛔ **Requires `--max-total-tokens`** — see [the host-KV section](#the-pool-is-no-longer-the-binding-constraint-host-resident-kv). |
+| `SGLANG_QSA_HOST_KV` | off | `all` puts the 12 full-attention layers' **and** the MTP draft layer's K/V in pinned, UVA-mapped host RAM, leaving only the compressed index on the GPU. `target` leaves the draft layer on the card: same hit rate and step time as `all`, 964 MiB less free VRAM at a 1.31M fp8 pool `[measured, Modal]` — not worth it. ⛔ **Requires `--max-total-tokens`** — see [the host-KV section](#the-pool-is-no-longer-the-binding-constraint-host-resident-kv). |
 | `SGLANG_QSA_HOST_KV_MAX_GB` | — | Hard startup fail-fast on the host allocation. At 24 it caps the pool at 2,097,152 fp8 tokens and dies with a named error rather than reaching the host OOM killer. Set it. |
-| `SGLANG_QSA_HOST_KV_CACHE_SETS` | — | GPU hot cache in front of the host pool: direct-mapped, 4 tokens per set, per (layer, request slot). 4,096 sets = 16,384 tokens per slot ≈ 1.02 GiB of GPU, measured **81 %** hit in steady decode (not the 97 % the first sample reports). 2,048 halves the VRAM at a reported ~92 % on another card. |
-| `SGLANG_QSA_HOST_KV_STATS=1` | off | Periodic hit-rate and host-bytes-per-token lines. Inert otherwise. |
+| `SGLANG_QSA_HOST_KV_CACHE_SETS` | — | GPU hot cache in front of the host pool: direct-mapped, 4 tokens per set, per (layer, request slot). 4,096 sets = 16,384 tokens per slot ≈ 1.02 GiB of GPU, measured **81 %** hit in steady decode (not the 97 % the first sample reports). 2,048 halves the VRAM at a reported ~92 % on another card. **16,384 sets** (4.06 GiB): hit 0.776 → 0.908 and step time −6 to −7 % against 4,096 in a same-card A/B on Modal ([§3.22](BENCHMARKS.md#322-what-high-context-costs-in-speed--per-step-versus-delivered)). |
+| `SGLANG_QSA_HOST_KV_STATS=1` | off | Periodic hit-rate and host-bytes-per-token lines. ⛔ **Leave it off in this tree**: its reporter thread can invalidate CUDA-graph capture at boot ([§3.19](BENCHMARKS.md#319-nondeterministic-cuda-graph-capture-failure-on-the-host-kv-build)); the fix is not yet in this series. |
 | `SGLANG_OOM_MAX_REQ_RETRACTIONS` | 3 | How many times one request may be retracted by the non-fatal-OOM path before it is failed instead of retried. EXTEND batches only; decode and driver-level OOMs stay fatal. |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | unset | Not ours. Recovers ~1.0 GiB of reserved-but-unallocated VRAM that showed up in the 900k OOM report. Relevant to every configuration in this repository, not just host KV. |
 
@@ -1085,6 +1132,7 @@ Not ours, listed because a result above needs them.
 | `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Required to boot with `--context-length` above the window SGLang derives from the checkpoint. Needed for the native-extrapolation result and for any YaRN configuration. |
 | `--kv-cache-dtype fp8_e4m3` | Opt-in lossy. **1.94× the KV pool** (279,680 → 542,912), and required to reach a pool that admits ~400k-token prompts. |
 | `--max-mamba-cache-size` **and** `--max-running-requests` | Set them **together**: 3 slots per running request means the slot count divided by 3 caps concurrency, whatever `--max-running-requests` says. For agent workloads set the slot count **higher** than 3 × running requests — the spare slots keep idle conversations' prefixes cacheable. See [If you run agents on this model](#if-you-run-agents-on-this-model-set---max-mamba-cache-size-first). |
+| `--mamba-max-states-per-path 2` | Default `-1` (unlimited). Keeps only the 2 deepest recurrent-state checkpoints per radix path, so one deep cold prefill cannot evict every other conversation's checkpoint. **Required for more than one long conversation per card** — see [above](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2). Not 1. |
 | `--context-length` | Declaring a larger window **costs pool** (measured: 542,912 tokens at 262k vs 519,040 at 540k), so do not advertise a window you do not intend to serve. |
 
 ### Build helpers (optional levers only)
