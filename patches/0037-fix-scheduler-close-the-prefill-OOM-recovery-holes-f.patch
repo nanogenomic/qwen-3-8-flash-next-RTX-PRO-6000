@@ -1,0 +1,286 @@
+From 6201a7f615be61104036089769d2e095020d2c49 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 20:27:48 +0000
+Subject: [PATCH 37/38] fix(scheduler): close the prefill-OOM recovery holes
+ found in review
+
+Hardens 611a3af1d6 before any test ran:
+
+- Drain is DEVICE-wide (device_module.synchronize), not forward_stream only.
+  The torn forward also has work on side streams (PLE prefetch gather, the
+  draft plan stream, copy_stream); a per-stream drain left those free to write
+  into pages this method then frees.
+- Reset cross-layer model state left by the torn forward. Qwen4ExpPLELayer
+  arms layers[i+1]._prefetch_state before layer i runs; an OOM in layer i left
+  it set, so the NEXT eager prefill would raise "PLE prefetch state was not
+  consumed before reuse" and SIGQUIT the lane later, misattributed. New
+  opt-in hook reset_aborted_forward_state(), called on target and draft models.
+- Scope guard: single rank only (tp=pp=1, no DP-attention/MLP sync, no
+  disaggregation, no hisparse/pdmux/dllm) and only ForwardMode.EXTEND. With TP
+  peers, one rank swallowing an OOM while the others enter a collective is a
+  hang. The old is_extend() check also admitted MIXED and TARGET_VERIFY.
+- Livelock cap counts prefill OOMs per request (prefill_oom_count), not
+  retraction_count, which also counts KV-pressure decode retractions.
+- Requests already finished/aborted (incl. a pending chunked abort) are
+  released and answered with their abort instead of being requeued and
+  resurrected; decode_offload_manager is drained like other retract paths.
+---
+ python/sglang/srt/managers/scheduler.py | 175 +++++++++++++++++-------
+ python/sglang/srt/models/qwen4_exp.py   |   9 ++
+ 2 files changed, 132 insertions(+), 52 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 2797cb5..ceec2a8 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -2003,8 +2003,6 @@ class Scheduler(
+                 try:
+                     batch_result = self.run_batch(batch)
+                 except torch.OutOfMemoryError:
+-                    if not batch.forward_mode.is_extend():
+-                        raise
+                     if not self._drop_prefill_batch_on_oom(batch):
+                         raise
+                     continue
+@@ -4312,36 +4310,92 @@ class Scheduler(
+         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+ 
++    def _prefill_oom_recovery_supported(self, batch: ScheduleBatch) -> bool:
++        """Only the configuration the recovery was validated on.
++
++        Single rank only: with TP/PP/DP-attention peers, one rank swallowing an
++        OOM while the others enter the next collective is a hang, which is worse
++        than the crash. Only a pure EXTEND batch (no decode peers mixed in).
++        """
++        from sglang.srt.model_executor.forward_batch_info import ForwardMode
++
++        par = get_parallel()
++        return (
++            self.enable_overlap
++            and batch.forward_mode == ForwardMode.EXTEND
++            and par.tp_size == 1
++            and par.pp_size == 1
++            and not self.require_mlp_sync
++            and self.disaggregation_mode == DisaggregationMode.NULL
++            and not self.enable_hisparse
++            and not self.enable_pdmux
++            and getattr(self, "dllm_config", None) is None
++        )
++
++    def _reset_aborted_forward_model_state(self) -> None:
++        """Clear per-forward module state a torn forward left behind.
++
++        A forward that raised mid-model can leave cross-layer state set, e.g. the
++        Qwen4 PLE layer's _prefetch_state, which layer i arms for layer i+1. Left
++        stale, the NEXT eager forward either raises "PLE prefetch state was not
++        consumed before reuse" (the lane dies later, misattributed) or consumes the
++        aborted batch's embeddings. Modules opt in via reset_aborted_forward_state().
++        """
++        runners = [self.tp_worker.model_runner]
++        draft = getattr(self.model_worker, "_draft_worker", None)
++        draft_runner = getattr(draft, "draft_runner", None)
++        if draft_runner is not None:
++            runners.append(draft_runner)
++        for runner in runners:
++            model = getattr(runner, "model", None)
++            if model is None:
++                continue
++            for module in model.modules():
++                reset = getattr(module, "reset_aborted_forward_state", None)
++                if reset is not None:
++                    reset()
++
+     def _drop_prefill_batch_on_oom(self, batch: ScheduleBatch) -> bool:
+         """Release a prefill batch whose forward OOM'd, and requeue its requests.
+ 
+         Returns False to decline recovery, in which case the caller re-raises and
+         the lane dies as before. Declining is always the safe answer.
+ 
+-        ⛔ THE ORDER OF THE FIRST TWO STEPS IS THE WHOLE SAFETY ARGUMENT. The
+-        exception skipped _apply_war_barrier(), so earlier layers' kernels are
+-        still enqueued on forward_stream and still READ req_to_token and the KV
+-        pages this method is about to free, while the scheduler's own writes run
+-        on schedule_stream. Freeing before draining hands live pages to the next
+-        allocation and corrupts a healthy peer's output instead of dropping one
+-        request -- a silent wrong answer in place of a loud crash, which is worse
+-        than the bug being fixed.
++        ⛔ THE ORDER OF THE FIRST STEP IS THE WHOLE SAFETY ARGUMENT. The exception
++        skipped _apply_war_barrier(), so kernels of the torn forward (and of the
++        previous overlapped batch) are still enqueued -- on forward_stream, but
++        also on side streams (PLE prefetch, draft plan stream, copy_stream) -- and
++        still READ req_to_token and WRITE the KV pages / mamba slots this method is
++        about to free. Freeing before they finish hands live pages to the next
++        allocation, and a late write from the dead forward then corrupts a healthy
++        peer's KV: a silent wrong answer in place of a loud crash, which is worse
++        than the bug being fixed. So the drain is DEVICE-wide, not per-stream, and
++        a failed drain declines recovery.
+         """
+-        # 1. Drain the aborted forward before touching anything it may read.
++        if not self._prefill_oom_recovery_supported(batch):
++            return False
++
++        # 1. Drain EVERY stream on the device before touching anything the torn
++        #    forward may still read or write. A sticky CUDA error surfaces here.
+         try:
+-            self.forward_stream.synchronize()
++            self.device_module.synchronize()
+         except Exception:
+-            logger.exception("Prefill OOM: could not drain forward_stream; "
+-                             "declining recovery so the lane fails loudly.")
++            logger.exception(
++                "Prefill OOM: device drain failed; declining recovery so the "
++                "lane fails loudly."
++            )
+             return False
+         runner = getattr(self.model_worker, "last_shared_read_runner", None)
+         if runner is not None:
+             runner.shared_read_done_event = None
+         self.schedule_stream.wait_stream(self.forward_stream)
++        self._reset_aborted_forward_model_state()
+ 
+-        # 2. run_batch never appended this batch's result, so result_queue and
+-        #    last_batch would drift apart: pop_and_process() pops one entry
+-        #    whenever last_batch is set. Drain the previous entry and clear.
++        # 2. run_batch never appended this batch's result. Process the previous
++        #    batch's pending result now (pop_and_process would otherwise pop the
++        #    wrong entry next iteration) and clear last_batch. Clearing is correct:
++        #    get_next_batch_to_run already merged last_batch into running_batch
++        #    when it built this prefill batch.
+         if self.last_batch is not None and self.result_queue:
+             tmp_batch, tmp_result = self.result_queue.popleft()
+             self.process_batch_result(tmp_batch, tmp_result)
+@@ -4349,30 +4403,52 @@ class Scheduler(
+         self.cur_batch_for_debug = None
+ 
+         # 3. A request whose context can never fit would otherwise re-admit and
+-        #    re-OOM forever: no progress, no crash, no alert. Cap it.
+-        max_retractions = envs.SGLANG_OOM_MAX_REQ_RETRACTIONS.get()
+-        reqs, doomed = [], []
+-        for req in batch.reqs:
++        #    re-OOM forever: no progress, no crash, no alert. Cap it. The count is
++        #    per request and counts prefill OOMs only (retraction_count also
++        #    counts KV-pressure decode retractions).
++        max_ooms = envs.SGLANG_OOM_MAX_REQ_RETRACTIONS.get()
++        pending_abort = self._pending_chunked_abort_req
++        reqs, doomed = list(batch.reqs), {}
++        for req in reqs:
++            req.prefill_oom_count = getattr(req, "prefill_oom_count", 0) + 1
+             if req.finished():
+-                continue
+-            reqs.append(req)
+-            if req.retraction_count >= max_retractions:
+-                doomed.append(req)
++                reason = req.finished_reason
++                doomed[req] = (
++                    reason.to_json()
++                    if isinstance(reason, FINISH_ABORT)
++                    else FINISH_ABORT().to_json()
++                )
++            elif req is pending_abort or isinstance(req.to_finish, FINISH_ABORT):
++                doomed[req] = (
++                    req.to_finish.to_json()
++                    if isinstance(req.to_finish, FINISH_ABORT)
++                    else FINISH_ABORT().to_json()
++                )
++            elif req.prefill_oom_count >= max_ooms:
++                doomed[req] = FINISH_ABORT(
++                    "Prefill ran out of device memory "
++                    f"{req.prefill_oom_count} times; giving up on this request "
++                    "rather than wedging the lane.",
++                    HTTPStatus.SERVICE_UNAVAILABLE,
++                ).to_json()
++        if pending_abort is not None and pending_abort in doomed:
++            self._pending_chunked_abort_req = None
+ 
+         # 4. Release KV pages, the req_to_token slot, the mamba/GDN state slot,
+         #    the radix lock ref and inflight_middle_chunks. retract_all ->
+         #    release_req -> release_kv_cache + reset_for_retract covers all five;
+         #    this is the same teardown pause_generation(mode="retract") uses.
+-        if reqs:
+-            retract_all(
+-                reqs=reqs,
+-                req_to_token_pool=self.req_to_token_pool,
+-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+-                tree_cache=self.tree_cache,
+-                hisparse_coordinator=self.hisparse_coordinator,
+-                offload_kv=False,
+-            )
+-        if self.chunked_req is not None and self.chunked_req in batch.reqs:
++        if self.decode_offload_manager is not None:
++            self.decode_offload_manager.drain_before_retraction()
++        retract_all(
++            reqs=reqs,
++            req_to_token_pool=self.req_to_token_pool,
++            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++            tree_cache=self.tree_cache,
++            hisparse_coordinator=self.hisparse_coordinator,
++            offload_kv=False,
++        )
++        if self.chunked_req is not None and self.chunked_req in reqs:
+             self.chunked_req = None
+         self.running_batch.batch_is_full = False
+ 
+@@ -4384,30 +4460,25 @@ class Scheduler(
+         except Exception:
+             logger.debug("Prefill OOM: empty_cache failed", exc_info=True)
+ 
+-        for req in doomed:
++        for req, reason in doomed.items():
+             self.ipc_channels.send_to_tokenizer.send_output(
+-                _make_abort_req(
+-                    req,
+-                    finished_reason={
+-                        "type": "abort",
+-                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+-                        "message": (
+-                            "Prefill ran out of device memory "
+-                            f"{req.retraction_count} times; giving up on this "
+-                            "request rather than wedging the lane."
+-                        ),
+-                    },
+-                ),
+-                req,
++                _make_abort_req(req, finished_reason=reason), req
+             )
+         for req in reqs:
+             if req not in doomed:
+                 self._add_request_to_queue(req, is_retracted=True)
+ 
++        self.num_prefill_oom_recoveries = (
++            getattr(self, "num_prefill_oom_recoveries", 0) + 1
++        )
+         logger.error(
+-            "Prefill OOM recovered: batch of %d req(s) dropped, %d aborted, "
+-            "%d requeued. The lane stayed up.",
+-            len(batch.reqs), len(doomed), len(reqs) - len(doomed),
++            "Prefill OOM recovered (#%d): batch of %d req(s) dropped, %d aborted, "
++            "%d requeued; rids=%s. The lane stayed up.",
++            self.num_prefill_oom_recoveries,
++            len(reqs),
++            len(doomed),
++            len(reqs) - len(doomed),
++            [r.rid for r in reqs][:8],
+         )
+         return True
+ 
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 494b832..b471859 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -1074,6 +1074,15 @@ class Qwen4ExpPLELayer(nn.Module):
+         self._eager_prefetch_buffer = None
+         self._prefetch_state = None
+ 
++    def reset_aborted_forward_state(self) -> None:
++        """Drop a prefetch armed by a forward that raised before consuming it.
++
++        Called by the scheduler after a recovered prefill OOM, once the device is
++        drained. Without it the next eager forward raises "PLE
++        prefetch state was not consumed before reuse" at this layer.
++        """
++        self._prefetch_state = None
++
+     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+         y = norm(x.flatten(-2, -1))
+         return y.unflatten(-1, (self.hc_count, self.hidden_size))

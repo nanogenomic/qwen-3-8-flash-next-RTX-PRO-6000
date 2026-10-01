@@ -1936,6 +1936,10 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+            from sglang.srt.mem_cache.qsa_host_kv import qsa_host_kv_enabled
+
+            if qsa_host_kv_enabled(self.is_draft_worker):
+                extra_args["qsa_host_kv"] = True
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,

@@ -1,0 +1,238 @@
+From 52f56dda571f8b9e0b202db6399ba3fbf2c679a3 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 20:24:46 +0000
+Subject: [PATCH 35/38] fix(qsa): chunk-prefill reads K/V from the pool instead
+ of gathering the whole context
+
+forward_extend's prefixed (chunked-prefill) path index_select'ed and torch.cat'ed the
+FULL sequence K and V of every request, per full-attention layer, per prefill chunk:
+4 x seq_len x 512 B transient at fp8 (746.7 MiB at 382K, 1024 MiB at 512K; 2x at bf16).
+Peak non-pool VRAM therefore scaled with context, not --chunked-prefill-size, and the
+2026-09-30 16:44:17 GPU0 lane death OOM'd in exactly this torch.cat (:1470).
+
+Now the top-k logical positions are mapped to pool slots by a small Triton kernel
+(qsa_logical_to_pool_slots_triton) and the unchanged chunk-prefill kernel runs with
+cu_k = 0 against the per-layer pool buffer. It loads the same bytes in the same order,
+so the output is bit-identical (verified on RTX PRO 6000 at 64K..512K, fp8 and bf16,
+mixed batches, -1-padded rows). Transient is the [rows, topk] slot table: 32 MiB at
+chunk 4096, independent of context; the kernel is also 1.1-1.6x faster (no gather).
+Slots are emitted as int64 once pool_rows x row_stride >= 2**31 (the kernel computes
+slot * stride in the index dtype).
+
+Host-resident (SGLANG_QSA_HOST_KV, UVA) pools are detected via pool.qsa_host_kv and
+stage only the UNION of selected rows onto the GPU first: reading UVA in place is
+~30x slower, and the union is never larger than the old full-context gather.
+---
+ .../srt/layers/attention/qsa/sparse_attn.py   | 77 +++++++++++++++++
+ .../attention/qwen_sparse_attn_backend.py     | 82 +++++++++++++------
+ 2 files changed, 136 insertions(+), 23 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/sparse_attn.py b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
+index a52c1e5..9f001b6 100644
+--- a/python/sglang/srt/layers/attention/qsa/sparse_attn.py
++++ b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
+@@ -316,6 +316,82 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
+     return out
+ 
+ 
++@triton.jit
++def _logical_to_pool_slots(
++    indices,
++    out,
++    req_to_token,
++    req_indices,
++    cu_q,
++    kv_lens,
++    topk,
++    si_m,
++    so_m,
++    req_stride,
++    BLOCK_T: tl.constexpr,
++):
++    query_relative = tl.program_id(0)
++    batch = tl.program_id(1)
++    q_start = tl.load(cu_q + batch)
++    q_end = tl.load(cu_q + batch + 1)
++    query = (q_start + query_relative).to(tl.int64)
++    if query >= q_end:
++        return
++    req = tl.load(req_indices + batch).to(tl.int64)
++    length = tl.load(kv_lens + batch)
++    cols = tl.program_id(2) * BLOCK_T + tl.arange(0, BLOCK_T)
++    in_row = cols < topk
++    positions = tl.load(indices + query * si_m + cols, mask=in_row, other=-1)
++    valid = (positions >= 0) & (positions < length)
++    slots = tl.load(
++        req_to_token + req * req_stride + tl.where(valid, positions, 0),
++        mask=valid,
++        other=0,
++    )
++    slots = tl.where(valid, slots, -1)
++    tl.store(out + query * so_m + cols, slots.to(out.dtype.element_ty), mask=in_row)
++
++
++def qsa_logical_to_pool_slots_triton(
++    indices, req_to_token, req_indices, cu_q, kv_lens, max_q, wide=False
++):
++    """Map chunk-prefill top-k LOGICAL positions to KV-pool slots.
++
++    ``indices`` is ``[total_q, topk]``: row ``r`` of request ``b`` holds positions in
++    ``[0, kv_lens[b])`` (``-1`` = unused). The result has the same shape and holds
++    ``req_to_token[req_indices[b], pos]`` for every valid position and ``-1`` for the
++    rest, so ``sparse_gqa_fwd_interface_triton_ck`` can read K/V straight out of the
++    pool (``cu_k`` all zero) instead of from a gathered copy of the whole context.
++    ``wide`` emits int64 slots: the kernel computes ``slot * k.stride(0)`` in the
++    index dtype, which overflows int32 once the pool passes ``2**31 / stride`` rows.
++    """
++    total_q, topk = indices.shape
++    out = torch.empty(
++        (total_q, topk),
++        dtype=torch.int64 if wide else torch.int32,
++        device=indices.device,
++    )
++    block_t = min(1024, triton.next_power_of_2(topk))
++    batch = cu_q.shape[0] - 1
++    if total_q == 0 or batch == 0:
++        return out
++    _logical_to_pool_slots[(max_q, batch, triton.cdiv(topk, block_t))](
++        indices,
++        out,
++        req_to_token,
++        req_indices,
++        cu_q,
++        kv_lens,
++        topk,
++        indices.stride(0),
++        out.stride(0),
++        req_to_token.stride(0),
++        BLOCK_T=block_t,
++        num_warps=4,
++    )
++    return out
++
++
+ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+     """Run one packed sparse-attention row per request without a host sync.
+ 
+@@ -568,6 +644,7 @@ __all__ = [
+     "qwen_sparse_fa2_cu_seqlens_triton",
+     "qwen_sparse_valid_counts_triton",
+     "qwen_sparse_kv_extraction_compact_triton",
++    "qsa_logical_to_pool_slots_triton",
+     "sparse_gqa_fwd_interface_triton",
+     "sparse_gqa_fwd_interface_triton_ck",
+     "sparse_gqa_packed_decode_triton",
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index dacaab9..a1b14e3 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.qsa.shared_scratch import (
+     qsa_trtllm_workspace,
+ )
+ from sglang.srt.layers.attention.qsa.sparse_attn import (
++    qsa_logical_to_pool_slots_triton,
+     qwen_sparse_fa2_cu_seqlens_triton,
+     qwen_sparse_kv_extraction_compact_triton,
+     qwen_sparse_valid_counts_triton,
+@@ -1555,43 +1556,78 @@ class QwenSparseAttnBackend(AttentionBackend):
+             )
+             return self._pad_extend_output(output, num_output_rows)
+ 
+-        # The validated chunk-prefill kernel consumes tightly packed full-context
+-        # K/V. Current-chunk K/V has already been committed to the cache above.
++        # Read K/V straight out of the pool: the top-k logical positions are mapped
++        # to pool slots (a [rows, topk] integer table, bounded by the chunk) and the
++        # chunk-prefill kernel runs with cu_k = 0 against the whole per-layer buffer.
++        # It loads exactly the bytes a gathered copy would hold, in the same order,
++        # so the output is bit-identical. Gathering the full context instead cost
++        # 2 x seq_len x (K + V row bytes) of transient VRAM per full-attention layer
++        # per chunk, which scaled with context, not --chunked-prefill-size, and is
++        # where the 2026-09-30 GPU0 OOM died.
++        # Current-chunk K/V has already been committed to the cache above.
+         pool = self.token_to_kv_pool
+         k_buffer = pool.get_key_buffer(layer.layer_id)
+         v_buffer = pool.get_value_buffer(layer.layer_id)
+-        req_to_token = self.req_to_token_pool.req_to_token
+-        req_indices = forward_batch.req_pool_indices.tolist()
+-        k_parts = [
+-            k_buffer.index_select(
+-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+-            )
+-            for i in range(len(sequence_lens))
+-        ]
+-        v_parts = [
+-            v_buffer.index_select(
+-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+-            )
+-            for i in range(len(sequence_lens))
+-        ]
+         sequence_lens_tensor = torch.tensor(
+             sequence_lens, dtype=torch.int32, device=q.device
+         )
+-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+-        # One sequence (the long-context case) needs no concatenation copy: at 1M
+-        # tokens that copy is another 1 GiB per K and per V.
++        wide = max(
++            k_buffer.shape[0] * k_buffer.stride(0),
++            v_buffer.shape[0] * v_buffer.stride(0),
++        ) >= (1 << 31)
++        pool_slots = qsa_logical_to_pool_slots_triton(
++            topk_indices,
++            self.req_to_token_pool.req_to_token,
++            forward_batch.req_pool_indices,
++            cu_seqlens_q,
++            sequence_lens_tensor,
++            max(extend_lens),
++            wide=wide,
++        )
++        if getattr(pool, "qsa_host_kv", False):
++            k_buffer, v_buffer, pool_slots = self._stage_selected_kv_rows(
++                k_buffer, v_buffer, pool_slots
++            )
+         output = sparse_gqa_fwd_interface_triton_ck(
+             q.contiguous(),
+-            k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts),
+-            v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts),
+-            topk_indices,
++            k_buffer,
++            v_buffer,
++            pool_slots,
+             cu_seqlens_q,
+-            cu_seqlens_k,
++            torch.zeros_like(cu_seqlens_q),
+             sequence_lens_tensor,
+             layer.scaling,
+         )
+         return self._pad_extend_output(output, num_output_rows)
+ 
++    @staticmethod
++    def _stage_selected_kv_rows(k_buffer, v_buffer, pool_slots):
++        """Copy only the UNION of the selected pool rows into compact GPU buffers.
++
++        For a host-resident (UVA, SGLANG_QSA_HOST_KV) pool, reading it in place
++        costs one PCIe round per (query row, KV group, top-k column), ~30x slower
++        than staging. The union is at most min(context, rows x topk) rows, so the
++        staged copy is never larger than the old full-context gather; the other
++        transients are the [rows, topk] tables and 8 bytes per pool row. Slots are
++        renumbered into the compact buffers; the kernel reads the same bytes in the
++        same order, so the output stays bit-identical.
++        """
++        flat = pool_slots.reshape(-1)
++        sink = (flat + 1).long()  # -1 (unused) lands on row 0, a sink
++        mark = torch.zeros(k_buffer.shape[0] + 1, dtype=torch.int32, device=flat.device)
++        mark.index_fill_(0, sink, 1)
++        mark[0] = 0
++        rows = torch.nonzero(mark[1:]).squeeze(1)
++        rank = torch.cumsum(mark, 0, dtype=torch.int32) - 1
++        compact = torch.where(
++            flat >= 0, rank.index_select(0, sink), torch.full_like(rank[:1], -1)
++        )
++        return (
++            k_buffer.index_select(0, rows),
++            v_buffer.index_select(0, rows),
++            compact.view(pool_slots.shape),
++        )
++
+     @staticmethod
+     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
+         output = output.reshape(output.shape[0], -1)

@@ -31,3 +31,9 @@ patch	development_sha	subject
 0030-fix-qsa-reservation-covered-by-an-existing-shared-bu.patch	486b099529	fix(qsa): reservation covered by an existing shared buffer is idempotent
 0031-fix-qsa-regrow-the-shared-scratch-if-autotune-alloca.patch	436fa5cf69	fix(qsa): regrow the shared scratch if autotune allocated it undersized before capture
 0032-feat-spec-ship-the-adaptive-speculation-tier-configs.patch	-	feat(spec): ship the adaptive-speculation tier configs in-tree
+0033-feat-qsa-host-resident-full-attention-K-V-UVA-zero-c.patch	c17068d2e5	feat(qsa): host-resident full-attention K/V (UVA zero-copy) + GPU hot cache
+0034-fix-qsa-host-KV-hot-cache-margin-follows-the-specula.patch	dacacd8a13	fix(qsa): host-KV hot-cache margin follows the speculative window (wide verify)
+0035-fix-qsa-chunk-prefill-reads-K-V-from-the-pool-instea.patch	13b7f3ff84	fix(qsa): chunk-prefill reads K/V from the pool instead of gathering the whole context
+0036-feat-scheduler-survive-a-prefill-CUDA-OOM-instead-of.patch	b4176cf086	feat(scheduler): survive a prefill CUDA OOM instead of killing the lane
+0037-fix-scheduler-close-the-prefill-OOM-recovery-holes-f.patch	0a6519021b	fix(scheduler): close the prefill-OOM recovery holes found in review
+0038-test-qsa-host-resident-K-V-and-GPU-hot-cache-correct.patch	-	test(qsa): host-resident K/V and GPU hot-cache correctness tests

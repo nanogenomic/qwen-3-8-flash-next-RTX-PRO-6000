@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.qsa.shared_scratch import (
     qsa_trtllm_workspace,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qsa_logical_to_pool_slots_triton,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -241,6 +242,110 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._share_scratch = qsa_scratch_sharing_enabled()
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._host_kv_cache = self._init_host_kv_cache()
+
+    def _init_host_kv_cache(self):
+        """GPU hot cache in front of a host-resident K/V pool (qsa_host_kv.py).
+
+        Shared through the pool object, so the per-step draft backends of one
+        draft pool reuse a single cache. None when the pool is GPU-resident.
+        """
+        pool = self.token_to_kv_pool
+        if pool is None or not getattr(pool, "qsa_host_kv", False):
+            return None
+        cache = getattr(pool, "_qsa_host_kv_cache", None)
+        if cache is not None:
+            return cache
+        import os
+
+        from sglang.srt.layers.attention.qsa.host_kv_cache import (
+            QSAHostKVCache,
+            host_kv_cache_sets,
+        )
+
+        sets = host_kv_cache_sets()
+        if sets <= 0 or self.req_to_token is None:
+            pool._qsa_host_kv_cache = None
+            return None
+        full_pool = pool.full_kv_pool
+        cache = QSAHostKVCache(
+            num_layers=pool.full_layer_nums,
+            num_req_slots=int(self.req_to_token.shape[0]),
+            heads=full_pool.head_num,
+            dim=full_pool.head_dim,
+            dtype=full_pool.dtype,
+            ratio=self.compress_ratio,
+            num_sets=sets,
+            margin=self._host_kv_cache_margin(),
+            device=self.device,
+        )
+        pool._qsa_host_kv_cache = cache
+        return cache
+
+    def _host_kv_cache_margin(self) -> int:
+        """Tokens behind the row end that are never cached: must exceed the widest
+        speculative window (wide verify raises it above 4), since those positions
+        are rewritten by later steps. 4x the draft window, at least 16."""
+        import os
+
+        env = os.environ.get("SGLANG_QSA_HOST_KV_CACHE_MARGIN")
+        if env is not None:
+            return int(env)
+        try:
+            from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+
+            draft = int(max_speculative_num_draft_tokens() or 0)
+        except Exception:
+            draft = 0
+        return max(16, 4 * draft + self.compress_ratio)
+
+    def _gather_selected_kv(
+        self,
+        layer,
+        k_buffer,
+        v_buffer,
+        req_indices,
+        topk_indices,
+        sequence_lens,
+        cu,
+        packed_k,
+        packed_v,
+        batch,
+        topk,
+        zero_fill_cols: int = 0,
+    ) -> None:
+        cache = self._host_kv_cache
+        if cache is None:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                req_indices,
+                topk_indices,
+                sequence_lens,
+                cu,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                zero_fill_cols=zero_fill_cols,
+            )
+            return
+        cache.gather(
+            self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id),
+            k_buffer,
+            v_buffer,
+            self.req_to_token_pool.req_to_token,
+            req_indices,
+            topk_indices,
+            sequence_lens,
+            cu,
+            packed_k,
+            packed_v,
+            batch,
+            topk,
+            zero_fill_cols=zero_fill_cols,
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1407,6 +1512,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
+        if self._host_kv_cache is not None and q.is_cuda:
+            # A real EXTEND (new request, prefill chunk, re-prefill after
+            # retraction) is the only way a request slot starts or restarts, so
+            # dropping its cached groups here keeps a reused slot from ever
+            # hitting another request's K/V.
+            self._host_kv_cache.invalidate(
+                self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id),
+                forward_batch.req_pool_indices,
+            )
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -1442,40 +1556,77 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        # The validated chunk-prefill kernel consumes tightly packed full-context
-        # K/V. Current-chunk K/V has already been committed to the cache above.
+        # Read K/V straight out of the pool: the top-k logical positions are mapped
+        # to pool slots (a [rows, topk] integer table, bounded by the chunk) and the
+        # chunk-prefill kernel runs with cu_k = 0 against the whole per-layer buffer.
+        # It loads exactly the bytes a gathered copy would hold, in the same order,
+        # so the output is bit-identical. Gathering the full context instead cost
+        # 2 x seq_len x (K + V row bytes) of transient VRAM per full-attention layer
+        # per chunk, which scaled with context, not --chunked-prefill-size, and is
+        # where the 2026-09-30 GPU0 OOM died.
+        # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        wide = max(
+            k_buffer.shape[0] * k_buffer.stride(0),
+            v_buffer.shape[0] * v_buffer.stride(0),
+        ) >= (1 << 31)
+        pool_slots = qsa_logical_to_pool_slots_triton(
+            topk_indices,
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            cu_seqlens_q,
+            sequence_lens_tensor,
+            max(extend_lens),
+            wide=wide,
+        )
+        if getattr(pool, "qsa_host_kv", False):
+            k_buffer, v_buffer, pool_slots = self._stage_selected_kv_rows(
+                k_buffer, v_buffer, pool_slots
+            )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
-            topk_indices,
+            k_buffer,
+            v_buffer,
+            pool_slots,
             cu_seqlens_q,
-            cu_seqlens_k,
+            torch.zeros_like(cu_seqlens_q),
             sequence_lens_tensor,
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    @staticmethod
+    def _stage_selected_kv_rows(k_buffer, v_buffer, pool_slots):
+        """Copy only the UNION of the selected pool rows into compact GPU buffers.
+
+        For a host-resident (UVA, SGLANG_QSA_HOST_KV) pool, reading it in place
+        costs one PCIe round per (query row, KV group, top-k column), ~30x slower
+        than staging. The union is at most min(context, rows x topk) rows, so the
+        staged copy is never larger than the old full-context gather; the other
+        transients are the [rows, topk] tables and 8 bytes per pool row. Slots are
+        renumbered into the compact buffers; the kernel reads the same bytes in the
+        same order, so the output stays bit-identical.
+        """
+        flat = pool_slots.reshape(-1)
+        sink = (flat + 1).long()  # -1 (unused) lands on row 0, a sink
+        mark = torch.zeros(k_buffer.shape[0] + 1, dtype=torch.int32, device=flat.device)
+        mark.index_fill_(0, sink, 1)
+        mark[0] = 0
+        rows = torch.nonzero(mark[1:]).squeeze(1)
+        rank = torch.cumsum(mark, 0, dtype=torch.int32) - 1
+        compact = torch.where(
+            flat >= 0, rank.index_select(0, sink), torch.full_like(rank[:1], -1)
+        )
+        return (
+            k_buffer.index_select(0, rows),
+            v_buffer.index_select(0, rows),
+            compact.view(pool_slots.shape),
+        )
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
@@ -1581,10 +1732,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
+        self._gather_selected_kv(
+            layer,
             k_buffer,
             v_buffer,
-            self.req_to_token_pool.req_to_token,
             (
                 metadata.row_req_pool_indices
                 if metadata.row_req_pool_indices is not None
@@ -1714,10 +1865,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
+        self._gather_selected_kv(
+            layer,
             k_buffer,
             v_buffer,
-            self.req_to_token_pool.req_to_token,
             (
                 metadata.row_req_pool_indices
                 if metadata.row_req_pool_indices is not None

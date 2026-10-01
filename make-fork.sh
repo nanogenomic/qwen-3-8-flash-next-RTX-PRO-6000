@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the full fork locally: upstream SGLang at the pinned base commit, plus this
-# repository's 32 commits on top, so `git diff` and `git rebase` work natively.
+# repository's 38 commits on top, so `git diff` and `git rebase` work natively.
 #
 #   ./make-fork.sh [target-dir]
 #

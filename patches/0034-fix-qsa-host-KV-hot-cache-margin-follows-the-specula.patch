@@ -1,0 +1,45 @@
+From 5a0f3fbd88dd721f244ea351f3665850cbf73111 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 23:13:35 +0000
+Subject: [PATCH 34/38] fix(qsa): host-KV hot-cache margin follows the
+ speculative window (wide verify)
+
+---
+ .../attention/qwen_sparse_attn_backend.py     | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 9c91577..dacaab9 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -275,12 +275,29 @@ class QwenSparseAttnBackend(AttentionBackend):
+             dtype=full_pool.dtype,
+             ratio=self.compress_ratio,
+             num_sets=sets,
+-            margin=int(os.environ.get("SGLANG_QSA_HOST_KV_CACHE_MARGIN", "16")),
++            margin=self._host_kv_cache_margin(),
+             device=self.device,
+         )
+         pool._qsa_host_kv_cache = cache
+         return cache
+ 
++    def _host_kv_cache_margin(self) -> int:
++        """Tokens behind the row end that are never cached: must exceed the widest
++        speculative window (wide verify raises it above 4), since those positions
++        are rewritten by later steps. 4x the draft window, at least 16."""
++        import os
++
++        env = os.environ.get("SGLANG_QSA_HOST_KV_CACHE_MARGIN")
++        if env is not None:
++            return int(env)
++        try:
++            from sglang.srt.runtime_context import max_speculative_num_draft_tokens
++
++            draft = int(max_speculative_num_draft_tokens() or 0)
++        except Exception:
++            draft = 0
++        return max(16, 4 * draft + self.compress_ratio)
++
+     def _gather_selected_kv(
+         self,
+         layer,

@@ -74,7 +74,25 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        qsa_host_kv: bool = False,
     ):
+        # Full-attention K/V in pinned, device-mapped host memory (UVA zero-copy):
+        # decode reads only the indexer's top-budget tokens, and the compressed
+        # indexer keys that drive the selection stay on the GPU. See qsa_host_kv.py.
+        self.qsa_host_kv = bool(qsa_host_kv)
+        if self.qsa_host_kv:
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            from sglang.srt.mem_cache.qsa_host_kv import host_kv_pool_class
+
+            if post_capture_active:
+                raise ValueError("QSA host KV is incompatible with post-capture KV")
+            if quant_method is not None:
+                raise ValueError(
+                    "QSA host KV supports bf16/fp8 KV storage only (no quant_method)"
+                )
+            full_kv_pool_class = host_kv_pool_class(
+                full_kv_pool_class or MHATokenToKVPool
+            )
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
                 "compressed QSA requires a paged full-KV cache with the page "

@@ -1,0 +1,255 @@
+From 2ce2bfb1cdb1e8a614dc43109fcbca000b9de983 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 17:16:39 +0000
+Subject: [PATCH 36/38] feat(scheduler): survive a prefill CUDA OOM instead of
+ killing the lane
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Today one allocation failure destroys every healthy in-flight request. The
+traceback of the 2026-09-30 16:44:17 death shows why: torch.OutOfMemoryError is
+raised in qwen_sparse_attn_backend.forward_extend, and there is NO try/except
+anywhere between run_batch (scheduler.py:1988) and the top of the process. It
+lands in run_scheduler_process's bare `except Exception` (scheduler.py:6090),
+which does parent_process.send_signal(SIGQUIT); the parent's
+running_phase_sigquit_handler then calls kill_process_tree(os.getpid()). The KV
+pool was only 73% full at the time -- the shortage was driver-level VRAM outside
+the pool -- so nothing about the request mix justified losing the lane.
+
+WHAT THIS DOES. Catches torch.OutOfMemoryError at the batch boundary, releases
+the offending prefill batch, requeues its requests, and continues the event loop.
+
+WHY IT IS BELIEVED SAFE. Every resource is already committed before the forward
+starts (prepare_for_extend runs at scheduler.py:4108, run_batch at :1988), and
+the teardown for exactly this set already exists and is already exercised by
+pause_generation(mode="retract"): retract_all -> release_req ->
+release_kv_cache + reset_for_retract covers the KV pages, the req_to_token slot,
+the mamba/GDN state slot, the radix lock ref and inflight_middle_chunks.
+retract_all was already imported at scheduler.py:217. The radix cache cannot hold
+a partial node because maybe_cache_unfinished_req only runs post-forward, and
+prefill takes no CUDA graph here (--cuda-graph-backend-prefill=disabled).
+
+THE LOAD-BEARING HAZARD IS STREAM ORDERING, NOT BOOKKEEPING. The exception skips
+_apply_war_barrier(), so earlier layers' kernels are still enqueued on
+forward_stream and still READ req_to_token and the KV pages this frees, while the
+scheduler writes on schedule_stream. The recovery therefore drains
+forward_stream FIRST and re-establishes the WAR fence before freeing anything.
+Get that order wrong and a freed page is handed to the next allocation while a
+live kernel still reads it: a healthy peer's output silently corrupts. That is
+strictly worse than the crash this replaces, which is why the drain failing at
+all returns False and lets the lane die as before.
+
+SCOPE IS DELIBERATELY NARROW. Only torch.OutOfMemoryError -- raised host-side by
+the caching allocator before the failing kernel launches, so the CUDA context is
+intact -- and only on an extend batch. The 2026-09-29 death was a different
+class: ncclUnhandledCudaError "Failed to CUDA calloc 536870912 bytes" from
+sampler.py:687, which leaves the communicator undefined. Catching that would keep
+a wedged process serving garbage. It stays fatal, by construction.
+
+SGLANG_OOM_MAX_REQ_RETRACTIONS (default 3) aborts a request with a 503 after
+repeated retractions. Without it a request whose context can never fit re-admits
+and re-OOMs forever: no forward progress, no crash and no alert -- a worse outage
+than the one being fixed.
+
+⛔ WHY THIS CANNOT SHIP ON INSPECTION. SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+defaults to True, and invariant_checker.py:479 raises on a pool leak. So if
+retract_all misses any resource, the lane still dies -- later, at the next idle
+moment, through the same SIGQUIT path, with a traceback pointing at the checker
+instead of at the OOM. A leaky version of this patch is harder to diagnose than
+no patch at all.
+
+REQUIRED BEFORE IT SHIPS:
+  1. Forced-OOM injection in the prefill forward: the loop continues and the
+     request completes on retry.
+  2. THE DECISIVE ONE: >= 20 forced prefill OOMs, then drive to idle with
+     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=1 and assert _check_all_pools,
+     _check_req_pool and verify_byte_accounting all pass. This is what proves no
+     leak in any of the four pools.
+  3. OOM while chunked_req is set: inflight_middle_chunks == 0 and
+     chunked_req is None afterwards.
+  4. mamba_allocator.available_size() returns to baseline (this lane runs
+     --max-mamba-cache-size 36).
+  5. The matched prefix node's lock_ref returns to its pre-admission value and
+     the prefix stays evictable.
+  6. The NEXTN / eagle_worker_v2 path specifically -- the OOM occurred under
+     _forward_prefill_batch, so the DRAFT worker's state needs re-verifying, not
+     just the target's. FutureMap ring slots are the known residual risk: if the
+     OOM lands before publish(), those req_pool_indices are unpublished. The
+     existing pause_generation retract path does not reset future_map either, so
+     the assumption is shared with shipped code -- but it is unproven.
+  7. Livelock guard: a request that OOMs unconditionally is aborted with 503
+     after SGLANG_OOM_MAX_REQ_RETRACTIONS, not requeued forever.
+  8. The existing retract/pause suites unchanged (they share retract_all).
+  9. Peers in running_batch produce bit-identical output across a forced OOM.
+
+NOTE THIS IS SURVIVABILITY, NOT PREVENTION. The structural cause is upstream of
+the scheduler: qwen_sparse_attn_backend.py:1450-1477 gathers the FULL sequence
+length per chunk (index_select over req_to_token[.., :sequence_lens[i]], then
+torch.cat), so four full-context dense transients are live per full-attention
+layer per forward and peak non-pool VRAM scales with total context, not with
+--chunked-prefill-size. Bounding that gather is the actual fix, and this tree
+already contains the template upstream added for the same bug class in the DSA
+backend (63d320c723, mqa_logits_utils.py + SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION).
+---
+ python/sglang/srt/environ.py            |   5 +
+ python/sglang/srt/managers/scheduler.py | 123 +++++++++++++++++++++++-
+ 2 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index af7d5c3..15a5a43 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -627,6 +627,11 @@ class Envs:
+     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
+     # in seconds. Set if you observe high memory accumulation over a long serving period.
+     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
++    # Abort a request after this many prefill-OOM retractions rather than
++    # requeueing it forever. Without a cap, a request whose context can never
++    # fit re-admits and re-OOMs indefinitely: no forward progress, no crash and
++    # no alert, which is a worse outage than the crash it replaced.
++    SGLANG_OOM_MAX_REQ_RETRACTIONS = EnvInt(3)
+     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
+     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a7d8bae..2797cb5 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1985,7 +1985,29 @@ class Scheduler(
+ 
+             # Launch the current batch
+             if batch:
+-                batch_result = self.run_batch(batch)
++                # ⛔ A PREFILL OOM MUST NOT KILL THE LANE.
++                # Without this, torch.OutOfMemoryError escapes every frame up to
++                # run_scheduler_process's bare `except Exception`, which sends
++                # SIGQUIT to the parent, whose handler calls
++                # kill_process_tree(os.getpid()) -- so one 560 MiB allocation
++                # failure destroys every healthy in-flight request. Measured
++                # 2026-09-30 16:44:17 with the KV pool only 73% full.
++                #
++                # Scope is deliberately minimal: ONLY a host-side
++                # torch.OutOfMemoryError (raised by the caching allocator before
++                # the failing kernel launches, so the CUDA context is intact),
++                # and ONLY on an extend batch. A driver-level failure -- the
++                # 2026-09-29 `ncclUnhandledCudaError: Failed to CUDA calloc` --
++                # leaves the communicator undefined and MUST still be fatal;
++                # surviving it would serve garbage.
++                try:
++                    batch_result = self.run_batch(batch)
++                except torch.OutOfMemoryError:
++                    if not batch.forward_mode.is_extend():
++                        raise
++                    if not self._drop_prefill_batch_on_oom(batch):
++                        raise
++                    continue
+                 # Fence result processing behind this forward's shared reads.
+                 self._apply_war_barrier()
+                 self.result_queue.append((batch.copy(), batch_result))
+@@ -4290,6 +4312,105 @@ class Scheduler(
+         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+ 
++    def _drop_prefill_batch_on_oom(self, batch: ScheduleBatch) -> bool:
++        """Release a prefill batch whose forward OOM'd, and requeue its requests.
++
++        Returns False to decline recovery, in which case the caller re-raises and
++        the lane dies as before. Declining is always the safe answer.
++
++        ⛔ THE ORDER OF THE FIRST TWO STEPS IS THE WHOLE SAFETY ARGUMENT. The
++        exception skipped _apply_war_barrier(), so earlier layers' kernels are
++        still enqueued on forward_stream and still READ req_to_token and the KV
++        pages this method is about to free, while the scheduler's own writes run
++        on schedule_stream. Freeing before draining hands live pages to the next
++        allocation and corrupts a healthy peer's output instead of dropping one
++        request -- a silent wrong answer in place of a loud crash, which is worse
++        than the bug being fixed.
++        """
++        # 1. Drain the aborted forward before touching anything it may read.
++        try:
++            self.forward_stream.synchronize()
++        except Exception:
++            logger.exception("Prefill OOM: could not drain forward_stream; "
++                             "declining recovery so the lane fails loudly.")
++            return False
++        runner = getattr(self.model_worker, "last_shared_read_runner", None)
++        if runner is not None:
++            runner.shared_read_done_event = None
++        self.schedule_stream.wait_stream(self.forward_stream)
++
++        # 2. run_batch never appended this batch's result, so result_queue and
++        #    last_batch would drift apart: pop_and_process() pops one entry
++        #    whenever last_batch is set. Drain the previous entry and clear.
++        if self.last_batch is not None and self.result_queue:
++            tmp_batch, tmp_result = self.result_queue.popleft()
++            self.process_batch_result(tmp_batch, tmp_result)
++        self.last_batch = None
++        self.cur_batch_for_debug = None
++
++        # 3. A request whose context can never fit would otherwise re-admit and
++        #    re-OOM forever: no progress, no crash, no alert. Cap it.
++        max_retractions = envs.SGLANG_OOM_MAX_REQ_RETRACTIONS.get()
++        reqs, doomed = [], []
++        for req in batch.reqs:
++            if req.finished():
++                continue
++            reqs.append(req)
++            if req.retraction_count >= max_retractions:
++                doomed.append(req)
++
++        # 4. Release KV pages, the req_to_token slot, the mamba/GDN state slot,
++        #    the radix lock ref and inflight_middle_chunks. retract_all ->
++        #    release_req -> release_kv_cache + reset_for_retract covers all five;
++        #    this is the same teardown pause_generation(mode="retract") uses.
++        if reqs:
++            retract_all(
++                reqs=reqs,
++                req_to_token_pool=self.req_to_token_pool,
++                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++                tree_cache=self.tree_cache,
++                hisparse_coordinator=self.hisparse_coordinator,
++                offload_kv=False,
++            )
++        if self.chunked_req is not None and self.chunked_req in batch.reqs:
++            self.chunked_req = None
++        self.running_batch.batch_is_full = False
++
++        # 5. Hand cached-but-unallocated segments back to the driver, so the
++        #    retry -- and any lazy cubin load -- has headroom outside the pool.
++        #    With expandable_segments this may return very little.
++        try:
++            current_platform.empty_cache()
++        except Exception:
++            logger.debug("Prefill OOM: empty_cache failed", exc_info=True)
++
++        for req in doomed:
++            self.ipc_channels.send_to_tokenizer.send_output(
++                _make_abort_req(
++                    req,
++                    finished_reason={
++                        "type": "abort",
++                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
++                        "message": (
++                            "Prefill ran out of device memory "
++                            f"{req.retraction_count} times; giving up on this "
++                            "request rather than wedging the lane."
++                        ),
++                    },
++                ),
++                req,
++            )
++        for req in reqs:
++            if req not in doomed:
++                self._add_request_to_queue(req, is_retracted=True)
++
++        logger.error(
++            "Prefill OOM recovered: batch of %d req(s) dropped, %d aborted, "
++            "%d requeued. The lane stayed up.",
++            len(batch.reqs), len(doomed), len(reqs) - len(doomed),
++        )
++        return True
++
+     @contextmanager
+     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+         """Make SB transactional across one forward (overlap and non-overlap).

@@ -627,6 +627,11 @@ class Envs:
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
     # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
+    # Abort a request after this many prefill-OOM retractions rather than
+    # requeueing it forever. Without a cap, a request whose context can never
+    # fit re-admits and re-OOMs indefinitely: no forward progress, no crash and
+    # no alert, which is a worse outage than the crash it replaced.
+    SGLANG_OOM_MAX_REQ_RETRACTIONS = EnvInt(3)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)

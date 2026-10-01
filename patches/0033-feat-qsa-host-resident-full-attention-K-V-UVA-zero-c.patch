@@ -1,0 +1,891 @@
+From dbcfa02bda32f7f2e194eea995a70ac625e54922 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Mon, 28 Sep 2026 22:14:37 +0000
+Subject: [PATCH 33/38] feat(qsa): host-resident full-attention K/V (UVA
+ zero-copy) + GPU hot cache
+
+SGLANG_QSA_HOST_KV=target|all keeps QSA full-attention K/V in pinned,
+device-mapped host memory; compressed indexer keys stay on GPU. Existing
+gather/store kernels read/write it through UVA. Pool sizing charges only
+GPU-resident bytes. Direct-mapped per-(layer,request) GPU hot cache at
+compressed-group granularity absorbs repeated selections (SGLANG_QSA_HOST_KV_CACHE_SETS).
+---
+ .../srt/layers/attention/qsa/host_kv_cache.py | 354 ++++++++++++++++++
+ .../attention/qwen_sparse_attn_backend.py     | 110 +++++-
+ .../srt/mem_cache/kv_cache_configurator.py    |   4 +
+ python/sglang/srt/mem_cache/qsa_host_kv.py    | 245 ++++++++++++
+ python/sglang/srt/mem_cache/qsa_kv_pool.py    |  18 +
+ .../srt/model_executor/pool_configurator.py   |  35 ++
+ 6 files changed, 760 insertions(+), 6 deletions(-)
+ create mode 100644 python/sglang/srt/layers/attention/qsa/host_kv_cache.py
+ create mode 100644 python/sglang/srt/mem_cache/qsa_host_kv.py
+
+diff --git a/python/sglang/srt/layers/attention/qsa/host_kv_cache.py b/python/sglang/srt/layers/attention/qsa/host_kv_cache.py
+new file mode 100644
+index 0000000..a26833b
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/qsa/host_kv_cache.py
+@@ -0,0 +1,354 @@
++# Copyright © 2025 Ligandal, Inc. All rights reserved.
++"""GPU hot cache in front of host-resident QSA K/V.
++
++With ``SGLANG_QSA_HOST_KV`` the full-attention K/V live in mapped host memory,
++so every decode row would pull its whole top-budget selection (2051 tokens x
++2 KiB = 4.2 MB per layer) across PCIe. Consecutive decode steps -- and the
++MTP verify rows of one step -- select mostly the same compressed groups, so a
++small per-request cache on the GPU turns most of those reads into HBM reads.
++
++Design: direct-mapped, one entry per compressed group (``ratio`` tokens), per
++(layer, request slot). Set = group % num_sets, tag = group id.
++
++Three kernels per layer call:
++  1. gather   : selected token -> packed scratch, from the cache on a tag hit,
++                from host memory otherwise (drop-in for ``_compact_kv``).
++  2. claim    : every cacheable missed group bids for its set (atomic max), so
++                exactly one group owns a contested set.
++  3. fill     : the winning groups copy their freshly packed rows (already in
++                HBM) into the cache and publish the tag.
++Tags are only read by a LATER kernel launch than the one that writes them, so
++data and tag are always consistent at read time.
++
++Correctness invariants:
++  * Only committed, immutable tokens are cached: a group is cacheable iff
++    ``(g + 1) * ratio + margin <= row_seq_len``, with ``margin`` above the
++    speculative draft window, so draft-token K/V that a later step rewrites is
++    never cached.
++  * A request slot's tags are invalidated on every real EXTEND of that slot
++    (new request, chunked prefill, re-prefill after retraction), which is how
++    a reused request slot starts empty.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import List, Optional
++
++import torch
++import triton
++import triton.language as tl
++
++logger = logging.getLogger(__name__)
++
++_SETS_ENV = "SGLANG_QSA_HOST_KV_CACHE_SETS"
++
++
++def host_kv_cache_sets() -> int:
++    return int(os.environ.get(_SETS_ENV, "4096"))
++
++
++@triton.jit
++def _gather_cached(
++    k,
++    v,
++    ck,
++    cv,
++    tags,
++    req_to_token,
++    req_indices,
++    indices,
++    seq_lens,
++    cu_k,
++    out_k,
++    out_v,
++    stats,
++    topk: tl.constexpr,
++    heads: tl.constexpr,
++    dim: tl.constexpr,
++    req_stride: tl.constexpr,
++    idx_stride: tl.constexpr,
++    pad_cols,
++    num_sets: tl.constexpr,
++    margin: tl.constexpr,
++    RATIO: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    ZERO_FILL: tl.constexpr,
++    STATS: tl.constexpr,
++):
++    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
++    dims = tl.arange(0, BLOCK_D)
++    length = tl.load(seq_lens + batch)
++    req = tl.load(req_indices + batch).to(tl.int64)
++    pack_start = tl.load(cu_k + batch)
++    valid_count = tl.load(cu_k + batch + 1) - pack_start
++    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
++    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
++    safe_pos = tl.where(valid, positions, 0)
++    group = safe_pos // RATIO
++    sets = group % num_sets
++    tag = tl.load(tags + req * num_sets + sets, mask=valid, other=-1)
++    cacheable = (group + 1) * RATIO + margin <= length
++    hit = valid & cacheable & (tag == group)
++    miss = valid & (~hit)
++    slots = tl.load(req_to_token + req * req_stride + safe_pos, mask=miss, other=0)
++    dmask = dims[None, :] < dim
++    src_host = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
++    cache_row = req * (num_sets * RATIO) + sets.to(tl.int64) * RATIO + safe_pos % RATIO
++    src_cache = cache_row[:, None] * heads * dim + head * dim + dims[None, :]
++    dst = (
++        (pack_start + cols).to(tl.int64)[:, None] * heads * dim
++        + head * dim
++        + dims[None, :]
++    )
++    if ZERO_FILL:
++        store_mask = (cols < pad_cols)[:, None] & dmask
++    else:
++        store_mask = valid[:, None] & dmask
++    out_dtype = out_k.dtype.element_ty
++    kh = tl.load(k + src_host, mask=miss[:, None] & dmask, other=0.0).to(out_dtype)
++    kc = tl.load(ck + src_cache, mask=hit[:, None] & dmask, other=0.0).to(out_dtype)
++    tl.store(out_k + dst, tl.where(hit[:, None], kc, kh), mask=store_mask)
++    vh = tl.load(v + src_host, mask=miss[:, None] & dmask, other=0.0).to(out_dtype)
++    vc = tl.load(cv + src_cache, mask=hit[:, None] & dmask, other=0.0).to(out_dtype)
++    tl.store(out_v + dst, tl.where(hit[:, None], vc, vh), mask=store_mask)
++    if STATS:
++        if head == 0:
++            tl.atomic_add(stats + 0, tl.sum(hit.to(tl.int64), axis=0))
++            tl.atomic_add(stats + 1, tl.sum(valid.to(tl.int64), axis=0))
++            tl.atomic_add(stats + 2, tl.sum((valid & cacheable).to(tl.int64), axis=0))
++
++
++@triton.jit
++def _claim_sets(
++    tags,
++    claim,
++    req_indices,
++    indices,
++    seq_lens,
++    cu_k,
++    topk: tl.constexpr,
++    idx_stride: tl.constexpr,
++    num_sets: tl.constexpr,
++    margin: tl.constexpr,
++    RATIO: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++):
++    batch, block = tl.program_id(0), tl.program_id(1)
++    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
++    length = tl.load(seq_lens + batch)
++    req = tl.load(req_indices + batch).to(tl.int64)
++    pack_start = tl.load(cu_k + batch)
++    valid_count = tl.load(cu_k + batch + 1) - pack_start
++    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
++    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
++    safe_pos = tl.where(valid, positions, 0)
++    group = safe_pos // RATIO
++    sets = group % num_sets
++    tag = tl.load(tags + req * num_sets + sets, mask=valid, other=-1)
++    cacheable = (group + 1) * RATIO + margin <= length
++    bid = valid & cacheable & (tag != group) & (safe_pos % RATIO == 0)
++    tl.atomic_max(claim + req * num_sets + sets, group.to(tl.int32), mask=bid)
++
++
++@triton.jit
++def _fill_cache(
++    ck,
++    cv,
++    tags,
++    claim,
++    req_indices,
++    indices,
++    seq_lens,
++    cu_k,
++    out_k,
++    out_v,
++    topk: tl.constexpr,
++    heads: tl.constexpr,
++    dim: tl.constexpr,
++    idx_stride: tl.constexpr,
++    num_sets: tl.constexpr,
++    margin: tl.constexpr,
++    RATIO: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
++    dims = tl.arange(0, BLOCK_D)
++    length = tl.load(seq_lens + batch)
++    req = tl.load(req_indices + batch).to(tl.int64)
++    pack_start = tl.load(cu_k + batch)
++    valid_count = tl.load(cu_k + batch + 1) - pack_start
++    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
++    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
++    safe_pos = tl.where(valid, positions, 0)
++    group = safe_pos // RATIO
++    sets = group % num_sets
++    cacheable = (group + 1) * RATIO + margin <= length
++    # `claim` holds only groups that MISSED in this call (see _claim_sets), so a
++    # group that owns its set never overwrites data another row just hit on.
++    owner = tl.load(claim + req * num_sets + sets, mask=valid, other=-1)
++    win = valid & cacheable & (owner == group)
++    dmask = dims[None, :] < dim
++    src = (
++        (pack_start + cols).to(tl.int64)[:, None] * heads * dim
++        + head * dim
++        + dims[None, :]
++    )
++    cache_row = req * (num_sets * RATIO) + sets.to(tl.int64) * RATIO + safe_pos % RATIO
++    dst = cache_row[:, None] * heads * dim + head * dim + dims[None, :]
++    cdtype = ck.dtype.element_ty
++    m = win[:, None] & dmask
++    tl.store(ck + dst, tl.load(out_k + src, mask=m, other=0.0).to(cdtype), mask=m)
++    tl.store(cv + dst, tl.load(out_v + src, mask=m, other=0.0).to(cdtype), mask=m)
++    if head == 0:
++        tl.store(
++            tags + req * num_sets + sets,
++            group.to(tl.int32),
++            mask=win & (safe_pos % RATIO == 0),
++        )
++
++
++class QSAHostKVCache:
++    """Per-layer GPU hot cache for one host-resident QSA KV pool."""
++
++    def __init__(
++        self,
++        *,
++        num_layers: int,
++        num_req_slots: int,
++        heads: int,
++        dim: int,
++        dtype: torch.dtype,
++        ratio: int,
++        num_sets: int,
++        margin: int,
++        device,
++    ):
++        self.num_layers = num_layers
++        self.num_req_slots = num_req_slots
++        self.num_sets = int(num_sets)
++        self.ratio = int(ratio)
++        self.margin = int(margin)
++        self.heads, self.dim = heads, dim
++        self.elem = torch.empty((), dtype=dtype).element_size()
++        rows = num_req_slots * self.num_sets * self.ratio
++        self.k: List[torch.Tensor] = []
++        self.v: List[torch.Tensor] = []
++        self.tags: List[torch.Tensor] = []
++        for _ in range(num_layers):
++            self.k.append(torch.zeros((rows, heads, dim), dtype=dtype, device=device))
++            self.v.append(torch.zeros((rows, heads, dim), dtype=dtype, device=device))
++            self.tags.append(
++                torch.full(
++                    (num_req_slots, self.num_sets), -1, dtype=torch.int32, device=device
++                )
++            )
++        self.claim = torch.full(
++            (num_req_slots, self.num_sets), -1, dtype=torch.int32, device=device
++        )
++        # [hits, selected tokens, cacheable selected tokens], cumulative.
++        self.stats = torch.zeros(3, dtype=torch.int64, device=device)
++        self.stats_enabled = os.environ.get("SGLANG_QSA_HOST_KV_STATS", "0") == "1"
++        if self.stats_enabled:
++            self._start_stats_thread(device)
++        nbytes = 2 * num_layers * rows * heads * dim * torch.empty((), dtype=dtype).element_size()
++        logger.info(
++            "QSA host KV hot cache: %d layers x %d request slots x %d sets x %d tokens "
++            "= %.2f GiB GPU (margin %d)",
++            num_layers,
++            num_req_slots,
++            self.num_sets,
++            self.ratio,
++            nbytes / (1 << 30),
++            self.margin,
++        )
++
++    def _start_stats_thread(self, device) -> None:
++        import threading
++        import time
++
++        interval = float(os.environ.get("SGLANG_QSA_HOST_KV_STATS_INTERVAL", "30"))
++        stream = torch.cuda.Stream(device=device)
++        host = torch.zeros(3, dtype=torch.int64).pin_memory()
++
++        def run():
++            last = (0, 0, 0)
++            while True:
++                time.sleep(interval)
++                try:
++                    with torch.cuda.stream(stream):
++                        host.copy_(self.stats, non_blocking=True)
++                    stream.synchronize()
++                    hits, sel, cach = (int(x) for x in host.tolist())
++                except Exception:  # shutdown
++                    return
++                d = (hits - last[0], sel - last[1], cach - last[2])
++                last = (hits, sel, cach)
++                if d[1] > 0:
++                    logger.info(
++                        "QSA host KV cache: last %.0fs hit %.4f of selected tokens "
++                        "(%.4f of cacheable), %d selected; cumulative hit %.4f "
++                        "over %d; host bytes/token read %.0f",
++                        interval,
++                        d[0] / d[1],
++                        d[0] / max(d[2], 1),
++                        d[1],
++                        hits / max(sel, 1),
++                        sel,
++                        (d[1] - d[0]) / d[1] * 2 * self.heads * self.dim * self.elem,
++                    )
++
++        threading.Thread(target=run, name="qsa-host-kv-stats", daemon=True).start()
++
++    def invalidate(self, layer: int, req_pool_indices: torch.Tensor) -> None:
++        self.tags[layer].index_fill_(0, req_pool_indices.long(), -1)
++
++    def gather(
++        self,
++        layer: int,
++        k,
++        v,
++        req_to_token,
++        req_indices,
++        indices,
++        seq_lens,
++        cu_k,
++        out_k,
++        out_v,
++        batch: int,
++        topk: int,
++        zero_fill_cols: int = 0,
++    ) -> None:
++        _, heads, dim = k.shape
++        block_topk = 16
++        zero_fill = zero_fill_cols > 0
++        num_cols = zero_fill_cols if zero_fill else topk
++        block_d = triton.next_power_of_2(dim)
++        ck, cv, tags = self.k[layer], self.v[layer], self.tags[layer]
++        _gather_cached[(batch, heads, triton.cdiv(num_cols, block_topk))](
++            k, v, ck, cv, tags, req_to_token, req_indices, indices, seq_lens, cu_k,
++            out_k, out_v, self.stats, topk, heads, dim, req_to_token.stride(0),
++            indices.stride(0), num_cols, self.num_sets, self.margin,
++            RATIO=self.ratio, BLOCK_TOPK=block_topk, BLOCK_D=block_d,
++            ZERO_FILL=zero_fill, STATS=self.stats_enabled, num_warps=8,
++        )
++        self.claim.fill_(-1)
++        _claim_sets[(batch, triton.cdiv(topk, 128))](
++            tags, self.claim, req_indices, indices, seq_lens, cu_k, topk,
++            indices.stride(0), self.num_sets, self.margin,
++            RATIO=self.ratio, BLOCK_TOPK=128, num_warps=4,
++        )
++        _fill_cache[(batch, heads, triton.cdiv(topk, block_topk))](
++            ck, cv, tags, self.claim, req_indices, indices, seq_lens, cu_k,
++            out_k, out_v, topk, heads, dim, indices.stride(0), self.num_sets,
++            self.margin, RATIO=self.ratio, BLOCK_TOPK=block_topk, BLOCK_D=block_d,
++            num_warps=8,
++        )
++
++
++__all__ = ["QSAHostKVCache", "host_kv_cache_sets"]
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 5aa80ec..9c91577 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -241,6 +241,93 @@ class QwenSparseAttnBackend(AttentionBackend):
+         self._share_scratch = qsa_scratch_sharing_enabled()
+         self._graph_extend_lens = None
+         self._graph_extend_lens_pin = None
++        self._host_kv_cache = self._init_host_kv_cache()
++
++    def _init_host_kv_cache(self):
++        """GPU hot cache in front of a host-resident K/V pool (qsa_host_kv.py).
++
++        Shared through the pool object, so the per-step draft backends of one
++        draft pool reuse a single cache. None when the pool is GPU-resident.
++        """
++        pool = self.token_to_kv_pool
++        if pool is None or not getattr(pool, "qsa_host_kv", False):
++            return None
++        cache = getattr(pool, "_qsa_host_kv_cache", None)
++        if cache is not None:
++            return cache
++        import os
++
++        from sglang.srt.layers.attention.qsa.host_kv_cache import (
++            QSAHostKVCache,
++            host_kv_cache_sets,
++        )
++
++        sets = host_kv_cache_sets()
++        if sets <= 0 or self.req_to_token is None:
++            pool._qsa_host_kv_cache = None
++            return None
++        full_pool = pool.full_kv_pool
++        cache = QSAHostKVCache(
++            num_layers=pool.full_layer_nums,
++            num_req_slots=int(self.req_to_token.shape[0]),
++            heads=full_pool.head_num,
++            dim=full_pool.head_dim,
++            dtype=full_pool.dtype,
++            ratio=self.compress_ratio,
++            num_sets=sets,
++            margin=int(os.environ.get("SGLANG_QSA_HOST_KV_CACHE_MARGIN", "16")),
++            device=self.device,
++        )
++        pool._qsa_host_kv_cache = cache
++        return cache
++
++    def _gather_selected_kv(
++        self,
++        layer,
++        k_buffer,
++        v_buffer,
++        req_indices,
++        topk_indices,
++        sequence_lens,
++        cu,
++        packed_k,
++        packed_v,
++        batch,
++        topk,
++        zero_fill_cols: int = 0,
++    ) -> None:
++        cache = self._host_kv_cache
++        if cache is None:
++            qwen_sparse_kv_extraction_compact_triton(
++                k_buffer,
++                v_buffer,
++                self.req_to_token_pool.req_to_token,
++                req_indices,
++                topk_indices,
++                sequence_lens,
++                cu,
++                packed_k,
++                packed_v,
++                batch,
++                topk,
++                zero_fill_cols=zero_fill_cols,
++            )
++            return
++        cache.gather(
++            self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id),
++            k_buffer,
++            v_buffer,
++            self.req_to_token_pool.req_to_token,
++            req_indices,
++            topk_indices,
++            sequence_lens,
++            cu,
++            packed_k,
++            packed_v,
++            batch,
++            topk,
++            zero_fill_cols=zero_fill_cols,
++        )
+ 
+     @staticmethod
+     def _is_speculative_paged_mode(forward_mode) -> bool:
+@@ -1407,6 +1494,15 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 q, layer, forward_batch, topk_indices
+             )
+             return self._pad_extend_output(output, num_output_rows)
++        if self._host_kv_cache is not None and q.is_cuda:
++            # A real EXTEND (new request, prefill chunk, re-prefill after
++            # retraction) is the only way a request slot starts or restarts, so
++            # dropping its cached groups here keeps a reused slot from ever
++            # hitting another request's K/V.
++            self._host_kv_cache.invalidate(
++                self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id),
++                forward_batch.req_pool_indices,
++            )
+         if not q.is_cuda:
+             metadata = self._resolve_metadata(forward_batch)
+             slots = self._logical_to_physical(topk_indices, metadata)
+@@ -1465,10 +1561,12 @@ class QwenSparseAttnBackend(AttentionBackend):
+             sequence_lens, dtype=torch.int32, device=q.device
+         )
+         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
++        # One sequence (the long-context case) needs no concatenation copy: at 1M
++        # tokens that copy is another 1 GiB per K and per V.
+         output = sparse_gqa_fwd_interface_triton_ck(
+             q.contiguous(),
+-            torch.cat(k_parts),
+-            torch.cat(v_parts),
++            k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts),
++            v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts),
+             topk_indices,
+             cu_seqlens_q,
+             cu_seqlens_k,
+@@ -1581,10 +1679,10 @@ class QwenSparseAttnBackend(AttentionBackend):
+             q.dtype,
+             k_buffer.device,
+         )
+-        qwen_sparse_kv_extraction_compact_triton(
++        self._gather_selected_kv(
++            layer,
+             k_buffer,
+             v_buffer,
+-            self.req_to_token_pool.req_to_token,
+             (
+                 metadata.row_req_pool_indices
+                 if metadata.row_req_pool_indices is not None
+@@ -1714,10 +1812,10 @@ class QwenSparseAttnBackend(AttentionBackend):
+             q.dtype,
+             k_buffer.device,
+         )
+-        qwen_sparse_kv_extraction_compact_triton(
++        self._gather_selected_kv(
++            layer,
+             k_buffer,
+             v_buffer,
+-            self.req_to_token_pool.req_to_token,
+             (
+                 metadata.row_req_pool_indices
+                 if metadata.row_req_pool_indices is not None
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index 9aed431..3168ed9 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -1936,6 +1936,10 @@ class KVCacheConfigurator:
+                 qsa_token_topk=qsa_profile.budget,
+                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+             )
++            from sglang.srt.mem_cache.qsa_host_kv import qsa_host_kv_enabled
++
++            if qsa_host_kv_enabled(self.is_draft_worker):
++                extra_args["qsa_host_kv"] = True
+         token_to_kv_pool = pool_class(
+             page_size=self.pool_page_size,
+             size=max_total_num_tokens,
+diff --git a/python/sglang/srt/mem_cache/qsa_host_kv.py b/python/sglang/srt/mem_cache/qsa_host_kv.py
+new file mode 100644
+index 0000000..ae281a3
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/qsa_host_kv.py
+@@ -0,0 +1,245 @@
++# Copyright © 2025 Ligandal, Inc. All rights reserved.
++"""Host-resident (UVA zero-copy) K/V storage for QSA full-attention layers.
++
++QSA decode reads only the indexer's top-``indexer_budget`` tokens (+ the
++pending compress tail) of each full-attention layer, and the selection is made
++from the compressed indexer keys, which stay on the GPU. So the full K/V of a
++long context does not need to be GPU-resident: it can live in pinned, mapped
++host memory and be read over PCIe by the very same gather kernels.
++
++This module provides that storage. A buffer is allocated with
++``cudaHostAlloc(Mapped | Portable)`` and exposed to PyTorch as a *CUDA* tensor
++(via ``__cuda_array_interface__``) whose data pointer is the UVA device
++pointer of the pinned host pages. Every existing torch op / Triton kernel that
++reads or writes the K/V pool therefore keeps working unchanged, only the bytes
++now cross PCIe instead of HBM.
++
++Enable with ``SGLANG_QSA_HOST_KV``:
++  * unset / ``0`` / ``off``  - disabled (default; nothing changes)
++  * ``1`` / ``target``       - target model's full-attention K/V on host;
++                               the MTP draft layer's K/V stays on the GPU
++  * ``all``                  - target and draft K/V on host
++
++``SGLANG_QSA_HOST_KV_MAX_GB`` (default 100) is a fail-fast guard on the pinned
++bytes one pool may allocate, so an oversized ``--max-total-tokens`` dies at
++startup instead of taking the host OOM killer down with it.
++
++
++"""
++
++from __future__ import annotations
++
++import ctypes
++import logging
++import math
++import os
++import weakref
++from typing import List, Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_MODE_ENV = "SGLANG_QSA_HOST_KV"
++_MAX_GB_ENV = "SGLANG_QSA_HOST_KV_MAX_GB"
++
++
++def qsa_host_kv_mode() -> str:
++    raw = os.environ.get(_MODE_ENV, "").strip().lower()
++    if raw in ("", "0", "off", "false", "no"):
++        return "off"
++    if raw in ("1", "on", "true", "target"):
++        return "target"
++    if raw == "all":
++        return "all"
++    raise ValueError(f"{_MODE_ENV} must be off|target|all, got {raw!r}")
++
++
++def qsa_host_kv_enabled(is_draft_worker: bool) -> bool:
++    mode = qsa_host_kv_mode()
++    if mode == "off":
++        return False
++    return mode == "all" or not is_draft_worker
++
++
++def _check(err, what: str):
++    # cuda-python returns (cudaError_t, *values)
++    code = int(err[0]) if isinstance(err, tuple) else int(err)
++    if code != 0:
++        raise RuntimeError(f"{what} failed with cudaError {code}")
++    return err[1:] if isinstance(err, tuple) else ()
++
++
++class _CudaArrayInterface:
++    """Minimal ``__cuda_array_interface__`` exporter for a raw device pointer."""
++
++    def __init__(self, ptr: int, nbytes: int, owner):
++        self._owner = owner  # keep the mapped allocation alive
++        self.__cuda_array_interface__ = {
++            "shape": (nbytes,),
++            "typestr": "|u1",
++            "data": (ptr, False),
++            "version": 3,
++            "strides": None,
++        }
++
++
++class MappedHostBuffer:
++    """One pinned + device-mapped host allocation (freed with the object)."""
++
++    def __init__(self, nbytes: int, device: torch.device):
++        from cuda.bindings import runtime as cudart
++
++        if nbytes <= 0:
++            raise ValueError("MappedHostBuffer needs a positive size")
++        self.nbytes = int(nbytes)
++        self.device = torch.device(device)
++        with torch.cuda.device(self.device):
++            (host_ptr,) = _check(
++                cudart.cudaHostAlloc(
++                    self.nbytes,
++                    cudart.cudaHostAllocMapped | cudart.cudaHostAllocPortable,
++                ),
++                f"cudaHostAlloc({self.nbytes} B)",
++            )
++            host_ptr = int(host_ptr)
++            (dev_ptr,) = _check(
++                cudart.cudaHostGetDevicePointer(host_ptr, 0),
++                "cudaHostGetDevicePointer",
++            )
++        self.host_ptr = host_ptr
++        self.dev_ptr = int(dev_ptr)
++        self._finalizer = weakref.finalize(self, _free_host, host_ptr)
++        # cudaHostAlloc does not zero memory. Zero it once on the host side so a
++        # never-written slot reads as 0.0 exactly like the torch.zeros GPU pool.
++        ctypes.memset(self.host_ptr, 0, self.nbytes)
++
++    def cuda_view(self, offset: int, shape, dtype: torch.dtype) -> torch.Tensor:
++        numel = math.prod(shape)
++        nbytes = numel * torch.empty((), dtype=dtype).element_size()
++        if offset < 0 or offset + nbytes > self.nbytes:
++            raise ValueError("cuda_view out of range")
++        iface = _CudaArrayInterface(self.dev_ptr + offset, nbytes, self)
++        raw = torch.as_tensor(iface, device=self.device)
++        if raw.data_ptr() != self.dev_ptr + offset:
++            raise RuntimeError("torch copied the mapped buffer instead of aliasing it")
++        return raw.view(dtype).view(tuple(shape))
++
++    def cpu_view(self, offset: int, shape, dtype: torch.dtype) -> torch.Tensor:
++        numel = math.prod(shape)
++        nbytes = numel * torch.empty((), dtype=dtype).element_size()
++        buf = (ctypes.c_uint8 * nbytes).from_address(self.host_ptr + offset)
++        return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(tuple(shape))
++
++
++def _free_host(ptr: int) -> None:
++    try:
++        from cuda.bindings import runtime as cudart
++
++        cudart.cudaFreeHost(ptr)
++    except Exception:  # interpreter shutdown
++        pass
++
++
++def _max_host_bytes() -> int:
++    return int(float(os.environ.get(_MAX_GB_ENV, "100")) * (1 << 30))
++
++
++def allocate_host_kv_buffers(
++    *,
++    layer_num: int,
++    k_shape,
++    v_shape,
++    dtype: torch.dtype,
++    device,
++    label: str = "",
++):
++    """Allocate [layer_num] K and V buffers as device-mapped host memory.
++
++    Returns (k_buffers, v_buffers, owner). The owner must be kept referenced
++    for the buffers' lifetime.
++    """
++    itemsize = torch.empty((), dtype=dtype).element_size()
++    k_bytes = math.prod(k_shape) * itemsize
++    v_bytes = math.prod(v_shape) * itemsize
++    # 256 B alignment for every per-layer view.
++    align = 256
++    k_stride = (k_bytes + align - 1) // align * align
++    v_stride = (v_bytes + align - 1) // align * align
++    total = layer_num * (k_stride + v_stride)
++    limit = _max_host_bytes()
++    if total > limit:
++        raise RuntimeError(
++            f"QSA host KV{label}: {total / (1 << 30):.2f} GiB of pinned host memory "
++            f"requested, above {_MAX_GB_ENV}={limit / (1 << 30):.1f} GiB. Lower "
++            "--max-total-tokens or raise the guard deliberately."
++        )
++    owner = MappedHostBuffer(total, torch.device(device))
++    k_buffers: List[torch.Tensor] = []
++    v_buffers: List[torch.Tensor] = []
++    offset = 0
++    for _ in range(layer_num):
++        k_buffers.append(owner.cuda_view(offset, k_shape, dtype))
++        offset += k_stride
++        v_buffers.append(owner.cuda_view(offset, v_shape, dtype))
++        offset += v_stride
++    logger.info(
++        "QSA host KV%s: %d layers x (K %s + V %s) %s = %.2f GiB pinned+mapped host "
++        "memory (UVA zero-copy)",
++        label,
++        layer_num,
++        tuple(k_shape),
++        tuple(v_shape),
++        dtype,
++        total / (1 << 30),
++    )
++    return k_buffers, v_buffers, owner
++
++
++class HostKVPoolMixin:
++    """Mixin for an MHA KV pool class: full K/V live in mapped host memory."""
++
++    _qsa_host_kv_owner: Optional[MappedHostBuffer] = None
++
++    def _create_buffers_normal(self):  # overrides MHATokenToKVPool
++        if getattr(self, "kv_cache_layout", None) == "vectorized_5d":
++            raise NotImplementedError("QSA host KV supports the NHD/HND layouts only")
++        k_shape, v_shape = self._kv_buffer_shapes()
++        self.k_buffer, self.v_buffer, self._qsa_host_kv_owner = (
++            allocate_host_kv_buffers(
++                layer_num=self.layer_num,
++                k_shape=k_shape,
++                v_shape=v_shape,
++                dtype=self.store_dtype,
++                device=self.device,
++            )
++        )
++
++    def _alloc_post_capture_buffers(self):
++        raise NotImplementedError("QSA host KV is incompatible with post-capture KV")
++
++    @property
++    def qsa_host_kv_bytes(self) -> int:
++        owner = self._qsa_host_kv_owner
++        return 0 if owner is None else owner.nbytes
++
++
++_HOST_CLASS_CACHE = {}
++
++
++def host_kv_pool_class(base_cls: type) -> type:
++    """Return a subclass of ``base_cls`` whose K/V buffers are host-resident."""
++    cls = _HOST_CLASS_CACHE.get(base_cls)
++    if cls is None:
++        cls = type(f"HostKV{base_cls.__name__}", (HostKVPoolMixin, base_cls), {})
++        _HOST_CLASS_CACHE[base_cls] = cls
++    return cls
++
++
++__all__ = [
++    "MappedHostBuffer",
++    "allocate_host_kv_buffers",
++    "host_kv_pool_class",
++    "qsa_host_kv_enabled",
++    "qsa_host_kv_mode",
++]
+diff --git a/python/sglang/srt/mem_cache/qsa_kv_pool.py b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+index 1e46544..c637d4e 100644
+--- a/python/sglang/srt/mem_cache/qsa_kv_pool.py
++++ b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+@@ -74,7 +74,25 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         full_kv_pool_class: Optional[type] = None,
+         quant_method=None,
+         post_capture_active: bool = False,
++        qsa_host_kv: bool = False,
+     ):
++        # Full-attention K/V in pinned, device-mapped host memory (UVA zero-copy):
++        # decode reads only the indexer's top-budget tokens, and the compressed
++        # indexer keys that drive the selection stay on the GPU. See qsa_host_kv.py.
++        self.qsa_host_kv = bool(qsa_host_kv)
++        if self.qsa_host_kv:
++            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
++            from sglang.srt.mem_cache.qsa_host_kv import host_kv_pool_class
++
++            if post_capture_active:
++                raise ValueError("QSA host KV is incompatible with post-capture KV")
++            if quant_method is not None:
++                raise ValueError(
++                    "QSA host KV supports bf16/fp8 KV storage only (no quant_method)"
++                )
++            full_kv_pool_class = host_kv_pool_class(
++                full_kv_pool_class or MHATokenToKVPool
++            )
+         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
+             raise ValueError(
+                 "compressed QSA requires a paged full-KV cache with the page "
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index b0417d5..a95ff25 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -249,6 +249,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
+                         allocate_all_layers=True,
+                     )
+                     self._cell_size += draft_kv_size + draft_indexer_size
++                elif self._qsa_host_kv_active(kvc):
++                    # The target's K/V left the GPU, so the proportional scaling
++                    # below would drop the draft's (possibly still GPU-resident)
++                    # K/V. Charge the draft layers explicitly.
++                    model_config = kvc.model_config
++                    draft_kv = 0
++                    if not self._qsa_host_kv_active(kvc, is_draft_worker=True):
++                        draft_kv = (
++                            model_config.get_num_kv_heads(
++                                get_parallel().attn_tp_size,
++                                get_parallel().attn_dcp_size,
++                            )
++                            * (model_config.head_dim + model_config.v_head_dim)
++                            * draft_num_layers
++                            * torch._utils._element_size(kvc.kv_cache_dtype)
++                        )
++                    self._cell_size += draft_kv + self._compute_qsa_cell_size(
++                        hf_config=model_config.hf_config,
++                        num_layers=draft_num_layers,
++                    )
+                 else:
+                     self._cell_size = int(
+                         self._cell_size * (1 + draft_num_layers / int(num_layers))
+@@ -443,11 +463,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
+                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
+                 ) // scale_block_size
+ 
++        if not kvc.use_mla_backend and self._qsa_host_kv_active(kvc):
++            # Full-attention K/V live in mapped host memory (qsa_host_kv.py);
++            # only the QSA indexer state below is GPU-resident per token.
++            cell_size = 0
+         cell_size += self._compute_qsa_cell_size(
+             hf_config=model_config.hf_config, num_layers=num_layers
+         )
+         return cell_size
+ 
++    @staticmethod
++    def _qsa_host_kv_active(kvc, *, is_draft_worker: Optional[bool] = None) -> bool:
++        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
++        from sglang.srt.mem_cache.qsa_host_kv import qsa_host_kv_enabled
++
++        if parse_qsa_profile(kvc.model_config.hf_config) is None:
++            return False
++        return qsa_host_kv_enabled(
++            kvc.is_draft_worker if is_draft_worker is None else is_draft_worker
++        )
++
+     @staticmethod
+     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+         from sglang.srt.layers.attention.qsa.config import (

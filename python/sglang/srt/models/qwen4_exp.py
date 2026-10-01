@@ -1074,6 +1074,15 @@ class Qwen4ExpPLELayer(nn.Module):
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
 
+    def reset_aborted_forward_state(self) -> None:
+        """Drop a prefetch armed by a forward that raised before consuming it.
+
+        Called by the scheduler after a recovered prefill OOM, once the device is
+        drained. Without it the next eager forward raises "PLE
+        prefetch state was not consumed before reuse" at this layer.
+        """
+        self._prefetch_state = None
+
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         y = norm(x.flatten(-2, -1))
         return y.unflatten(-1, (self.hc_count, self.hidden_size))
