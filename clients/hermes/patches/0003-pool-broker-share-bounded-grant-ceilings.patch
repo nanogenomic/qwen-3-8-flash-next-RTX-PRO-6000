@@ -1,0 +1,1185 @@
+From 301b96a84f0ea8602634890f15f3e3bedb337739 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 16:32:34 -0400
+Subject: [PATCH] pool broker: bound the ceilings it GRANTS, not just the
+ reservations it measures
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A cross-session KV-pool broker publishes an allowance document that every
+agent session on the host sizes itself from. Its safety invariant summed the
+reservations it could MEASURE, not the ceilings it was handing out -- so it
+reported ok while granting two sessions the whole pool each.
+
+The live stall it was found in: /v1/loads showed 421,888 of a 451,264-token
+pool in use (0.9349), 1 running, 10 waiting, num_waiting_uncached_tokens
+479,548 -- more than the entire pool -- cache_hit_rate 0.0, gen_throughput
+0.0, and one main holding a 433,782-token prompt. The published allowance gave
+EACH of two sessions 451,264 as both its window and its growth ceiling, and
+still reported invariant ok=True.  [measured]
+
+Two mechanisms, both fixed:
+
+  * the policy returned main_grow_max = child_grow_max = pool ceiling -- the
+    whole pool, per session, unconditionally;
+  * the "mains are never shrunk" rail did mg = max(grow_max, window), which
+    raised any bounded growth ceiling back up to the session's already-grown
+    window. No policy could express "you are above your share, do not grow".
+
+Growth was bounded per STEP and unbounded in OUTCOME, so a session ratcheted
+sequentially into the whole pool.
+
+derive_window_ceilings() now splits the LIVE max_total_num_tokens: one child
+stream per granted stream is reserved first, the remainder is water-filled
+across the live mains with a guaranteed primary lane, and a GRANT invariant
+checks the worst case in which every session uses everything it was granted --
+main_window, main_grow_max, child_window_max and child_grow_max together. At a
+451,264-token pool that is 401,408 for one main, 196,608 each for two, 131,072
+for three, 98,304 for four, with the grant total fitting the 406,138 usable in
+every case.  [arithmetic, from the measured pool]
+
+Reading the pool live rather than from configuration is what makes a host-KV
+offload widen these numbers with no edit here -- see patch 0010, where
+preferring the configured ceiling over the live pool is the bug.
+
+A session already above its share is GRANDFATHERED rather than silently
+declared fine: it keeps what it holds, is granted no growth, and the invariant
+reports held_total, deadlock_risk and the pids, so a compactor shrinks it
+instead of the broker ratcheting it.
+
+The context compressor now CONSUMES main_window. Nothing read it before, so
+the number was inert and the recurrence stayed reachable with no growth at
+all: two mains at a 393,216-token configured window are 670,924 in-flight
+tokens against 406,138 usable.  [arithmetic] A grant is adopted only while the
+resident prompt still fits under the smaller trigger, so a fresh session
+settles onto its share and a live full session is left alone.
+
+BASE: this fork at commit 5a3c9f5 (see BASELINE.md).
+
+PUBLISHED FORM. Two live process ids, in one comment and in a test's
+expected `grandfathered` list, are replaced with synthetic ids (900001,
+900002). Ordering is preserved, which is all the assertion depends on.
+
+---
+ agent/context_compressor.py     |   61 ++++++
+ agent/pool_broker.py            |  380 ++++++++++++++++++++++++++++++++++++---
+ agent/pool_policy.py            |   78 ++++++--
+ tests/agent/test_pool_broker.py |  303 ++++++++++++++++++++++++++++++-
+ 4 files changed, 766 insertions(+), 56 deletions(-)
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index c0b9a7a..65dea48 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -3234,6 +3234,62 @@ class ContextCompressor(ContextEngine):
+         decision, _reason = self.should_compress_info(prompt_tokens)
+         return decision
+ 
++    def _maybe_pool_adopt_share(self, allowance, sess, role, tokens, mt, pct, cur):
++        """Adopt a window grant SMALLER than the one this agent is running at —
++        but only while the resident prompt still fits under the smaller trigger.
++        Returns the (possibly lowered) window. Never raises. [bd-dre-x3n0x]
++
++        ⛔ WHY THIS EXISTS. The broker publishes a share-bounded ``main_window``
++        per session, and until now NOTHING READ IT — it was an inert number, so
++        the only bound that bit was ``main_grow_max`` (stop growing). That leaves
++        the recurrence hole that caused the 2026-09-30 deadlock to be reachable
++        with no growth at all: two architect mains launch at the profile's
++        configured 393,216 window, whose compaction triggers are 327,270 each,
++        and 2 x 335,462 = 670,924 in-flight tokens against a 406,138-token usable
++        pool. Both sessions simply ride up to their triggers and the pool wedges.
++
++        ⛔ WHY IT NEVER SHRINKS A SESSION THAT IS ALREADY FULL. Andre 2026-09-30:
++        a live session's context is his call, not the broker's. So the grant is
++        adopted only when ``footprint(granted) > current prompt`` — i.e. when
++        lowering the window does NOT force a compaction this turn. A fresh main
++        with a 30K prompt therefore settles onto its share immediately; the
++        grandfathered 433K session is left exactly alone and is instead denied
++        growth (it appears in invariant.grants.grandfathered, and only a relaunch
++        brings its held context down).
++
++        Opt out with HERMES_POOL_SHRINK=0.
++        """
++        import os          # module-level `os` is not in this file's namespace
++
++        try:
++            if role != "main" or os.environ.get("HERMES_POOL_SHRINK", "1") == "0":
++                return cur
++            granted = int(sess.get("main_window") or 0)
++            if not granted or granted >= cur:
++                return cur
++            from agent import pool_broker as pb
++
++            floor = int(allowance.get("main_window_floor") or 0)
++            if floor and granted < floor:
++                return cur
++            if pb.footprint(granted, mt, pct) <= int(tokens or 0):
++                # Lowering it now would force a compaction the broker did not ask
++                # for. Leave the window alone; growth is refused separately.
++                return cur
++            self.context_length = granted  # setter re-derives every budget
++            logger.info(
++                "Pool share adopted (main): window %s -> %s, the share the broker "
++                "grants with %s main(s) live on a %s-token pool. Prompt %s still "
++                "sits under the new trigger %s, so nothing is compacted.",
++                f"{cur:,}", f"{granted:,}", allowance.get("n_mains"),
++                f"{int(allowance.get('pool') or 0):,}", f"{int(tokens or 0):,}",
++                f"{self.threshold_tokens:,}",
++            )
++            return granted
++        except Exception:
++            logger.debug("pool share adoption skipped", exc_info=True)
++            return cur
++
+     def _maybe_pool_grow(self, prompt_tokens: int = None) -> bool:
+         """Raise this agent's window instead of compacting, when the GPU0 pool
+         broker says the pool can absorb it. Returns True only if the raise
+@@ -3294,10 +3350,11 @@ class ContextCompressor(ContextEngine):
+             cap = int(sess.get(key) or allowance.get(key) or 0)
+             cap = min(cap, int(allowance.get("ceiling") or 0))
+             cur = int(self.context_length or 0)
+-            if not cap or cur >= cap:
+-                return False
+             mt = int(self.max_tokens or 0)
+             pct = float(getattr(self, "_base_threshold_percent", 0.5) or 0.5)
++            cur = self._maybe_pool_adopt_share(allowance, sess, role, tokens, mt, pct, cur)
++            if not cap or cur >= cap:
++                return False
+             target = pb.smallest_window_for(int(tokens * 1.5), mt, cap,
+                                             floor=cur + pb.WINDOW_GRID,
+                                             threshold_percent=pct)
+diff --git a/agent/pool_broker.py b/agent/pool_broker.py
+index 562f49d..d18ca67 100644
+--- a/agent/pool_broker.py
++++ b/agent/pool_broker.py
+@@ -91,7 +91,10 @@ class ProductionStateWriteError(BaseException):
+ def _production_root() -> Path:
+     import pwd
+ 
+-    return (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes").resolve()
++    # windows-footgun: ok - POSIX-only broker: `pwd` itself does not exist on
++    # Windows, and this path exists to name the REAL ~/.hermes that the test
++    # guard must refuse to write. There is no Windows equivalent to gate to.
++    return (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes").resolve()  # windows-footgun: ok
+ 
+ 
+ def _under_test() -> bool:
+@@ -151,7 +154,7 @@ def _heartbeat_dir() -> Path:
+ 
+ def _broker_config() -> dict:
+     try:
+-        return json.loads((hermes_root() / BROKER_CONFIG_NAME).read_text()) or {}
++        return json.loads((hermes_root() / BROKER_CONFIG_NAME).read_text(encoding="utf-8")) or {}
+     except Exception:
+         return {}
+ 
+@@ -196,6 +199,21 @@ SMALL_CTX_THRESHOLD_PERCENT = 0.75
+ MIN_CTX_TRIGGER_RATIO = 0.85
+ 
+ CHILD_FLOOR = MINIMUM_CONTEXT_LENGTH
++# Smallest window a MAIN (primary lane) may be granted. Andre 2026-09-30:
++# "56-80k for a primary lane (main architects) is insufficient" — so this is a
++# FLOOR, not a target: the share-bounded ceiling is normally far above it (see
++# derive_window_ceilings; 401,408 at one main, 196,608 at two on a 451,264 pool).
++# If N mains cannot each reach this floor, the pool genuinely cannot host them
++# and the broker publishes invariant ok=False rather than pretending otherwise.
++MAIN_WINDOW_FLOOR = int(os.environ.get("HERMES_POOL_MAIN_WINDOW_FLOOR",
++                                       str(MINIMUM_CONTEXT_LENGTH)))
++# What a main is GUARANTEED before any of its share can be lent to a busier peer.
++# Derived, not picked: Andre 2026-09-30 named 56-80K as insufficient for a primary
++# lane, so the guarantee is the first 8K rung at or above 1.5x the top of that
++# band (1.5 x 80,000 = 120,000 -> 131,072), which is also exactly the equal share
++# three mains get on the 451,264 pool — so the guarantee is consistent with the
++# largest N this pool can host at a usable window.
++GUARANTEED_LANE_WINDOW = int(os.environ.get("HERMES_POOL_LANE_GUARANTEE", "131072"))
+ WINDOW_GRID = 8_192          # windows are chosen on an 8K grid — legible, cache-friendly
+ MAIN_MAX_TOKENS_DEFAULT = 8_192
+ CHILD_MAX_TOKENS_DEFAULT = 24_576
+@@ -367,6 +385,180 @@ def largest_window_within(budget_tokens: int, max_tokens: int, ceiling: int,
+     return floor
+ 
+ 
++# =========================================================================
++# SHARE-BOUNDED CEILINGS — the grants themselves must not oversubscribe
++# [bd-dre-x3n0x]
++# =========================================================================
++# ⛔ 2026-09-30, live production stall. /v1/loads: num_used_tokens 421,888 of a
++# 451,264 pool (0.9349), 1 running, 10 waiting, num_waiting_uncached_tokens
++# 479,548 — MORE THAN THE WHOLE POOL — cache_hit_rate 0.0, gen_throughput 0.0.
++# One architect main had grown to a 522,880 window holding a 433,782-token
++# prompt: 96% of the pool in one session, prefix cache fully evicted, nothing
++# generating.
++#
++# THE BUG WAS IN THE GRANT, NOT THE MEASUREMENT. The published allowance read:
++#   pid 900001  main_window 451,264  main_grow_max 451,264  child_grow_max 451,264
++#   pid 900002  main_window 451,264  main_grow_max 451,264  child_grow_max 451,264
++#   invariant {ok: True, total: 406,137, limit: 406,138}
++# Each of two sessions was granted the ENTIRE pool as its window AND its growth
++# ceiling — 2 x 451,264 against a 451,264-token pool — and the invariant said
++# "ok" because it summed MEASURED CURRENT RESERVATIONS, not the ceilings it was
++# handing out. It was blind to the exact failure it existed to prevent.
++#
++# Two mechanisms produced it, and both are fixed:
++#   1. RulePolicy returned main_grow_max = pool.ceiling and child_grow_max =
++#      pool.ceiling — the whole pool, per session, unconditionally.
++#   2. apply_rails' old "mains are never shrunk" rail did mg = max(a.main_grow_max,
++#      main_window), which RAISED any bounded grow ceiling back up to the
++#      session's already-grown window. No policy could express "you are above
++#      your share, do not grow" even if it wanted to.
++#
++# ⛔ WHY claim_growth WAS NOT ENOUGH. Growth already debits an atomic claim
++# against live free pool, so two sessions cannot grow into the same tokens at the
++# same time. What it cannot stop is SEQUENTIAL RATCHETING: session A grows 8K
++# whenever the pool happens to be free, over and over, and with a ceiling of
++# "the whole pool" there is nothing to stop the cumulative result being the whole
++# pool. claim_growth bounds each STEP; the ceiling bounds the OUTCOME. Both are
++# needed, and claim_growth stays exactly as it is.
++#
++# ⛔ SHAPE OF THE FIX (Andre 2026-09-30: keep mains generous; GPU1 stays free for
++# training, so a second replica is not the answer). Ceilings are a SHARE of the
++# live pool, derived — never a constant and never the whole pool:
++#   * one floor-sized child is reserved first, so a main can always delegate;
++#   * what is left is split among the live mains by WATER-FILLING: each main first
++#     takes the SMALLER of an equal share and what it can actually use (never less
++#     than GUARANTEED_LANE_WINDOW — Andre: a primary lane below ~80K is useless),
++#     and whatever is then still unclaimed goes to the mains that want more, in
++#     proportion to how much more. A lender's ceiling therefore drops BELOW the
++#     equal share, which is what makes the sum add up; it is revocable at the next
++#     5 s refresh, and revoking it does not shrink the borrower — the borrower just
++#     stops being granted growth. So a busy main beside an idle one gets ~270,336,
++#     two busy mains get ~196,608 each, and one alone gets 401,408 — Andre's own
++#     statement of the real trade: "two mains at ~200K each, or one at 400K".
++#   ⛔ The obvious version of this is WRONG and was caught in test: if every main
++#     keeps a guaranteed equal share AND the under-users also lend their unused
++#     part away, the same tokens are promised twice (measured: 350,617 granted
++#     against a 348,052 budget). A lender must actually give up the share.
++#   * the child ceiling is what remains after every main's granted ceiling is
++#     paid for, divided by the shared child-stream budget.
++# Every number comes from the LIVE max_total_num_tokens, so if host-KV offload
++# raises the pool to ~1M the ceilings widen automatically with no edit here.
++#
++# When two mains genuinely cannot both be large, the honest outcome is that the
++# second one's growth claim is REFUSED and it compacts — recoverable — instead of
++# both being admitted and the pool deadlocking at gen_throughput 0.0.
++def derive_window_ceilings(usable_tokens: int, mains: List[dict], child_streams: int,
++                           child_max_tokens: int, threshold_percent: float,
++                           ceiling: int) -> tuple:
++    """Share-bounded (window, grow) ceilings whose WORST CASE fits usable_tokens.
++
++    Returns (per_pid_main_ceiling, child_ceiling, detail). `mains` rows need
++    "pid", "max_tokens" and "need" (the UNSCALED measured demand — what the
++    session can actually use; the scaled "reserved" is an artifact of over-demand
++    and would make the split depend on the scaling). Pure arithmetic — no I/O, no
++    globals beyond the geometry constants — so the regression test can drive it
++    directly, which is how the double-counting bug above was caught."""
++    # ⛔ Reserve EVERY child stream that is being granted, not one. Reserving a
++    # single floor child while the broker handed out three was a second way to
++    # over-grant: child_budget // streams fell below one floor child, and
++    # largest_window_within then returns its FLOOR, so each of three streams cost
++    # 58,086 against a 63,713 budget (measured: 516,683 granted vs 406,138 usable).
++    # max(1, ...) keeps the old guarantee that one floor child always fits even
++    # when the stream budget is momentarily 0 (VRAM critical, or a full pool).
++    reserve_child = inflight(CHILD_FLOOR, child_max_tokens, threshold_percent)
++    # ⛔ MAINS OUTRANK CHILD STREAMS. If the pool cannot afford both N main lanes
++    # and the requested streams, give up STREAMS first — a main is Andre's primary
++    # lane and a subagent is discretionary. Walk the stream count down until the
++    # whole grant fits; the caller adopts detail["child_streams"], so what is
++    # reserved is exactly what is handed out.
++    last = None
++    for streams in range(max(1, int(child_streams or 0)), 0, -1):
++        last = _derive_for_streams(usable_tokens, mains, streams, child_max_tokens,
++                                   threshold_percent, ceiling, reserve_child)
++        if last[2]["feasible"]:
++            return last
++    return last
++
++
++def _derive_for_streams(usable_tokens: int, mains: List[dict], streams: int,
++                        child_max_tokens: int, threshold_percent: float,
++                        ceiling: int, reserve_child: int) -> tuple:
++    """One candidate split at a fixed child-stream count. See derive_window_ceilings."""
++    budget = max(0, int(usable_tokens) - streams * reserve_child)
++    n = len(mains)
++    if n == 0:
++        # No mains discovered. ⛔ The published top-level main_grow_max is the
++        # FALLBACK an UNDISCOVERED main uses (context_compressor reads
++        # sessions[pid] first, then the top level), so it must not be the whole
++        # pool just because the process scan came back empty — that is the same
++        # hole by another route. It is the lane guarantee: enough to work in,
++        # small enough that several undiscovered mains still fit.
++        lone = largest_window_within(budget, MAIN_MAX_TOKENS_DEFAULT, ceiling,
++                                     floor=MAIN_WINDOW_FLOOR,
++                                     threshold_percent=threshold_percent)
++        fallback = min(GUARANTEED_LANE_WINDOW, ceiling, lone)
++        left = max(0, int(usable_tokens) - inflight(fallback, MAIN_MAX_TOKENS_DEFAULT,
++                                                   threshold_percent))
++        child = largest_window_within(left // streams,
++                                      child_max_tokens, ceiling,
++                                      floor=CHILD_FLOOR,
++                                      threshold_percent=threshold_percent)
++        cost = inflight(fallback, MAIN_MAX_TOKENS_DEFAULT, threshold_percent) \
++            + streams * inflight(child, child_max_tokens, threshold_percent)
++        return {}, child, {"equal_share": budget, "reserve_child": reserve_child,
++                           "child_streams": streams,
++                           "main_budget": budget, "lone_main_window": lone,
++                           "granted_cost": cost,
++                           "feasible": cost <= int(usable_tokens),
++                           "undiscovered_main_fallback": fallback}
++
++    equal = budget // n
++    mt_of = {int(r["pid"]): int(r.get("max_tokens") or MAIN_MAX_TOKENS_DEFAULT)
++             for r in mains}
++    want = {int(r["pid"]): max(0, int(r.get("need") or 0)) for r in mains}
++    # Round 1: the smaller of an equal share and what the session can use, but
++    # never below one guaranteed primary lane. Every first-round take is <= equal,
++    # so the round-1 total can never exceed the budget.
++    first: Dict[int, int] = {}
++    for p, w in want.items():
++        lane = inflight(min(GUARANTEED_LANE_WINDOW, ceiling), mt_of[p], threshold_percent)
++        first[p] = min(equal, max(w, lane))
++    unclaimed = max(0, budget - sum(first.values()))
++    # Round 2: whatever the lenders gave up goes to the mains that want more — and
++    # if nobody is asking for more right now, it is split evenly rather than left
++    # on the table. ⛔ Leaving it unspent caps a ceiling at CURRENT need, which
++    # would disable grow-instead-of-compact entirely (measured: a lone main with a
++    # 60K prompt was granted 131,072 instead of 401,408). A ceiling is headroom for
++    # the growth that has not happened yet, not a record of what is held.
++    extra_want = {p: max(0, want[p] - first[p]) for p in first}
++    total_extra = sum(extra_want.values())
++    even = unclaimed // n
++    out: Dict[int, int] = {}
++    for p, f in first.items():
++        share = f + ((unclaimed * extra_want[p]) // total_extra if total_extra else even)
++        out[p] = largest_window_within(share, mt_of[p], ceiling,
++                                       floor=MAIN_WINDOW_FLOOR,
++                                       threshold_percent=threshold_percent)
++    main_grant = sum(inflight(w, mt_of[p], threshold_percent) for p, w in out.items())
++    child_budget = max(0, int(usable_tokens) - main_grant)
++    child = largest_window_within(child_budget // streams,
++                                  child_max_tokens, ceiling, floor=CHILD_FLOOR,
++                                  threshold_percent=threshold_percent)
++    # ⛔ largest_window_within RETURNS ITS FLOOR when nothing fits, so a budget
++    # below one floor lane does not produce a smaller lane — it produces a lane
++    # that does not fit. That is reported, never hidden: an infeasible split means
++    # this pool cannot host N mains at a usable window plus `streams` children,
++    # and the broker publishes invariant ok=False rather than pretending.
++    cost = main_grant + streams * inflight(child, child_max_tokens, threshold_percent)
++    return out, child, {"equal_share": equal, "reserve_child": reserve_child,
++                        "child_streams": streams,
++                        "main_budget": budget, "lent_by_under_users": unclaimed,
++                        "mains_granted_cost": main_grant,
++                        "child_budget": child_budget,
++                        "granted_cost": cost,
++                        "feasible": cost <= int(usable_tokens)}
++
++
+ # ------------------------------------------------------------------- probing
+ def _get_json(path: str, timeout: float = PROBE_TIMEOUT_S) -> Optional[dict]:
+     try:
+@@ -394,7 +586,7 @@ def _profile_numbers(profile: str, _cache: Dict[str, Any] = {}) -> dict:
+     try:
+         import yaml
+ 
+-        cfg = yaml.safe_load(path.read_text()) or {}
++        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+         m = cfg.get("model") or {}
+         d = cfg.get("delegation") or {}
+         out = {
+@@ -463,7 +655,7 @@ def discover_main_sessions() -> List[dict]:
+     reg_rows: List[dict] = []
+     try:
+         reg = json.loads((Path(SESSION_REGISTRY) if SESSION_REGISTRY is not None
+-                          else hermes_root() / "bridge" / "session-rooms.json").read_text())
++                          else hermes_root() / "bridge" / "session-rooms.json").read_text(encoding="utf-8"))
+         rows = reg.get("sessions") if isinstance(reg, dict) else reg
+         # The registry keys sessions by instance, so `sessions` is a dict here.
+         if isinstance(rows, dict):
+@@ -525,7 +717,9 @@ def discover_main_sessions() -> List[dict]:
+ 
+ def _pid_alive(pid: int) -> bool:
+     try:
+-        os.kill(pid, 0)
++        # windows-footgun: ok - liveness probe for a pid from THIS host's /proc
++        # scan; signal 0 is the POSIX idiom and the broker is Linux-only.
++        os.kill(pid, 0)  # windows-footgun: ok
+         return True
+     except ProcessLookupError:
+         return False
+@@ -551,7 +745,7 @@ def read_heartbeats() -> Dict[int, dict]:
+                     pass
+                 continue
+             try:
+-                hb = json.loads(p.read_text())
++                hb = json.loads(p.read_text(encoding="utf-8"))
+             except Exception:
+                 continue
+             if time.time() - float(hb.get("updated", 0)) > 3600:
+@@ -571,14 +765,14 @@ def publish_heartbeat(**fields: Any) -> None:
+         path = _heartbeat_dir() / f"{os.getpid()}.json"
+         cur: dict = {}
+         try:
+-            cur = json.loads(path.read_text())
++            cur = json.loads(path.read_text(encoding="utf-8"))
+         except Exception:
+             cur = {}
+         cur.update(fields)
+         cur["pid"] = os.getpid()
+         cur["updated"] = time.time()
+         tmp = path.with_suffix(".json.tmp")
+-        tmp.write_text(json.dumps(cur))
++        tmp.write_text(json.dumps(cur), encoding="utf-8")
+         os.replace(tmp, path)
+     except Exception:
+         logger.debug("pool broker: heartbeat write failed", exc_info=True)
+@@ -587,7 +781,7 @@ def publish_heartbeat(**fields: Any) -> None:
+ # ----------------------------------------------------------------- the policy
+ def _previous_allowance() -> dict:
+     try:
+-        return json.loads(_allowance_path().read_text())
++        return json.loads(_allowance_path().read_text(encoding="utf-8"))
+     except Exception:
+         return {}
+ 
+@@ -643,12 +837,12 @@ def claim_growth(delta_tokens: int, role: str = "child") -> tuple:
+             return False, f"pool pressure {a.get('pressure')}"
+         _run_dir().mkdir(parents=True, exist_ok=True)
+         claims_path = _run_dir() / "gpu0-grow-claims.json"
+-        with open(_lock_path().with_suffix(".claims.lock"), "a+") as fh:
++        with open(_lock_path().with_suffix(".claims.lock"), "a+", encoding="utf-8") as fh:
+             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+             try:
+                 now = time.time()
+                 try:
+-                    claims = json.loads(claims_path.read_text())
++                    claims = json.loads(claims_path.read_text(encoding="utf-8"))
+                 except Exception:
+                     claims = []
+                 # Claims made before the allowance was measured are still
+@@ -664,7 +858,7 @@ def claim_growth(delta_tokens: int, role: str = "child") -> tuple:
+                 claims.append({"pid": os.getpid(), "role": role, "tokens": int(delta_tokens),
+                                "at": now})
+                 tmp = claims_path.with_suffix(f".{os.getpid()}.tmp")
+-                tmp.write_text(json.dumps(claims))
++                tmp.write_text(json.dumps(claims), encoding="utf-8")
+                 os.replace(tmp, claims_path)
+                 return True, f"claimed {delta_tokens:,} of {free:,} free"
+             finally:
+@@ -770,14 +964,6 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+             r["reserved"] = int(r["need"] * f)
+     main_reserved = sum(r["reserved"] for r in main_rows)
+ 
+-    for r in main_rows:
+-        records.append(pp.SessionRecord(
+-            session_key=str(r["pid"]), pid=r["pid"], profile=r["profile"], role="main",
+-            session_id=r["session_id"], context_length=r["window"], max_tokens=r["max_tokens"],
+-            prompt_tokens=r["prompt_tokens"], recent_growth_tokens=r["recent_growth_tokens"],
+-            children_active=r["children_active"],
+-            children_pending=r["children_pending"], reports=r["reports"]))
+-
+     # 2. What is left of the usable pool belongs to children (>= one floor child).
+     child_pool = usable - main_reserved
+ 
+@@ -821,13 +1007,48 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+     prio_enabled = bool(info.get("enable_priority_scheduling"))
+     prio_abort = bool(info.get("abort_on_priority_when_disabled"))
+ 
++    # ⛔ SHARE-BOUNDED CEILINGS — computed BEFORE the policy runs, so the policy
++    # sees the cap as an input and the rails enforce it on any policy's output.
++    # See derive_window_ceilings for why the old "whole pool per session" grant
++    # deadlocked the box on 2026-09-30.
++    main_ceilings, child_ceiling, ceiling_detail = derive_window_ceilings(
++        usable, main_rows, child_streams, child_max_tokens, pct, ceiling)
++    # Adopt the stream count the split could actually pay for: mains outrank
++    # discretionary subagents, so this only ever goes down. Reserving 3 streams
++    # and handing out 3 must be the same number.
++    if child_streams:
++        child_streams = min(child_streams, int(ceiling_detail.get("child_streams")
++                                               or child_streams))
++    if not ceiling_detail.get("feasible", True):
++        logger.error(
++            "pool broker: %d main(s) at a usable window plus %d child stream(s) do "
++            "not fit %s usable tokens (granted cost %s). Mains are held at the "
++            "%s-token floor and the grant invariant is published not-ok — this pool "
++            "cannot host this many primary lanes.", n_mains, child_streams,
++            f"{usable:,}", f"{ceiling_detail.get('granted_cost', 0):,}",
++            f"{MAIN_WINDOW_FLOOR:,}")
++    for r in main_rows:
++        r["window_ceiling"] = int(main_ceilings.get(r["pid"], ceiling))
++        # A main whose HELD window is above its share: it keeps what it holds (no
++        # forced shrink — Andre owns that call for a live session) but it is
++        # granted no growth, so it compacts instead of ratcheting further.
++        r["over_ceiling"] = bool(r["window"] > r["window_ceiling"])
++        records.append(pp.SessionRecord(
++            session_key=str(r["pid"]), pid=r["pid"], profile=r["profile"], role="main",
++            session_id=r["session_id"], context_length=r["window"], max_tokens=r["max_tokens"],
++            prompt_tokens=r["prompt_tokens"], recent_growth_tokens=r["recent_growth_tokens"],
++            children_active=r["children_active"],
++            children_pending=r["children_pending"], reports=r["reports"],
++            window_ceiling=r["window_ceiling"]))
++
+     state = pp.PoolState(
+         pool_tokens=pool, used_tokens=used, token_usage=tu, free_tokens=free_tokens,
+         ceiling=ceiling, max_running_requests=mrr, running=running, waiting=waiting,
+         cache_reserve_tokens=cache_reserve, stream_cap=STREAM_CAP,
+         child_streams_budget=child_streams, child_pool_tokens=child_pool,
+         child_max_tokens=child_max_tokens, child_floor=CHILD_FLOOR,
+-        priority_enabled=prio_enabled, pressure=pressure, compression_threshold=pct)
++        priority_enabled=prio_enabled, pressure=pressure, compression_threshold=pct,
++        child_window_ceiling=child_ceiling, main_window_floor=MAIN_WINDOW_FLOOR)
+ 
+     # 5. Policy: rule by default; a pluggable one if configured; rails always.
+     rule = pp.RulePolicy()
+@@ -877,6 +1098,8 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+                                                   threshold_percent=pct))
+         if pressure == "hot":
+             child_window_max = min(child_window_max, pp.HOT_CHILD_WINDOW_MAX)
++        # Never advertise an initial child window above the child grow ceiling.
++        child_window_max = max(CHILD_FLOOR, min(child_window_max, child_ceiling))
+ 
+     # ⛔ INVARIANT ENFORCEMENT: Σ reservations <= pool - cache reserve. Children
+     # are one SHARED budget of `child_streams` streams (per-session child_streams
+@@ -893,14 +1116,96 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+     child_window_max = min((v.child_window_max for v in sessions_out.values()), default=child_window_max)
+     children_reserved = child_streams * inflight(child_window_max, child_max_tokens, pct)
+     reserved_total = main_reserved + children_reserved
++
++    # ⛔ GRANT INVARIANT [bd-dre-x3n0x]: the WORST CASE IF EVERY SESSION USED WHAT
++    # IT WAS GRANTED must fit. The old invariant summed only measured current
++    # reservations, so it reported ok=True while each of two mains held a grant of
++    # the entire pool as window and growth ceiling. This is the check that was
++    # missing, and it covers main_window, main_grow_max, child_window_max and
++    # child_grow_max. Enforce first (clamp until it holds), then report.
++    grow_cap_child = max((v.child_grow_max for v in sessions_out.values()),
++                         default=child_ceiling)
++    mt_by_pid = {r["pid"]: r["max_tokens"] for r in main_rows}
++
++    def _granted_cost() -> tuple:
++        m = sum(inflight(max(v.main_window, v.main_grow_max),
++                         mt_by_pid.get(int(k), MAIN_MAX_TOKENS_DEFAULT), pct)
++                for k, v in sessions_out.items())
++        c = child_streams * inflight(max((v.child_grow_max for v in sessions_out.values()),
++                                         default=child_ceiling), child_max_tokens, pct)
++        return m, c
++
++    mains_granted, children_granted = _granted_cost()
++    # Belt to the rails' braces: shrink the child grow ceiling, then the main
++    # ceilings, one grid step at a time until the granted worst case fits. This
++    # should never fire (derive_window_ceilings sizes them to fit), so it logs.
++    _guard = 0
++    while sessions_out and mains_granted + children_granted > usable and _guard < 512:
++        _guard += 1
++        cg_now = max((v.child_grow_max for v in sessions_out.values()), default=CHILD_FLOOR)
++        if cg_now > CHILD_FLOOR:
++            for v in sessions_out.values():
++                v.child_grow_max = max(CHILD_FLOOR, min(v.child_grow_max,
++                                                        cg_now - WINDOW_GRID))
++                v.child_window_max = min(v.child_window_max, v.child_grow_max)
++        else:
++            biggest = max(sessions_out.values(),
++                          key=lambda v: max(v.main_window, v.main_grow_max))
++            tgt = max(MAIN_WINDOW_FLOOR,
++                      max(biggest.main_window, biggest.main_grow_max) - WINDOW_GRID)
++            if tgt >= max(biggest.main_window, biggest.main_grow_max):
++                break
++            biggest.main_window = min(biggest.main_window, tgt)
++            biggest.main_grow_max = min(biggest.main_grow_max, tgt)
++        mains_granted, children_granted = _granted_cost()
++    if _guard:
++        logger.error("pool broker clamped granted ceilings %d step(s) to fit "
++                     "usable %s — derive_window_ceilings under-sized", _guard, usable)
++    child_window_max = min((v.child_window_max for v in sessions_out.values()),
++                           default=child_window_max)
++    grow_cap_child = max((v.child_grow_max for v in sessions_out.values()),
++                         default=child_ceiling)
++    granted_total = mains_granted + children_granted
++    # What the mains are HOLDING right now, worst case, at their current windows.
++    # This may legitimately exceed `usable` when a session grew before the pool
++    # shrank (or before this fix): it is grandfathered, not granted, and it is
++    # reported rather than hidden so the stall is visible in the allowance file.
++    held_total = sum(r["peak"] for r in main_rows) + children_reserved
++    grants = {
++        "mains_granted": mains_granted, "children_granted": children_granted,
++        "total": granted_total, "limit": usable, "ok": granted_total <= usable,
++        # The literal token sum Andre asked to be asserted: Σ granted window
++        # ceilings <= pool - cache reserve. 2 x 451,264 = 902,528 vs 406,138 was
++        # the published state during the deadlock.
++        "window_ceiling_sum": sum(max(v.main_window, v.main_grow_max)
++                                  for v in sessions_out.values()),
++        "child_grow_max": grow_cap_child,
++        "held_total": held_total,
++        "deadlock_risk": held_total > usable,
++        "grandfathered": sorted(r["pid"] for r in main_rows if r["over_ceiling"]),
++        "detail": ceiling_detail,
++    }
+     invariant = {
+         "mains_reserved": main_reserved, "children_reserved": children_reserved,
+-        "total": reserved_total, "limit": usable, "ok": reserved_total <= usable,
++        "total": reserved_total, "limit": usable,
++        "reservations_ok": reserved_total <= usable,
++        "ok": reserved_total <= usable and grants["ok"],
+         "mains_scaled": scaled, "mains_need": need_total,
++        "grants": grants,
+     }
+-    if not invariant["ok"]:
++    if not invariant["reservations_ok"]:
+         logger.error("pool broker INVARIANT VIOLATED: reserved %s > usable %s (%s)",
+                      reserved_total, usable, invariant)
++    if not grants["ok"]:
++        logger.error("pool broker GRANT INVARIANT VIOLATED: granted ceilings %s > "
++                     "usable %s (%s)", granted_total, usable, grants)
++    if grants["deadlock_risk"]:
++        logger.error(
++            "pool broker: mains are HOLDING %s of %s usable tokens (pids %s are above "
++            "their share). Growth is refused for them so they compact instead of "
++            "ratcheting; a session whose resident prompt already exceeds its share's "
++            "compaction trigger cannot shrink itself and needs a relaunch.",
++            f"{held_total:,}", f"{usable:,}", grants["grandfathered"])
+ 
+     return {
+         "version": 3,
+@@ -931,8 +1236,22 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+         # concurrency cap both read it.
+         "admit_children": vram["state"] != "critical",
+         "free_tokens": free_tokens,
+-        "main_grow_max": ceiling,
+-        "child_grow_max": (ceiling if pressure == "normal" else child_window_max),
++        # ⛔ These two are the FALLBACK a consumer uses when its own pid is not in
++        # `sessions` — a child process always lands here, since `sessions` is keyed
++        # by MAIN pids (see context_compressor._pool_grow: sess.get(key) or
++        # allowance.get(key)). They were `ceiling` — the whole pool — which is how
++        # every child was told it could grow to 451,264 tokens. They are now the
++        # share-bounded ceilings.
++        "main_window_ceiling": (min(main_ceilings.values()) if main_ceilings
++                                else ceiling_detail.get("undiscovered_main_fallback",
++                                                        GUARANTEED_LANE_WINDOW)),
++        "main_grow_max": (min(main_ceilings.values()) if main_ceilings
++                          else ceiling_detail.get("undiscovered_main_fallback",
++                                                  GUARANTEED_LANE_WINDOW)),
++        "child_window_ceiling": child_ceiling,
++        "child_grow_max": (grow_cap_child if pressure == "normal"
++                           else min(child_window_max, grow_cap_child)),
++        "main_window_floor": MAIN_WINDOW_FLOOR,
+         "sessions": {k: v.to_dict() for k, v in sessions_out.items()},
+         "shadow": shadow,
+         "priority": {
+@@ -1017,7 +1336,10 @@ def vram_sample(force: bool = False) -> Optional[dict]:
+         value = None
+         if cmd:
+             try:
+-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
++                # encoding/errors are explicit: text=True alone decodes with
++                # locale.getpreferredencoding() (scripts/check-windows-footguns.py).
++                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
++                                   errors="replace", timeout=8)
+                 raw = json.loads(r.stdout)
+                 g = (raw.get("gpus") or {}).get(str(GPU_INDEX)) or {}
+                 free = int(g.get("free_mib"))
+@@ -1126,7 +1448,7 @@ def refresh(force: bool = False) -> Optional[dict]:
+     try:
+         _run_dir().mkdir(parents=True, exist_ok=True)
+         tmp = _allowance_path().with_suffix(f".json.{os.getpid()}.tmp")
+-        tmp.write_text(json.dumps(allowance, indent=1))
++        tmp.write_text(json.dumps(allowance, indent=1), encoding="utf-8")
+         os.replace(tmp, _allowance_path())
+     except Exception:
+         logger.debug("pool broker: allowance write failed", exc_info=True)
+@@ -1144,7 +1466,7 @@ def _refresh_locked() -> Optional[dict]:
+     guard_production_write(_lock_path())
+     try:
+         _run_dir().mkdir(parents=True, exist_ok=True)
+-        with open(_lock_path(), "a+") as fh:
++        with open(_lock_path(), "a+", encoding="utf-8") as fh:
+             try:
+                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+             except OSError:
+@@ -1191,7 +1513,7 @@ def get_allowance() -> Optional[dict]:
+                 return _memo["value"]
+         value = None
+         try:
+-            value = json.loads(_allowance_path().read_text())
++            value = json.loads(_allowance_path().read_text(encoding="utf-8"))
+         except Exception:
+             value = None
+         age = now - float((value or {}).get("updated", 0))
+diff --git a/agent/pool_policy.py b/agent/pool_policy.py
+index 888de9a..2c9980a 100644
+--- a/agent/pool_policy.py
++++ b/agent/pool_policy.py
+@@ -35,11 +35,22 @@ OUTPUT
+   same for everyone.
+ 
+ HARD RAILS the broker applies AFTER any policy (a policy cannot violate them):
+-  * main_window is never below the session's current window (mains are
+-    protected: an allocator may grow a main, never shrink it) and never above
+-    pool.ceiling.
+-  * child_window_max and child_grow_max are clamped to [pool.child_floor,
+-    pool.ceiling]; child_grow_max >= child_window_max.
++  * main_window and main_grow_max are clamped to
++    [MAIN_WINDOW_FLOOR, min(pool.ceiling, session.window_ceiling)].
++    ⛔ window_ceiling is the SHARE-BOUNDED cap the broker derives so that the
++    GRANTS THEMSELVES cannot oversubscribe the pool (see below). It replaces the
++    old "mains are never shrunk" rail, which was the mechanical cause of the
++    2026-09-30 deadlock: that rail raised main_grow_max back up to the session's
++    already-grown window, so no policy could express "you are above your share,
++    you may not grow", and two mains were each granted the entire 451,264-token
++    pool as window AND growth ceiling.
++    main_grow_max is deliberately ALLOWED to be below main_window. That is how
++    "hold what you have, but do not grow" is expressed: context_compressor's
++    grow-instead-of-compact path sees cur >= cap and compacts instead. Refusing
++    growth is recoverable; a deadlocked pool is not.
++  * child_window_max and child_grow_max are clamped to
++    [pool.child_floor, min(pool.ceiling, pool.child_window_ceiling)];
++    child_grow_max >= child_window_max.
+   * each session's child_streams is clamped to [1, pool.child_streams_budget]
+     (slots left after one per main, bounded by memory). It is an UPPER BOUND:
+     at dispatch time a session also subtracts the children the OTHER sessions
+@@ -71,6 +82,12 @@ logger = logging.getLogger(__name__)
+ 
+ ALLOCATE_BUDGET_MS = 200
+ HOT_CHILD_WINDOW_MAX = 98_304   # nominal child rung (64,000 trigger at a 24,576 output cap)
++# Smallest window a main may be granted. Duplicated from
++# pool_broker.MINIMUM_CONTEXT_LENGTH rather than imported: pool_broker imports
++# this module's names inside functions and a module-level cycle would be worse.
++# If N mains cannot each get this much, the pool genuinely cannot host them and
++# the broker reports invariant not-ok rather than splitting into unusable slivers.
++MAIN_WINDOW_FLOOR = 64_000
+ 
+ 
+ @dataclass(frozen=True)
+@@ -87,6 +104,11 @@ class SessionRecord:
+     children_active: int             # children of this session running right now
+     children_pending: int            # children queued behind this session's own cap
+     reports: bool                    # True if the session runs broker-aware code
++    # ⛔ SHARE-BOUNDED CAP for this main's window AND growth ceiling, tokens.
++    # The broker derives it so that the worst case — every live session running
++    # at everything it was granted — still fits pool - cache_reserve. 0 means
++    # "unset, use pool.ceiling" (only when the broker could not derive one).
++    window_ceiling: int = 0
+ 
+ 
+ @dataclass(frozen=True)
+@@ -108,6 +130,11 @@ class PoolState:
+     priority_enabled: bool           # server honours request priority right now
+     pressure: str                    # "normal" | "hot" | "critical" (memory, not queue)
+     compression_threshold: float = 0.5   # profile compression.threshold (mains AND children)
++    # ⛔ SHARE-BOUNDED CAP for child_window_max AND child_grow_max, tokens.
++    # What is left of the usable pool once every main's granted ceiling is paid
++    # for, divided by the shared child-stream budget. 0 = unset -> pool.ceiling.
++    child_window_ceiling: int = 0
++    main_window_floor: int = MAIN_WINDOW_FLOOR   # pool_broker.MAIN_WINDOW_FLOOR
+ 
+ 
+ @dataclass
+@@ -138,12 +165,13 @@ class AllocationPolicy(Protocol):
+ class RulePolicy:
+     """Main-first, memory-keyed, legible.
+ 
+-    * every main keeps its current window and may grow to the ceiling;
++    * every main is granted its current window and growth ceiling bounded by its
++      SHARE of the pool (SessionRecord.window_ceiling) — never the whole pool;
+     * child streams are split so sessions with children in flight share what the
+       others are not using (the per-dispatch check refines this live);
+     * the initial child window is the largest whose in-flight cost fits an even
+-      share of the child pool; growth to the ceiling is allowed only while
+-      pressure is "normal".
++      share of the child pool, bounded by pool.child_window_ceiling; growth to
++      that ceiling is allowed only while pressure is "normal".
+     """
+ 
+     name = "rule-v1"
+@@ -164,20 +192,27 @@ class RulePolicy:
+             # huge INITIAL window just because the streams were halved. It can
+             # still grow later if pressure falls back to normal.
+             child_max = min(child_max, HOT_CHILD_WINDOW_MAX)
+-        grow = pool.ceiling if pool.pressure == "normal" else child_max
++        # ⛔ The child ceiling is a SHARE, not the pool. `pool.ceiling` here was
++        # the second half of the 2026-09-30 over-grant: every child was told it
++        # could grow to the entire 451,264-token pool.
++        child_cap = min(pool.ceiling, pool.child_window_ceiling or pool.ceiling)
++        child_max = min(child_max, child_cap)
++        grow = child_cap if pool.pressure == "normal" else child_max
+         out: Dict[str, SessionAllowance] = {}
+         for s in sessions:
++            main_cap = min(pool.ceiling, s.window_ceiling or pool.ceiling)
+             out[s.session_key] = SessionAllowance(
+-                main_window=s.context_length,
+-                main_grow_max=pool.ceiling,
++                main_window=min(s.context_length, main_cap),
++                main_grow_max=main_cap,
+                 # Upper bound; the dispatch-time check subtracts what the OTHER
+                 # sessions' children are already using.
+                 child_streams=budget,
+                 child_window_max=child_max,
+                 child_grow_max=grow,
+-                reason=(f"{self.name}: {len(sessions)} main(s) protected; "
+-                        f"{budget} child stream(s) of {pool.child_pool_tokens:,} "
+-                        f"child-pool tokens; memory {pool.token_usage:.0%} "
++                reason=(f"{self.name}: {len(sessions)} main(s) sharing the pool, "
++                        f"main cap {main_cap:,}; {budget} child stream(s) of "
++                        f"{pool.child_pool_tokens:,} child-pool tokens, child cap "
++                        f"{child_cap:,}; memory {pool.token_usage:.0%} "
+                         f"({pool.pressure})"),
+             )
+         return out
+@@ -218,10 +253,17 @@ def apply_rails(result: Dict[str, SessionAllowance], sessions: Sequence[SessionR
+         a = result.get(key) if isinstance(result, dict) else None
+         if not isinstance(a, SessionAllowance):
+             a = fallback[key]
+-        mw = min(max(int(a.main_window), s.context_length), pool.ceiling)
+-        mg = min(max(int(a.main_grow_max), mw), pool.ceiling)
+-        cw = min(max(int(a.child_window_max), pool.child_floor), pool.ceiling)
+-        cg = min(max(int(a.child_grow_max), cw), pool.ceiling)
++        # ⛔ SHARE-BOUNDED, not pool-bounded. The clamp is to the session's own
++        # ceiling; main_grow_max is NOT lifted to main_window (see the module
++        # docstring) — a session already above its share must be able to be told
++        # "no growth" rather than having its ceiling inflated back to its window.
++        main_cap = min(pool.ceiling, s.window_ceiling or pool.ceiling)
++        mfloor = min(int(pool.main_window_floor or MAIN_WINDOW_FLOOR), pool.ceiling)
++        mw = min(max(int(a.main_window), mfloor), main_cap)
++        mg = min(max(int(a.main_grow_max), mfloor), main_cap)
++        child_cap = min(pool.ceiling, pool.child_window_ceiling or pool.ceiling)
++        cw = min(max(int(a.child_window_max), pool.child_floor), child_cap)
++        cg = min(max(int(a.child_grow_max), cw), child_cap)
+         out[key] = SessionAllowance(
+             main_window=mw, main_grow_max=mg,
+             child_streams=min(max(1, int(a.child_streams)), max(1, pool.child_streams_budget)),
+diff --git a/tests/agent/test_pool_broker.py b/tests/agent/test_pool_broker.py
+index a88c113..b91615d 100644
+--- a/tests/agent/test_pool_broker.py
++++ b/tests/agent/test_pool_broker.py
+@@ -1,11 +1,22 @@
+ # Copyright © 2026 Ligandal, Inc. All rights reserved.
+-"""Pool broker invariant: Σ reservations <= pool - cache reserve, always.
+-[bd-dre-p4pjw]
++"""Pool broker invariants. [bd-dre-p4pjw, bd-dre-x3n0x]
+ 
+-The first broker reserved every main's PEAK and still granted a child, promising
+-654,054 tokens against a 643,456 pool with three mains live. These tests pin the
+-invariant at 1-4 mains, with measured and unmeasured prompts, under every
+-pressure level, and against a policy that tries to break it.
++TWO invariants, and the second one is the whole point of this file now:
++
++1. RESERVATIONS: Σ measured reservations <= pool - cache reserve. The first
++   broker reserved every main's PEAK and still granted a child, promising 654,054
++   tokens against a 643,456 pool with three mains live.
++
++2. GRANTS: Σ of the CEILINGS HANDED OUT (main_window, main_grow_max,
++   child_window_max, child_grow_max) <= pool - cache reserve — the worst case if
++   every session used everything it was granted. Invariant 1 alone is blind to
++   the failure it exists to prevent: on 2026-09-30 it published ok=True while
++   each of two mains was granted the ENTIRE 451,264-token pool as its window and
++   its growth ceiling, and the box deadlocked at gen_throughput 0.0 with
++   num_waiting_uncached_tokens 479,548 — more than the whole pool.
++
++Both are pinned at 1-4 mains, with measured and unmeasured prompts, under every
++pressure level, and against a policy that tries to break them.
+ """
+ import itertools
+ 
+@@ -43,17 +54,70 @@ def _mains(n):
+     return [{"pid": 1000 + i, "profile": "architect", "session_id": f"s{i}"} for i in range(n)]
+ 
+ 
++def _check_grants(a, pool=None):
++    """Invariant 2: the worst case if every session used what it was GRANTED.
++
++    Recomputed here from the published document rather than read out of
++    a["invariant"]["grants"], so a broken derivation cannot self-certify."""
++    pool = pool or POOL
++    usable = pool - a["cache_reserve"]
++    pct = a["compression_threshold"]
++    mt = {str(m["pid"]): m["max_tokens"] for m in a["mains"]}
++    sessions = a["sessions"]
++    mains_granted = sum(
++        pb.inflight(max(s["main_window"], s["main_grow_max"]),
++                    mt.get(k, pb.MAIN_MAX_TOKENS_DEFAULT), pct)
++        for k, s in sessions.items())
++    children_granted = a["child_streams_total"] * pb.inflight(
++        max([s["child_grow_max"] for s in sessions.values()] or [a["child_grow_max"]]),
++        a["child_max_tokens"], pct)
++    # ⛔ THE COST FORM IS THE INVARIANT, not the sum of the window NUMBERS. A
++    # window of w tokens occupies inflight(w) = ~0.85*(w - max_tokens) + max_tokens
++    # of the pool, because a session compacts at its trigger rather than at its
++    # window. Asserting Σ w <= usable is STRICTER THAN PHYSICS and would force
++    # needlessly small windows (measured: three 221,184 mains sum to 663,552 window
++    # tokens but only 503,808 pool tokens, which fits 579,111 fine). The live-pool
++    # regression test below also asserts the raw-number form, because at two mains
++    # on 451,264 it does hold and it is the sentence the incident was written in.
++    assert mains_granted + children_granted <= usable, (
++        "GRANTED ceilings oversubscribe the pool: mains %d + children %d > usable %d; "
++        "per-session %s" % (mains_granted, children_granted, usable,
++                            {k: (s["main_window"], s["main_grow_max"], s["child_grow_max"])
++                             for k, s in sessions.items()}))
++    for k, s in sessions.items():
++        assert s["main_window"] <= a["ceiling"]
++        assert s["main_grow_max"] <= a["ceiling"]
++        assert s["child_grow_max"] <= a["ceiling"]
++        assert s["child_window_max"] <= s["child_grow_max"]
++        if sessions:
++            assert s["main_window"] >= min(pb.MAIN_WINDOW_FLOOR, a["ceiling"])
++    # The top-level keys are the fallback an UNDISCOVERED main or any CHILD uses
++    # (context_compressor reads sessions[pid] first, then these) — they must be
++    # bounded too, which is how every child was told it could grow to the pool.
++    assert a["main_grow_max"] <= a["ceiling"]
++    assert a["child_grow_max"] <= a["ceiling"]
++    assert pb.inflight(a["main_grow_max"], pb.MAIN_MAX_TOKENS_DEFAULT, pct) <= usable
++    assert a["invariant"]["grants"]["ok"], a["invariant"]["grants"]
++    return mains_granted + children_granted
++
++
+ def _check(a):
+     inv = a["invariant"]
+     usable = POOL - a["cache_reserve"]
+     total = (sum(m["reserved"] for m in a["mains"])
+              + a["child_streams_total"] * pb.inflight(a["child_window_max"], 24_576))
+     assert inv["ok"], inv
++    assert inv["reservations_ok"], inv
+     assert total <= usable, (total, usable)
+     assert inv["total"] == total
+     for s in a["sessions"].values():
+         assert s["child_window_max"] <= a["child_window_max"] or a["child_streams_total"] == 0
+-        assert s["main_window"] == 262_144          # mains are never shrunk
++        # ⛔ WAS `== 262_144` ("mains are never shrunk"). That rail is exactly what
++        # inflated every grow ceiling back to the session's own window, so no
++        # policy could say "you are above your share, do not grow". A main is now
++        # granted at most its SHARE; it is never granted the whole pool.
++        assert s["main_window"] <= 262_144
++    _check_grants(a)
+     return total
+ 
+ 
+@@ -111,6 +175,231 @@ def test_growth_claims_cannot_double_spend(monkeypatch):
+     assert ok1 and not ok2, why
+ 
+ 
++# =====================================================================
++# THE REGRESSION TEST FOR THE 2026-09-30 DEADLOCK  [bd-dre-x3n0x]
++# =====================================================================
++# The geometry below is the live production stall, copied from /v1/loads, the
++# heartbeats and the published allowance, not invented:
++#   pool 451,264   used 421,888 (token_usage 0.9349)   1 running, 10 waiting
++#   num_waiting_uncached_tokens 479,548  (more than the whole pool)
++#   cache_hit_rate 0.0   gen_throughput 0.0
++#   pid 900001  prompt 433,782  window grown to 522,880
++#   pid 900002  prompt 306,253  window grown to 522,880
++# and the allowance the broker published while that was true:
++#   both pids: main_window 451,264  main_grow_max 451,264  child_grow_max 451,264
++#   invariant {ok: True, total: 406,137, limit: 406,138, mains_scaled: True}
++# ⛔ THE OLD INVARIANT PASSED HERE. It summed measured reservations, so it could
++# not see 2 x 451,264 granted against a 451,264 pool. These tests fail on that
++# geometry and pass only once the GRANTS are bounded.
++LIVE_POOL = 451_264
++LIVE_INFO = {"context_length": 540_000, "max_req_input_len": 451_258,
++             "max_running_requests": 4, "max_total_num_tokens": LIVE_POOL,
++             "enable_priority_scheduling": False,
++             "abort_on_priority_when_disabled": False, "schedule_policy": "fcfs"}
++LIVE_LOAD = {"max_total_num_tokens": LIVE_POOL, "max_running_requests": 4,
++             "num_used_tokens": 421_888, "token_usage": 0.9349,
++             "num_running_reqs": 1, "num_waiting_reqs": 10}
++
++
++@pytest.fixture
++def _architect(monkeypatch):
++    """The live architect profile: 393,216 window, 0.85 compaction threshold."""
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: {
++        "context_length": 393_216, "max_tokens": 8_192,
++        "delegation_max_tokens": 24_576, "compression_threshold": 0.85})
++    monkeypatch.setattr(pb, "vram_assessment",
++                        lambda queued=0, sample=None: {"state": "unknown", "why": "",
++                                                       "child_cap": 9})
++
++
++def test_two_mains_on_the_live_pool_are_not_each_granted_all_of_it(_architect):
++    a = pb.compute_allowance(
++        LIVE_INFO, LIVE_LOAD,
++        [{"pid": 900001, "profile": "architect", "session_id": "a"},
++         {"pid": 900002, "profile": "architect", "session_id": "b"}],
++        {900001: {"prompt_tokens": 433_782, "main_context_length": 522_880,
++                   "children_active": 2},
++         900002: {"prompt_tokens": 306_253, "main_context_length": 522_880,
++                   "children_active": 1}})
++    usable = LIVE_POOL - a["cache_reserve"]
++    assert usable == 406_138                       # 451,264 - 10%
++    _check_grants(a, LIVE_POOL)
++
++    # The literal assertion from the brief, spelled out so a future regression
++    # reads as the sentence it violates.
++    granted = sum(s["main_grow_max"] for s in a["sessions"].values())
++    assert granted <= usable, (
++        "two mains were granted %d tokens of growth ceiling against a %d-token "
++        "usable pool (the 2026-09-30 deadlock published 902,528)" % (granted, usable))
++    assert len(a["sessions"]) == 2
++    for s in a["sessions"].values():
++        assert s["main_grow_max"] < LIVE_POOL
++        assert s["child_grow_max"] < LIVE_POOL
++        # Andre 2026-09-30: 56-80K is insufficient for a primary lane. Two mains
++        # on this pool get ~196,608 each — the real trade, not a sliver.
++        assert s["main_window"] >= 131_072, s
++
++    # A session already holding more than its share is GRANDFATHERED, never
++    # silently "ok": it keeps what it holds, is granted no growth (so
++    # context_compressor compacts instead of ratcheting further), and the
++    # over-hold is reported so the stall is visible in the allowance file.
++    grants = a["invariant"]["grants"]
++    assert grants["deadlock_risk"] is True
++    assert grants["grandfathered"] == [900001, 900002]
++    for r in a["mains"]:
++        assert r["over_ceiling"] is True
++        assert r["window_ceiling"] < r["window"]
++
++
++@pytest.mark.parametrize("n", [1, 2, 3, 4])
++def test_live_pool_grants_fit_at_every_main_count(_architect, n):
++    """Every main demanding everything, on the live pool, at 1-4 mains."""
++    a = pb.compute_allowance(
++        LIVE_INFO, LIVE_LOAD,
++        [{"pid": 3_700_000 + i, "profile": "architect", "session_id": "s%d" % i}
++         for i in range(n)],
++        {3_700_000 + i: {"prompt_tokens": 433_782} for i in range(n)})
++    _check_grants(a, LIVE_POOL)
++    assert len(a["sessions"]) == n
++
++
++def test_grow_ceiling_may_sit_below_a_grown_window(_architect):
++    """The mechanism the old rail made impossible.
++
++    apply_rails used mg = max(policy_grow_max, main_window), so a session that had
++    already grown past its share had its ceiling inflated straight back to its
++    window and kept growing. `main_grow_max <= main_window` is how "hold what you
++    have, do not grow" is expressed; context_compressor._pool_grow then sees
++    cur >= cap and compacts, which is recoverable."""
++    a = pb.compute_allowance(
++        LIVE_INFO, LIVE_LOAD,
++        [{"pid": 1, "profile": "architect", "session_id": "a"},
++         {"pid": 2, "profile": "architect", "session_id": "b"}],
++        {1: {"prompt_tokens": 433_782, "main_context_length": 522_880},
++         2: {"prompt_tokens": 306_253, "main_context_length": 522_880}})
++    for r in a["mains"]:
++        held = r["window"]
++        cap = a["sessions"][str(r["pid"])]["main_grow_max"]
++        assert cap < held, (cap, held)          # growth refused, not inflated
++
++
++def test_ceilings_widen_with_the_live_pool(_architect):
++    """Read the LIVE max_total_num_tokens — host-KV offload must need no edit."""
++    small = pb.compute_allowance(
++        LIVE_INFO, LIVE_LOAD,
++        [{"pid": 1, "profile": "architect", "session_id": "a"},
++         {"pid": 2, "profile": "architect", "session_id": "b"}],
++        {1: {"prompt_tokens": 433_782}, 2: {"prompt_tokens": 433_782}})
++    big_pool = 1_048_576
++    big_info = dict(LIVE_INFO, max_total_num_tokens=big_pool,
++                    max_req_input_len=big_pool - 6, context_length=1_200_000)
++    big_load = dict(LIVE_LOAD, max_total_num_tokens=big_pool,
++                    num_used_tokens=int(big_pool * 0.3), token_usage=0.3,
++                    num_waiting_reqs=0)
++    big = pb.compute_allowance(
++        big_info, big_load,
++        [{"pid": 1, "profile": "architect", "session_id": "a"},
++         {"pid": 2, "profile": "architect", "session_id": "b"}],
++        {1: {"prompt_tokens": 433_782}, 2: {"prompt_tokens": 433_782}})
++    _check_grants(big, big_pool)
++    a_small = min(s["main_grow_max"] for s in small["sessions"].values())
++    a_big = min(s["main_grow_max"] for s in big["sessions"].values())
++    assert a_big > a_small, (a_small, a_big)
++    assert big["invariant"]["grants"]["deadlock_risk"] is False
++
++
++def test_derive_window_ceilings_is_pure_arithmetic_and_never_oversubscribes():
++    """Drive the derivation directly across pool sizes, main counts and demands.
++
++    This is the test that caught both over-grant bugs in the first draft of the
++    fix: lending an under-user's share away while still guaranteeing it (350,617
++    granted against a 348,052 budget) and reserving one floor child while handing
++    out three (516,683 against 406,138)."""
++    for pool in (262_144, 451_264, 643_456, 1_048_576):
++        cache = int(pb.CACHE_RESERVE_FRAC * pool)
++        usable = pool - cache
++        ceiling = pool
++        for n in range(1, 7):
++            for demand in (20_000, 120_000, 433_782, pb.inflight(ceiling, 8_192, 0.85)):
++                for streams in (0, 1, 2, 3):
++                    rows = [{"pid": i, "max_tokens": 8_192, "need": demand}
++                            for i in range(n)]
++                    mc, cc, detail = pb.derive_window_ceilings(
++                        usable, rows, streams, 24_576, 0.85, ceiling)
++                    assert set(mc) == set(range(n))
++                    granted_streams = detail["child_streams"]
++                    assert 1 <= granted_streams <= max(1, streams)
++                    cost = sum(pb.inflight(w, 8_192, 0.85) for w in mc.values())
++                    cost += granted_streams * pb.inflight(cc, 24_576, 0.85)
++                    assert cost == detail["granted_cost"], (detail, cost)
++                    if detail["feasible"]:
++                        assert cost <= usable, (pool, n, demand, streams, mc, cc, detail)
++                    else:
++                        # Infeasible is allowed ONLY when nothing further could be
++                        # given up: one child stream and every main at the floor.
++                        assert granted_streams == 1, detail
++                        assert all(w == min(pb.MAIN_WINDOW_FLOOR, ceiling)
++                                   for w in mc.values()), (mc, detail)
++                    for w in mc.values():
++                        assert w <= ceiling
++                        assert w >= min(pb.MAIN_WINDOW_FLOOR, ceiling)
++
++
++class _Stub:
++    """Minimal stand-in for ContextCompressor: plain attributes, real method.
++
++    The real ``context_length`` setter re-derives every budget; what is under test
++    here is only the DECISION to adopt a smaller grant, so a plain attribute is
++    enough and keeps the test off the compressor's construction path."""
++
++    def __init__(self, window):
++        self.context_length = window
++        self.threshold_tokens = 0
++
++
++def _adopt(window, granted, prompt, monkeypatch, pool=LIVE_POOL, **env):
++    from agent.context_compressor import ContextCompressor
++
++    for k, v in env.items():
++        monkeypatch.setenv(k, v)
++    s = _Stub(window)
++    allowance = {"pool": pool, "n_mains": 2, "main_window_floor": pb.MAIN_WINDOW_FLOOR}
++    return ContextCompressor._maybe_pool_adopt_share(
++        s, allowance, {"main_window": granted}, "main", prompt, 8_192, 0.85,
++        window), s
++
++
++def test_a_fresh_main_adopts_the_smaller_share(monkeypatch):
++    """The recurrence hole: two mains at the profile's configured 393,216 window
++    wedge the pool with NO growth at all (2 x 335,462 in-flight vs 406,138
++    usable). The broker publishes main_window; until this consumer existed the
++    number was inert."""
++    got, s = _adopt(393_216, 196_608, 30_000, monkeypatch)
++    assert got == 196_608
++    assert s.context_length == 196_608
++
++
++def test_a_grandfathered_main_is_left_alone(monkeypatch):
++    """Andre 2026-09-30: a live session's context is his call. A 433,782-token
++    prompt does not fit under a 196,608 window's trigger (160,153), so the window
++    is NOT lowered — the session is denied growth instead, and only a relaunch
++    brings its held context down."""
++    assert pb.footprint(196_608, 8_192, 0.85) < 433_782
++    got, s = _adopt(522_880, 196_608, 433_782, monkeypatch)
++    assert got == 522_880
++    assert s.context_length == 522_880
++
++
++def test_share_adoption_never_raises_and_respects_the_floor(monkeypatch):
++    # A grant at or above the current window is not an adoption.
++    assert _adopt(196_608, 393_216, 30_000, monkeypatch)[0] == 196_608
++    # A grant below the published main_window_floor is refused outright.
++    assert _adopt(393_216, 32_768, 1_000, monkeypatch)[0] == 393_216
++    # Opt-out honoured.
++    assert _adopt(393_216, 196_608, 30_000, monkeypatch,
++                  HERMES_POOL_SHRINK="0")[0] == 393_216
++
++
+ def test_peak_uses_profile_threshold(monkeypatch):
+     """A 393,216 main at compression.threshold 0.85 peaks at 327,270 + 8,192."""
+     monkeypatch.setattr(pb, "_profile_numbers", lambda p: {
+-- 
+2.43.0

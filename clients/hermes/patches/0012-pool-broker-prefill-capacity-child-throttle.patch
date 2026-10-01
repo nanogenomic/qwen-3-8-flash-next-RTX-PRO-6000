@@ -1,0 +1,1700 @@
+From 25f1873ad4d47b3ef41a98e43582727ea8c42388 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 20:22:52 -0400
+Subject: [PATCH] pool broker: re-key the child throttle off free VRAM onto
+ prefill capacity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A throttle keyed on free device VRAM stopped throttling, because the thing
+free VRAM was a proxy for left the device.
+
+Two changes on the serving side did it, in the same direction. A cutover moved
+the KV pool to host RAM (451,264 -> 1,310,720 tokens; KV VRAM 5.6 -> 1.26 GB;
+free VRAM 935-1,533 -> 6,463 MiB), and a bounded-gather fix put prefill
+transients flat at 32 MiB at every context length. The rule free_mib // 560
+then licensed ~11 concurrent children where it had licensed ~1, and two main
+sessions were measured at 11-17 tok/s each.  [measured]
+
+The gate is now the three resources that actually bind, each read live from
+the backend's own numbers:
+
+  (A) SLOTS. One slot held for every live main before a child is counted,
+      plus a total cap of 2 streams. Derived from 6,436 warm decode-batch
+      samples of the current build era, with cold-prefill-contended steps
+      segmented out and post-restart warmup dropped: aggregate throughput
+      rises monotonically 176.5 / 282.2 / 340.2 / 409.6 tok/s at concurrency
+      1/2/3/4, so there is NO interior aggregate maximum below
+      --max-running-requests 4 and the cap cannot be read off the aggregate
+      curve at all. Keyed instead on a main lane's OWN rate, which retains
+      100 / 80.0 / 64.2 / 58.0% of solo: 2 is the largest concurrency at
+      which a lane keeps two thirds. This refuses the SECOND concurrent child
+      outright, instead of letting six start and self-clamping once a 12-deep
+      queue has appeared.  [measured]
+  (B) PREFILL BACKLOG. num_waiting_uncached_tokens divided by the prefill
+      rate the server reports about itself (total_prefill_uncached_tokens /
+      total_prefill_busy_us = 8,481 tok/s), against the 30 s control-plane
+      budget that is the judge timeout. Inside the remaining headroom each
+      child is charged the eviction waste it causes, from the two measured
+      anchors: 2,622 tokens with no contention, 114,385 with five other
+      requests in flight (growth factor 2.145).  [measured]
+  (C) POOL RESIDENCY. Backlog tokens charged against the pool before
+      children. Correctly does not bind at 14-32% used.
+
+Runtime free VRAM is demoted to a floor backstop that should almost never
+fire: 560 MiB -- the largest allocation measured fatal, at a logged OOM --
+plus one 32 MiB transient per scheduler slot = 688 MiB. It separates the three
+geometries that matter (287 MiB critical; 935 and 6,463 MiB clear) and still
+reads a runtime sample with a 90 s staleness fail-open, never the boot-time
+available-memory figure.
+
+At the live geometry that prompted this (588,268 uncached waiting = 69 s of
+backlog, 2 mains, 3 running, 5,651 MiB free) the gate yields 0 child streams
+where the old rule gave 10.  [measured] No main's window, growth ceiling or
+request priority is touched by any of it: the share-bounded per-main grants
+from patch 0003 are unchanged.
+
+Every knob resolves at CALL time -- environment variable, then the broker's
+own JSON config, then the module default -- so retuning no longer means
+relaunching the sessions being throttled. The keys are documented in that
+file's own comment block and published per refresh under the allowance's
+"tunables".
+
+The old VRAM admission hold stays as an alias of the renamed one, which now
+holds on either leg, so the delegation tool needs no edit.
+
+Requires patches 0003 and 0004. Note on ordering: patch 0011 squashes a
+test-fixture correction that landed AFTER this change in fork history. The two
+touch disjoint files, and the series was verified to apply in the printed
+order.
+
+BASE: the tree left by patch 0011 (see BASELINE.md).
+
+PUBLISHED FORM. One absolute fleet log path in a comment becomes
+<stack>/..., following ops/README.md.
+
+---
+ agent/pool_broker.py              |  714 ++++++++++++++++++++++++++++++++-----
+ tests/agent/test_pool_broker.py   |   36 ++
+ tests/agent/test_vram_throttle.py |  592 +++++++++++++++++++++++++++----
+ 3 files changed, 1166 insertions(+), 176 deletions(-)
+
+diff --git a/agent/pool_broker.py b/agent/pool_broker.py
+index d18ca67..ed1e9a8 100644
+--- a/agent/pool_broker.py
++++ b/agent/pool_broker.py
+@@ -19,10 +19,24 @@ POLICY (legible on purpose — every number is checkable against /v1/loads by ey
+      minus one slot per main, and by how many floor-sized children the remaining
+      memory can hold. With mrr=4 today that is 2 child streams for 2 mains; if the
+      server is restarted at mrr=12 the same code hands out 10 with no change here.
+-  4. Pressure is keyed on POOL MEMORY (token_usage), not queue depth. With a
+-     643,456-token pool, queueing is a slot-count effect and throttling on it cuts
+-     throughput while memory is idle; prefix-cache eviction under memory pressure
+-     is the actual harm.
++  4. CHILD ADMISSION is keyed on PREFILL CAPACITY — scheduler slots, the uncached
++     waiting backlog's drain time against the control-plane budget, and pool
++     residency — never on free device VRAM. See the PREFILL CAPACITY block for the
++     derivation; free VRAM stopped being a capacity signal when the KV pool moved
++     to host RAM, and keying on it licensed 11 concurrent children where it had
++     licensed one. Runtime free VRAM remains as a FLOOR backstop that should
++     almost never fire.
++  5. WINDOW pressure is keyed on POOL MEMORY (token_usage). With a 1.31M-token
++     pool, queueing is a prefill-throughput effect, handled by (4); prefix-cache
++     eviction under memory pressure is what a memory rule is for.
++
++RETUNING WITHOUT A RELAUNCH
++Every throttle parameter resolves at CALL time through tunable(): environment
++variable, then ~/.hermes/pool-broker.json "throttle": {...}, then the module
++default. Editing that file retunes every live session within REFRESH_S — nothing
++has to be restarted, which matters because the sessions being throttled are
++Andre's. The resolved values and their sources are published in the allowance
++under "tunables".
+ 
+ HOW IT IS SHARED (no daemon required)
+ The allowance lives in one small JSON file. Any Hermes process that needs it and
+@@ -152,11 +166,110 @@ def _heartbeat_dir() -> Path:
+     return Path(HEARTBEAT_DIR) if HEARTBEAT_DIR is not None else _run_dir() / "pool-sessions"
+ 
+ 
++_config_cache: Dict[str, Any] = {"key": None, "value": {}}
++
++
+ def _broker_config() -> dict:
++    """``<root>/pool-broker.json``, re-read whenever the file changes.
++
++    ⛔ CALL TIME, NOT IMPORT TIME — that is the whole point of this file. The
++    cache is keyed on (mtime_ns, size), so an edit is picked up on the next call
++    (<= REFRESH_S later for the throttle, immediately for a dispatch) and a
++    retune needs no relaunch of Andre's sessions. A stat is ~1 us; a parse is
++    not, and every tunable lookup goes through here."""
++    path = hermes_root() / BROKER_CONFIG_NAME
+     try:
+-        return json.loads((hermes_root() / BROKER_CONFIG_NAME).read_text(encoding="utf-8")) or {}
++        st = path.stat()
++        key = (str(path), st.st_mtime_ns, st.st_size)
+     except Exception:
++        _config_cache["key"], _config_cache["value"] = None, {}
+         return {}
++    if _config_cache["key"] == key:
++        return _config_cache["value"]
++    try:
++        value = json.loads(path.read_text(encoding="utf-8")) or {}
++    except Exception:
++        value = {}
++    if not isinstance(value, dict):
++        value = {}
++    _config_cache["key"], _config_cache["value"] = key, value
++    return value
++
++
++# =========================================================================
++# RUNTIME-TUNABLE THROTTLE PARAMETERS  [bd-dre-i4qoy]
++# =========================================================================
++# ⛔ WHY THIS EXISTS. Every knob below used to be `int(os.environ.get(...))` at
++# IMPORT. Retuning one therefore meant relaunching the Hermes sessions that had
++# already imported this module — i.e. relaunching Andre's two main lanes, which
++# is the one operation we cannot keep performing while he is working in them.
++# Tonight that turned a one-number fix into a "needs a relaunch" item.
++#
++# Resolution order, evaluated on EVERY use (first hit wins):
++#     1. environment variable   — a launch-time pin; still wins, as before
++#     2. ~/.hermes/pool-broker.json  "throttle": {"<key>": <value>}
++#     3. the module constant below — the documented default, and the attribute a
++#        test monkeypatches
++# A malformed value falls through to the default rather than raising: nothing on
++# this path may fail a dispatch.
++#
++# The config keys are documented in pool-broker.json's own `_throttle_comment`,
++# so the next person retuning does not have to read this module to find them.
++_TUNABLE_SPEC: Dict[str, tuple] = {
++    #  name                  ->  (env var,                             config key)
++    "stream_cap":              ("HERMES_POOL_STREAM_CAP",              "stream_cap"),
++    "cache_reserve_frac":      ("HERMES_KV_CACHE_RESERVE_FRAC",        "cache_reserve_frac"),
++    "main_slot_reserve":       ("HERMES_POOL_MAIN_SLOT_RESERVE",       "main_slot_reserve"),
++    "total_stream_cap":        ("HERMES_POOL_TOTAL_STREAM_CAP",        "total_stream_cap"),
++    "prefill_rate_tps":        ("HERMES_POOL_PREFILL_RATE_TPS",        "prefill_rate_tps"),
++    "drain_budget_s":          ("HERMES_POOL_DRAIN_BUDGET_S",          "drain_budget_s"),
++    "waste_base_tokens":       ("HERMES_POOL_WASTE_BASE_TOKENS",       "waste_base_tokens"),
++    "waste_growth":            ("HERMES_POOL_WASTE_GROWTH",            "waste_growth"),
++    "prefill_alloc_mib":       ("HERMES_POOL_PREFILL_ALLOC_MIB",       "prefill_alloc_mib"),
++    "prefill_transient_mib":   ("HERMES_POOL_PREFILL_TRANSIENT_MIB",   "prefill_transient_mib"),
++    "vram_hold_max_s":         ("HERMES_POOL_VRAM_HOLD_S",             "vram_hold_max_s"),
++    "hot_token_usage":         ("HERMES_POOL_HOT_TOKEN_USAGE",         "hot_token_usage"),
++    "critical_token_usage":    ("HERMES_POOL_CRITICAL_TOKEN_USAGE",    "critical_token_usage"),
++}
++
++
++def tunable(name: str) -> Any:
++    """Resolve one throttle parameter: env > pool-broker.json > module default.
++
++    The default is read from the UPPERCASE module attribute of the same name, so
++    it stays the single documented source of the value AND stays monkeypatchable.
++    Never raises."""
++    default = globals().get(name.upper())
++    try:
++        env, ckey = _TUNABLE_SPEC[name]
++    except KeyError:
++        return default
++    raw = os.environ.get(env)
++    if raw is None or raw == "":
++        block = _broker_config().get("throttle")
++        if isinstance(block, dict):
++            raw = block.get(ckey)
++    if raw is None or raw == "":
++        return default
++    try:
++        return type(default)(raw) if default is not None else raw
++    except Exception:
++        logger.warning("pool broker: tunable %s=%r is not a %s; using the default %r",
++                       name, raw, type(default).__name__, default)
++        return default
++
++
++def tunables() -> dict:
++    """Every throttle parameter as resolved right now, with where it came from.
++    Published in the allowance so a live retune is visible without a relaunch."""
++    out = {}
++    for name, (env, ckey) in _TUNABLE_SPEC.items():
++        block = _broker_config().get("throttle")
++        src = ("env" if os.environ.get(env) else
++               "config" if isinstance(block, dict) and block.get(ckey) is not None
++               else "default")
++        out[name] = {"value": tunable(name), "source": src}
++    return out
+ 
+ 
+ def _backend() -> str:
+@@ -178,8 +291,9 @@ STALE_S = float(os.environ.get("HERMES_POOL_STALE_S", "30"))
+ PROBE_TIMEOUT_S = 1.5
+ # Andre, 2026-09-29: "seems like up to 12 streams is appropriate". The live
+ # max_running_requests still bounds it — requests beyond the server's slots queue.
+-STREAM_CAP = int(os.environ.get("HERMES_POOL_STREAM_CAP", "12"))
+-CACHE_RESERVE_FRAC = float(os.environ.get("HERMES_KV_CACHE_RESERVE_FRAC", "0.10"))
++# ⛔ Read through tunable("stream_cap"), never directly: see _TUNABLE_SPEC.
++STREAM_CAP = 12
++CACHE_RESERVE_FRAC = 0.10
+ 
+ # Lanes whose main model lives on the GPU0 pool (same set the admission guard
+ # budgets). Other lanes run on different backends and must not be counted here.
+@@ -225,11 +339,166 @@ MAIN_GROWTH_MARGIN = int(os.environ.get("HERMES_POOL_MAIN_GROWTH_MARGIN", "16384
+ GROW_CLAIM_TTL_S = 30.0
+ 
+ # Pressure thresholds on token_usage (fraction of the pool in use).
++# Read through tunable("hot_token_usage") / tunable("critical_token_usage").
+ HOT_TOKEN_USAGE = 0.70
+ CRITICAL_TOKEN_USAGE = 0.85
+ 
+ # ===========================================================================
+-# DEVICE VRAM PRESSURE — the axis that killed the lane  [bd-dre-i4qoy]
++# PREFILL CAPACITY — WHAT ACTUALLY BINDS CHILD CONCURRENCY  [bd-dre-i4qoy]
++# ===========================================================================
++# ⛔ 2026-09-30, GPU0 KV-pool cutover to host RAM. Pool 451,264 -> 1,310,720
++# tokens, KV VRAM 5.6 GB -> 1.26 GB, free VRAM 935-1,533 MiB -> 6,463 MiB. At the
++# same time the bounded-gather fix put prefill TRANSIENTS flat at 32 MiB at every
++# context length (was 1,024 MiB at 512K).
++#
++# Both of those broke the free-VRAM throttle below, in the same direction:
++#     affordable = 6,463 // 560 = 11 children, where it used to license ~1.
++# Andre's two mains were then measured at 11-17 tok/s each. Free device VRAM had
++# stopped being a capacity signal, because the thing it was a proxy FOR (prefill
++# transients, and the pool itself) had left the device.
++#
++# ⛔ WHAT WAS MEASURED ON THE LIVE LANE TONIGHT (the pool is NOT the constraint):
++#     pool used       187,840-417,664 / 1,310,720   (14-32%)
++#     running 3-4     waiting 2-4
++#     num_waiting_uncached_tokens  220,819-482,779   (up to 37% of the whole pool
++#                                                     sitting in the PREFILL queue)
++#     gen throughput  102-417 tok/s, nearly all of it spent on prefill
++# and, from the server's own cumulative counters at 23:54 UTC:
++#     total_prefill_uncached_tokens 7,535,276 / total_prefill_busy_us 888,433,873
++#       -> 8,481 prefill tokens/s   (vs gen_throughput 439 -> a 19:1 prefill:decode
++#          split, consistent with the 24:1-70:1 measured by the peer agent)
++#
++# The scarce resources, in the order they bind:
++#   1. PREFILL THROUGHPUT against --max-running-requests 4 and
++#      chunked_prefill_size 4,096. Every admitted request shares one 4,096-token
++#      prefill chunk budget per step, so a main's 300-500K prompt re-prefill is
++#      serialised behind whatever else is in flight.
++#   2. PREFIX-CACHE RESIDENCY. cache_hit_rate was 0.0 during the stall. A child
++#      with a distinct prompt evicts a main's cached prefix, and the main then
++#      pays its ENTIRE prompt again on its next turn. Measured by the peer agent:
++#      wasted prefill per call rises from 2,622 tokens with no contention to
++#      114,385 with five other in-flight requests.
++#   3. SCHEDULER SLOTS (max_running_requests 4). A main that cannot get a slot
++#      waits, however much pool and VRAM are free.
++#   4. POOL MEMORY. Last, at 14-32% used.
++#
++# ⛔ THE CONCURRENCY CURVE, RE-MEASURED [Andre 2026-09-30: "maybe we should cap
++# concurrency at where max tok/s are achieved so we can push things more"].
++# 6,436 `Decode batch` samples from the current build era of
++# <stack>/logs/qwen-flashnext-gpu0.log (2026-09-30 16:57 onward),
++# bucketed by #running-req, the first 180 s after each restart dropped, and
++# SEGMENTED by whether a prefill with >= 50,000 pending uncached tokens ran in the
++# preceding 10 s — because a post-restart prefill storm inflates the high-
++# concurrency buckets and was what made an earlier reading of this curve steeper
++# than it really is. The WARM segment is the one trusted here:
++#
++#   WARM (no cold prefill in flight)        COLD-contended (for contrast)
++#   conc    n   median agg   per-stream     conc    n   median agg   per-stream
++#     1  1060        176.5        176.5       1   933        160.6        160.6
++#     2   613        282.2        141.1       2  1085        273.1        136.5
++#     3   221        340.2        113.4       3   728        347.0        115.7
++#     4   128        409.6        102.4       4  1649        377.0         94.2
++#
++# ⛔ THERE IS NO INTERIOR AGGREGATE MAXIMUM below --max-running-requests 4.
++# Aggregate throughput rises monotonically (176 -> 282 -> 340 -> 410 warm) while a
++# single lane's own rate collapses (176 -> 141 -> 113 -> 102). So "cap at where max
++# tok/s is achieved" has no answer in aggregate terms: the cap is a deliberate
++# TRADE, and the objective that matters is A MAIN LANE'S OWN THROUGHPUT, because
++# the main lane is what Andre is reading at 22-28 tok/s.
++#
++# Share of its solo rate that a main lane retains, warm:
++#     conc 1 -> 100%      conc 2 -> 80.0%      conc 3 -> 64.2%      conc 4 -> 58.0%
++# TOTAL_STREAM_CAP = 2 is the largest concurrency at which a main lane keeps at
++# least two thirds of its solo decode rate; the third stream is what drops it
++# through that line (64.2%), for +21% aggregate. That is the derivation — not a
++# round number, and it is a runtime key (total_stream_cap), so Andre can push it
++# to 3 or 4 without relaunching a session once he wants the aggregate instead.
++#
++# ⛔ THE GATE, AND WHERE EVERY NUMBER COMES FROM.
++# Three conjunctive legs, each read live, none a round number:
++#
++# (A) SLOTS — two sub-legs, because one is an invariant and one is a preference.
++#     ⛔ INVARIANT (never traded away): a main's turn must NEVER queue behind a
++#        child. 2026-09-30, lane 226 was observed at "3 mine · 3/4 backend · 1
++#        free · 15 queued" — three of one session's OWN children holding three of
++#        four slots. So:
++#        hard_slot_cap  = max_running_requests - main_reserve - children_in_flight
++#        where main_reserve holds a slot for EVERY live main (at least one, even
++#        when the process scan finds none) plus whatever the mains have in flight.
++#     PREFERENCE (the throughput trade above):
++#        tuned_slot_cap = TOTAL_STREAM_CAP   - main_reserve - children_in_flight
++#     slot_cap = min(hard, tuned). At the live mrr=4 with one main and no children
++#     that is 1 — children take the SECOND slot and no more, which is the fix for
++#     the six-children-then-self-clamp behaviour: the gate refuses the second
++#     concurrent child outright instead of waiting for a 12-deep queue to teach it.
++#     With two mains the preference leg reaches 0 while the invariant leg still
++#     has room; that is deliberately NOT a refusal (see the state rules below),
++#     because blocking delegation outright whenever Andre has two sessions open
++#     would be a self-inflicted restriction, and three streams with two of them
++#     mains still queues no main.
++#
++# (B) PREFILL BACKLOG.  The backlog must drain inside the time the control plane
++#     can survive. That budget is not invented here: hermes_cli.goals
++#     DEFAULT_JUDGE_TIMEOUT is 30.0 s, and this module already records the
++#     measurement that made it matter — three identical small completions took
++#     28.5 s, 0.22 s, 0.22 s, the first simply waiting behind running requests,
++#     and "five of those in a row paused Andre's primary session". So:
++#         rate       = total_prefill_uncached_tokens / total_prefill_busy_us
++#                      (LIVE from /v1/loads; 8,481 tok/s measured tonight)
++#         budget     = rate * DRAIN_BUDGET_S          = 254,430 tokens
++#         backlog    = num_waiting_uncached_tokens
++#         headroom   = budget - backlog
++#     A backlog at or over the budget means the NEXT control-plane call already
++#     misses its timeout: headroom <= 0 -> admit nothing.
++#     Inside the headroom, each additional child is charged the EVICTION WASTE it
++#     causes, from the two measured anchors above: W(k) = 2,622 * g^k fitted
++#     through W(5) = 114,385, so g = (114,385/2,622)^(1/5) = 2.145 — per-call
++#     waste MULTIPLIES by 2.14 for every stream added. The admitted count is the
++#     largest k whose cumulative waste fits the headroom:
++#         W(1..5) = 5,624 / 12,065 / 25,880 / 55,513 / 119,076
++#         cum     = 5,624 / 17,689 / 43,569 / 99,082 / 218,158
++#     so an idle lane (backlog 0, headroom 254,430) affords 5 by this leg and is
++#     then held to 2 by leg (A) — and tonight's 482,779-token backlog affords 0.
++#     ⛔ The ceiling is deliberately NOT "as many as the headroom fits": the peer
++#     agent measured output saturating from mean concurrency ~1, with marginal
++#     return falling from 99 to 12 tok/s per added stream. Past a couple of
++#     streams we are buying 12 tok/s of child output with a 2.14x multiplier on
++#     every main's wasted prefill. Leg (A) is what makes that trade, on purpose.
++#
++# (C) POOL RESIDENCY (the bead's own wording: aggregate prompt tokens vs
++#     max_total_num_tokens). The backlog is prompt tokens that WILL land in the
++#     pool, so they are charged against it before children are:
++#         pool_cap = (pool - cache_reserve - used - backlog) // one_floor_child
++#     Tonight: (1,310,720 - 131,072 - 183,500 - 482,779) // 58,086 = 8 — this leg
++#     correctly does NOT bind, because the pool is not what is scarce.
++#
++# child_cap = min(A, B, C), and a main's window, growth ceiling and request
++# priority are untouched by all of it: this gate can only ever reduce CHILDREN.
++GPU0_PREFILL_RATE_TPS_DEFAULT = 8_481   # documented; the live counters override it
++PREFILL_RATE_TPS = 8_481
++# hermes_cli.goals.DEFAULT_JUDGE_TIMEOUT. Duplicated, not imported: goals imports
++# the agent package and a module-level cycle here would be worse than one number.
++# If that timeout is retuned, retune this with it (config key drain_budget_s).
++DRAIN_BUDGET_S = 30.0
++# The two measured anchors of the eviction-waste curve, and the growth factor
++# fitted through them. WASTE_GROWTH = (114385/2622)**(1/5) = 2.1448...
++WASTE_BASE_TOKENS = 2_622
++WASTE_GROWTH = 2.145
++WASTE_ANCHOR_HIGH_TOKENS = 114_385      # at 5 other in-flight requests
++# Slots held for each live main before any child is admitted. 1 = a main can
++# always get its turn's slot. Raising it to 2 also protects one auxiliary /
++# control-plane call per main (compaction, title, goal judge).
++MAIN_SLOT_RESERVE = 1
++# Total concurrent streams the backend is allowed to carry — mains INCLUDED.
++# Derived from the warm concurrency curve above: the largest concurrency at which
++# a main lane keeps >= 2/3 of its solo decode rate (80.0% at 2; 64.2% at 3).
++# Raise it (config key total_stream_cap) to buy aggregate throughput at a main
++# lane's expense: 3 -> +21% aggregate, main lane down to 64% of solo; 4 -> +45%
++# aggregate, main lane at 58%.
++TOTAL_STREAM_CAP = 2
++
++# ===========================================================================
++# DEVICE VRAM — NOW A BACKSTOP, NOT THE GATE  [bd-dre-i4qoy]
+ # ===========================================================================
+ # 2026-09-30 16:44:17: torch.OutOfMemoryError, "Tried to allocate 560.00 MiB ...
+ # 280.94 MiB is free", during prefill with #queue-req 14 and #pending-token
+@@ -253,22 +522,37 @@ CRITICAL_TOKEN_USAGE = 0.85
+ #     watchdog's gpu0_newproc/vram_drop job and it stays there. It cannot detect
+ #     "normal is already one allocation from death", which is what happened.
+ #
+-# ⛔ WHAT IS USED INSTEAD: CAPACITY, NOT ANOMALY.
+-# Free VRAM is divided by the largest single allocation known to be fatal
+-# (560 MiB, measured above) to get how many CONCURRENT PREFILLS the card can
+-# absorb. SGLang chunks prefill at max_prefill_tokens=4,096, so that working set
+-# is roughly per-in-flight-prefill and does not grow with total pending tokens —
+-# what grows it is how many requests the scheduler admits to a prefill batch,
+-# which is driven by QUEUE DEPTH. Hence the conjunction that was the real
+-# pre-crash signature: affordable_prefills == 0 AND a deep queue.
+-#     affordable = free_mib // PREFILL_ALLOC_MIB
+-#     vram_child_cap = max(0, affordable - queued)
+-# At the incident: 287 // 560 = 0 affordable, 14 queued -> cap 0, admit nothing.
+-# At 0.97 with ~1,266 MiB free and an empty queue: 2 affordable -> 2 children.
+-# This self-calibrates when Andre changes mem-fraction, because free VRAM is read
+-# live rather than compared to a constant.
++# ⛔ WHAT THIS IS NOW, AND WHY IT IS NO LONGER THE PRIMARY GATE.
++# It used to be a capacity divisor: free_mib // 560 concurrent prefills, minus the
++# queue depth. That was sound while a prefill's transient VRAM was the scarce
++# thing. After tonight's cutover it is not: the KV pool is in host RAM and prefill
++# transients are FLAT at 32 MiB at every context length, so free VRAM no longer
++# moves with load — it just reads 6,463 MiB and licenses 11 children. Dividing a
++# number that does not respond to pressure is not a throttle.
++#
++# So VRAM is now a FLOOR, deliberately one that should almost never fire:
++#     floor = PREFILL_ALLOC_MIB + max_running_requests * PREFILL_TRANSIENT_MIB
++#           = 560 + 4*32 = 688 MiB
++# i.e. "the card can still absorb the largest allocation measured to be fatal
++# (560 MiB, at the 16:44:17 OOM), plus one transient for every request the
++# scheduler can have in flight". Below it, admit nothing and let in-flight work
++# drain — GPU0 died twice today on VRAM exhaustion and that path stays armed.
++# Above it, VRAM contributes NO cap at all: the prefill gate decides.
++# Checked against the three geometries that matter:
++#     287 MiB  (the 16:44 OOM, mem-fraction 0.98)   -> below 688  -> critical  ✓
++#     935 MiB  (pre-cutover steady state)           -> above 688  -> no cap    ✓
++#     6,463 MiB (tonight, post-cutover)             -> above 688  -> no cap    ✓
++# ⛔ It must read RUNTIME free VRAM, never boot-time available_gpu_mem: a prior
++# agent measured that field reporting 3.42 GB while the card had 287 MiB free
++# while serving. The watchdog's latest.json IS runtime, which is why it is the
++# source, over the ssh ControlMaster with the 90 s staleness fail-open below.
+ GPU_INDEX = int(os.environ.get("HERMES_POOL_GPU_INDEX", "0"))
+-PREFILL_ALLOC_MIB = int(os.environ.get("HERMES_POOL_PREFILL_ALLOC_MIB", "560"))
++# Largest single allocation MEASURED to be fatal (the 16:44:17 OOM's own
++# "Tried to allocate 560.00 MiB"). Read through tunable("prefill_alloc_mib").
++PREFILL_ALLOC_MIB = 560
++# Per-in-flight-prefill transient after tonight's bounded-gather fix: flat 32 MiB
++# at every context length, down from 1,024 MiB at 512K.
++PREFILL_TRANSIENT_MIB = 32
+ # The watchdog samples every 20 s; tolerate a couple of misses, then treat the
+ # signal as ABSENT (fail open) rather than trusting a stale number.
+ VRAM_SAMPLE_TTL_S = float(os.environ.get("HERMES_POOL_VRAM_TTL_S", "20"))
+@@ -276,7 +560,7 @@ VRAM_SAMPLE_MAX_AGE_S = float(os.environ.get("HERMES_POOL_VRAM_MAX_AGE_S", "90")
+ # How long a dispatch may HOLD OFF while the card cannot afford one prefill.
+ # Bounded and then it proceeds: an OOM that kills the lane for every session is
+ # worse than a slow dispatch, but a stalled agent is worse than a risked one.
+-VRAM_HOLD_MAX_S = float(os.environ.get("HERMES_POOL_VRAM_HOLD_S", "60"))
++VRAM_HOLD_MAX_S = 60.0
+ VRAM_HOLD_POLL_S = 5.0
+ # ⛔ READ THE WATCHDOG'S OUTPUT, DO NOT POLL nvidia-smi. llm-vram-watchdog on
+ # delta already samples every 20 s into latest.json (gpus.<i>.free_mib,
+@@ -881,7 +1165,7 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+     tu = float(load.get("token_usage") or (used / pool if pool else 0.0))
+     running = int(load.get("num_running_reqs") or 0)
+     waiting = int(load.get("num_waiting_reqs") or 0)
+-    cache_reserve = int(CACHE_RESERVE_FRAC * pool)
++    cache_reserve = int(float(tunable("cache_reserve_frac")) * pool)
+ 
+     # Server ceiling = boot-time --context-length, tightened by max_req_input_len.
+     # ⛔ GROWTH CEILING = what the SERVER will actually accept, not what the
+@@ -968,35 +1252,59 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+     child_pool = usable - main_reserved
+ 
+     # 3. Streams: slots first, then memory — never more than the memory holds.
+-    streams_total = max(1, min(STREAM_CAP, mrr))
++    # ⛔ STREAM_CAP (12, Andre 2026-09-29 "up to 12 streams is appropriate") is a
++    # TARGET for a bigger server; TOTAL_STREAM_CAP is the measured ceiling on THIS
++    # one, from the warm concurrency curve, and it supersedes the 12 while mrr is 4
++    # anyway. Both are runtime keys.
++    streams_total = max(1, min(int(tunable("stream_cap")), mrr,
++                               int(tunable("total_stream_cap"))))
+     child_streams_slots = max(1, streams_total - n_mains)
+     child_streams_mem = max(0, child_pool // floor_cost) if child_pool > 0 else 0
+     child_streams = int(min(child_streams_slots, child_streams_mem))
+ 
+     # 4. Pressure on MEMORY, not queue depth.
+     pressure = "normal"
+-    if tu >= CRITICAL_TOKEN_USAGE:
++    if tu >= float(tunable("critical_token_usage")):
+         pressure = "critical"
+         child_streams = min(child_streams, 1)
+-    elif tu >= HOT_TOKEN_USAGE:
++    elif tu >= float(tunable("hot_token_usage")):
+         pressure = "hot"
+         child_streams = min(child_streams, max(1, child_streams // 2))
+ 
+-    # ⛔ DEVICE VRAM, NOT JUST THE POOL [bd-dre-i4qoy]. Pool pressure was 0.73
+-    # when the lane OOM'd; this is the axis that was actually exhausted.
+-    vram = vram_assessment(queued=waiting)
+-    vram_note = ""
+-    if vram["state"] != "unknown":
+-        vcap = int(vram["child_cap"])
+-        if vram["state"] == "critical":
++    # ⛔ PREFILL CAPACITY IS THE GATE; DEVICE VRAM IS THE BACKSTOP [bd-dre-i4qoy].
++    # Until tonight this was keyed on free VRAM alone. After the KV pool moved to
++    # host RAM (451,264 -> 1,310,720 tokens, free VRAM 935 -> 6,463 MiB) and prefill
++    # transients went flat at 32 MiB, `free_mib // 560` licensed ELEVEN children
++    # where it had licensed one, and Andre's two mains fell to 11-17 tok/s each.
++    # What binds is prefill throughput against mrr=4 / chunked_prefill_size=4,096
++    # plus prefix-cache residency — see the PREFILL CAPACITY block for the
++    # derivation of every threshold from measured numbers.
++    children_in_flight = sum(r["children_active"] for r in main_rows)
++    prefill = prefill_assessment(
++        load=load, n_mains=n_mains, children_in_flight=children_in_flight,
++        pool_tokens=pool, used_tokens=used, cache_reserve_tokens=cache_reserve,
++        floor_child_cost=floor_cost)
++    vram = vram_assessment(queued=waiting, max_running_requests=mrr)
++    notes: List[str] = []
++    # (a) the gate
++    if prefill["state"] != "unknown":
++        pcap = int(prefill["child_cap"])
++        if prefill["state"] == "critical":
+             if child_streams > 0:
+-                vram_note = (f"VRAM CRITICAL: {vram['why']}. Child streams "
+-                             f"{child_streams} -> 0; in-flight work drains.")
++                notes.append(f"PREFILL CRITICAL: {prefill['why']}. Child streams "
++                             f"{child_streams} -> 0; mains' prefill drains first.")
+             child_streams = 0
+-        elif vcap < child_streams:
+-            vram_note = (f"VRAM tight: {vram['why']}. Child streams "
+-                         f"{child_streams} -> {vcap}.")
+-            child_streams = vcap
++        elif pcap < child_streams:
++            notes.append(f"prefill tight: {prefill['why']}. Child streams "
++                         f"{child_streams} -> {pcap}.")
++            child_streams = pcap
++    # (b) the backstop — should almost never fire now that transients are 32 MiB.
++    if vram["state"] == "critical":
++        if child_streams > 0:
++            notes.append(f"VRAM FLOOR BREACHED: {vram['why']}. Child streams "
++                         f"{child_streams} -> 0; in-flight work drains.")
++        child_streams = 0
++    vram_note = " ".join(notes)
+     if vram_note:
+         # Every throttle decision is logged with the numbers that caused it, so
+         # the next incident is diagnosable from agent.log alone.
+@@ -1044,7 +1352,7 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+     state = pp.PoolState(
+         pool_tokens=pool, used_tokens=used, token_usage=tu, free_tokens=free_tokens,
+         ceiling=ceiling, max_running_requests=mrr, running=running, waiting=waiting,
+-        cache_reserve_tokens=cache_reserve, stream_cap=STREAM_CAP,
++        cache_reserve_tokens=cache_reserve, stream_cap=int(tunable("stream_cap")),
+         child_streams_budget=child_streams, child_pool_tokens=child_pool,
+         child_max_tokens=child_max_tokens, child_floor=CHILD_FLOOR,
+         priority_enabled=prio_enabled, pressure=pressure, compression_threshold=pct,
+@@ -1228,13 +1536,22 @@ def compute_allowance(info: dict, load: dict, mains: List[dict],
+         "child_window_max": child_window_max,
+         "child_max_tokens": child_max_tokens,
+         "compression_threshold": pct,
+-        "vram": vram, "vram_note": vram_note,
++        # ⛔ `prefill` IS THE THROTTLE; `vram` is the safety backstop. Both are
++        # published with every number that produced them, so a stall is
++        # diagnosable from the allowance file alone.
++        "prefill": prefill,
++        "vram": vram, "vram_note": vram_note, "throttle_note": vram_note,
++        # Every throttle parameter as resolved on THIS refresh, with its source —
++        # so a retune through ~/.hermes/pool-broker.json is visible here within
++        # REFRESH_S, with no session relaunch.
++        "tunables": tunables(),
+         # ⛔ SEPARATE FROM child_streams_total: apply_rails floors every
+         # PER-SESSION stream bound at 1 (a session always has a theoretical
+         # slot), so "admit nothing right now" cannot be expressed as a 0 there.
+         # This flag is the admission decision; the dispatch-time gate and the
+         # concurrency cap both read it.
+-        "admit_children": vram["state"] != "critical",
++        "admit_children": (vram["state"] != "critical"
++                           and prefill["state"] != "critical"),
+         "free_tokens": free_tokens,
+         # ⛔ These two are the FALLBACK a consumer uses when its own pid is not in
+         # `sessions` — a child process always lands here, since `sessions` is keyed
+@@ -1370,44 +1687,220 @@ def vram_sample(force: bool = False) -> Optional[dict]:
+         return value
+ 
+ 
+-def vram_assessment(queued: int = 0, sample: Optional[dict] = None) -> dict:
+-    """How many concurrent prefills the CARD can absorb, and what that allows.
++def vram_floor_mib(max_running_requests: int = 4) -> int:
++    """The runtime free-VRAM floor: the largest allocation measured to be fatal,
++    plus one prefill transient for every request the scheduler can run."""
++    return int(tunable("prefill_alloc_mib")) + max(1, int(max_running_requests or 1)) * \
++        int(tunable("prefill_transient_mib"))
+ 
+-    See the PREFILL_ALLOC_MIB commentary above for why this is a capacity
+-    calculation rather than a floor or a baseline deviation. ``state`` is
+-    "unknown" when the signal is absent, and every caller treats unknown as
+-    no-VRAM-throttle."""
++
++def vram_assessment(queued: int = 0, sample: Optional[dict] = None,
++                    max_running_requests: int = 4) -> dict:
++    """SAFETY BACKSTOP on runtime free device VRAM. Not the child throttle.
++
++    See the DEVICE VRAM commentary above: since the KV pool moved to host RAM and
++    prefill transients went flat at 32 MiB, free VRAM stopped responding to load,
++    so it is a FLOOR ("can the card still absorb the allocation that killed it at
++    16:44:17?") and not a capacity divisor. ``child_cap`` is None above the floor —
++    meaning "this leg imposes no cap" — and 0 below it. ``state`` is "unknown" when
++    the signal is absent, and every caller treats unknown as no-VRAM-throttle.
++    """
++    floor = vram_floor_mib(max_running_requests)
+     s = sample if sample is not None else vram_sample()
+     if not s:
+-        return {"state": "unknown", "free_mib": None, "affordable_prefills": None,
+-                "child_cap": None, "queued": queued,
++        return {"state": "unknown", "free_mib": None, "floor_mib": floor,
++                "child_cap": None, "queued": queued, "role": "backstop",
+                 "why": "no usable VRAM sample (fail open: VRAM throttling off)"}
+     free = int(s["free_mib"])
+-    affordable = free // max(1, PREFILL_ALLOC_MIB)
+-    cap = max(0, affordable - max(0, queued))
+-    # critical: cannot afford ONE prefill -> admit nothing, drain in flight.
+-    # tight:    at most one new child fits -> serialise.
+-    # ok:       room for two or more concurrent prefills.
+-    if affordable <= 0:
+-        state = "critical"
+-    elif cap <= 1:
+-        state = "tight"
+-    else:
+-        state = "ok"
++    headroom = free - floor
++    state = "critical" if headroom < 0 else "ok"
+     base = s.get("baseline_free_mib")
+     return {
+-        "state": state, "free_mib": free, "baseline_free_mib": base,
++        "state": state, "role": "backstop",
++        "free_mib": free, "floor_mib": floor, "headroom_mib": headroom,
++        "baseline_free_mib": base,
+         "below_baseline_mib": (int(base) - free) if isinstance(base, int) else None,
+-        "prefill_alloc_mib": PREFILL_ALLOC_MIB,
+-        "affordable_prefills": affordable, "queued": queued, "child_cap": cap,
++        "prefill_alloc_mib": int(tunable("prefill_alloc_mib")),
++        "prefill_transient_mib": int(tunable("prefill_transient_mib")),
++        "max_running_requests": int(max_running_requests or 0),
++        "queued": queued,
++        # ⛔ None, not a number: above the floor this leg contributes NO cap. A
++        # number here is what licensed 11 children tonight.
++        "child_cap": (0 if state == "critical" else None),
+         "sample_age_s": s.get("sample_age_s"), "sample_ts": s.get("sample_ts"),
+         "gpu_proc_count": s.get("gpu_proc_count"), "source": s.get("source"),
+-        "why": (f"{free:,} MiB device-free / {PREFILL_ALLOC_MIB} MiB per prefill = "
+-                f"{affordable} concurrent prefill(s) affordable, {queued} already "
+-                f"queued -> {cap} new child stream(s)"),
++        "why": (f"{free:,} MiB runtime device-free vs a {floor:,} MiB floor "
++                f"({int(tunable('prefill_alloc_mib'))} MiB largest fatal alloc + "
++                f"{max(1, int(max_running_requests or 1))} x "
++                f"{int(tunable('prefill_transient_mib'))} MiB prefill transient) -> "
++                + ("BELOW the floor: admit nothing, drain in flight"
++                   if state == "critical" else
++                   "above the floor: no VRAM cap (the prefill gate decides)")),
+     }
+ 
+ 
++def prefill_rate_tps(load: Optional[dict] = None) -> tuple:
++    """(tokens/s, source). Measured prefill throughput of the live backend.
++
++    From the server's OWN cumulative counters — total_prefill_uncached_tokens over
++    total_prefill_busy_us — so it self-calibrates across model, quantisation,
++    chunked_prefill_size and mem-fraction changes with no edit here. Falls back to
++    the value measured tonight (8,481 tok/s) when the counters are absent or have
++    not accumulated yet. Never raises."""
++    try:
++        toks = float((load or {}).get("total_prefill_uncached_tokens") or 0.0)
++        busy_us = float((load or {}).get("total_prefill_busy_us") or 0.0)
++        # Need a meaningful sample: under one second of measured prefill the ratio
++        # is dominated by warm-up and would understate the rate badly.
++        if toks > 0 and busy_us >= 1_000_000:
++            return max(1.0, toks / (busy_us / 1e6)), "live /v1/loads counters"
++    except Exception:
++        pass
++    return max(1.0, float(tunable("prefill_rate_tps"))), "configured default"
++
++
++def waste_curve_cumulative(k: int) -> int:
++    """Total extra WASTED PREFILL, in tokens, from admitting k concurrent children.
++
++    Sum of the fitted per-call eviction-waste curve W(i) = base * growth**i, whose
++    two anchors are measured: 2,622 tokens wasted per call with no contention and
++    114,385 with five other requests in flight. See the PREFILL CAPACITY block."""
++    base = float(tunable("waste_base_tokens"))
++    g = max(1.0, float(tunable("waste_growth")))
++    total = 0.0
++    for i in range(1, max(0, int(k)) + 1):
++        total += base * (g ** i)
++    return int(total)
++
++
++def children_affordable(headroom_tokens: int, limit: int = 16) -> int:
++    """Largest k whose cumulative eviction waste fits headroom_tokens."""
++    if headroom_tokens <= 0:
++        return 0
++    k = 0
++    while k < max(0, int(limit)):
++        if waste_curve_cumulative(k + 1) > headroom_tokens:
++            break
++        k += 1
++    return k
++
++
++def prefill_assessment(load: Optional[dict] = None, n_mains: int = 0,
++                       children_in_flight: int = 0, pool_tokens: int = 0,
++                       used_tokens: int = 0, cache_reserve_tokens: int = 0,
++                       floor_child_cost: int = 0) -> dict:
++    """THE CHILD THROTTLE. How many child streams real contention can absorb.
++
++    Three conjunctive legs — scheduler slots, prefill backlog drain time, and pool
++    residency — every one of them read from the live backend. Derivation, with the
++    measurement behind each number, is in the PREFILL CAPACITY block above.
++
++    ⛔ A MAIN'S TURN ALWAYS WINS. This function can only ever lower the CHILD
++    stream count; it never reads or returns anything that bounds a main's window,
++    growth ceiling or request priority, and leg (A) reserves a slot per main
++    BEFORE any child is counted. Never raises: an unusable load returns state
++    "unknown", which every caller treats as no-prefill-throttle (fail open)."""
++    try:
++        load = load or {}
++        mrr = int(load.get("max_running_requests") or 0)
++        running = int(load.get("num_running_reqs") or 0)
++        waiting = int(load.get("num_waiting_reqs") or 0)
++        backlog = int(load.get("num_waiting_uncached_tokens") or 0)
++        if mrr <= 0:
++            return {"state": "unknown", "child_cap": None, "role": "gate",
++                    "why": "no max_running_requests in /v1/loads "
++                           "(fail open: prefill throttling off)"}
++        kids = max(0, int(children_in_flight))
++        # ⛔ ONE SLOT FOR A MAIN'S OWN TURN AT ALL TIMES — even when the process
++        # scan found no main, because "no main discovered" is a scan result, not
++        # evidence that Andre is not typing. Plus whatever the mains already have
++        # in flight (running requests that are not children), so an auxiliary or
++        # control-plane call in progress is not double-sold to a child.
++        per_main = max(0, int(tunable("main_slot_reserve")))
++        mains_in_flight = max(0, running - kids)
++        reserve = max(1, per_main * max(0, int(n_mains)), mains_in_flight)
++        # INVARIANT leg: a main's turn never queues behind a child.
++        hard_slot_cap = max(0, mrr - reserve - kids)
++        # PREFERENCE leg: the warm concurrency curve's main-lane trade.
++        total_cap = max(1, int(tunable("total_stream_cap")))
++        tuned_slot_cap = max(0, min(total_cap, mrr) - reserve - kids)
++        slot_cap = min(hard_slot_cap, tuned_slot_cap)
++
++        rate, rate_src = prefill_rate_tps(load)
++        budget_s = max(0.1, float(tunable("drain_budget_s")))
++        budget_tokens = int(rate * budget_s)
++        headroom = budget_tokens - max(0, backlog)
++        backlog_s = (backlog / rate) if rate > 0 else 0.0
++        backlog_cap = children_affordable(headroom)
++
++        # (C) pool residency: the backlog is prompt tokens that WILL land in the
++        # pool, charged before any child is.
++        pool_cap = None
++        if pool_tokens > 0 and floor_child_cost > 0:
++            room = int(pool_tokens) - int(cache_reserve_tokens) - int(used_tokens) \
++                - max(0, backlog)
++            pool_cap = max(0, room // int(floor_child_cost))
++
++        legs = {"slots": slot_cap, "backlog": backlog_cap}
++        if pool_cap is not None:
++            legs["pool"] = pool_cap
++        cap = max(0, min(legs.values()))
++        # EVERY leg at the minimum, not the first one found: when two legs are both
++        # at zero, naming one of them hides the other from the next incident.
++        binding = sorted(k for k, v in legs.items() if v == min(legs.values()))
++        # critical -> admit nothing now; the bounded admission hold defers the
++        #             dispatch rather than failing it. Exactly two ways in:
++        #   * the backlog alone already misses the control-plane budget, so the
++        #     mains' own small calls are the ones timing out; or
++        #   * CHILDREN THEMSELVES already hold every slot the curve allows them.
++        #     ⛔ This is the leg that must refuse the SECOND concurrent child
++        #     rather than let six start and then self-clamp once a 12-deep queue
++        #     appears. It is scoped to kids > 0 on purpose: an ordinarily busy
++        #     server (slots full of somebody else's work) must NOT put every child
++        #     dispatch into a 60 s hold — that is saturation, not danger. There the
++        #     cap alone does the work, and the dispatch serialises instead.
++        # tight    -> at most one child fits: serialise (the dispatch-time cap
++        #             collapses to 1, as it does for a VRAM backstop trip). A main
++        #             can always still delegate ONE child; this is never a block.
++        # ok       -> two or more.
++        if headroom <= 0 or (tuned_slot_cap <= 0 and kids > 0):
++            state = "critical"
++        elif cap <= 1:
++            state = "tight"
++        else:
++            state = "ok"
++        return {
++            "state": state, "role": "gate", "child_cap": cap,
++            "binding_legs": binding, "binding_leg": "+".join(binding),
++            "max_running_requests": mrr, "running": running, "waiting": waiting,
++            "main_slots_reserved": reserve, "children_in_flight": kids,
++            "mains_in_flight": mains_in_flight,
++            "total_stream_cap": total_cap,
++            "hard_slot_cap": hard_slot_cap, "tuned_slot_cap": tuned_slot_cap,
++            "slot_cap": slot_cap,
++            "backlog_tokens": backlog, "backlog_s": round(backlog_s, 1),
++            "prefill_rate_tps": round(rate, 1), "prefill_rate_source": rate_src,
++            "drain_budget_s": budget_s, "drain_budget_tokens": budget_tokens,
++            "headroom_tokens": headroom, "backlog_cap": backlog_cap,
++            "waste_next_child_tokens": waste_curve_cumulative(cap + 1)
++            - waste_curve_cumulative(cap),
++            "pool_cap": pool_cap,
++            "why": (f"{backlog:,} uncached waiting tokens = {backlog_s:.0f}s of prefill "
++                    f"at {rate:,.0f} tok/s vs a {budget_s:.0f}s control-plane budget "
++                    f"({budget_tokens:,} tokens); headroom {headroom:,} -> "
++                    f"{backlog_cap} child(ren) by eviction waste, {slot_cap} by slots "
++                    f"(min of {mrr} - {reserve} reserved for {n_mains} main(s) - "
++                    f"{kids} child(ren) in flight = {hard_slot_cap}, and the "
++                    f"{total_cap}-stream throughput cap = {tuned_slot_cap})"
++                    + (f", {pool_cap} by pool residency" if pool_cap is not None else "")
++                    + f" -> {cap} ({'+'.join(binding)} binds)"),
++        }
++    except Exception as exc:
++        logger.debug("pool broker: prefill assessment failed (%s)", exc, exc_info=True)
++        return {"state": "unknown", "child_cap": None, "role": "gate",
++                "why": f"prefill assessment failed ({type(exc).__name__}); fail open"}
++
++
+ def _router_window() -> Optional[int]:
+     """The window the ROUTER advertises for the GPU0 model (max_model_len) —
+     the reviewed rung profiles are validated against at launch. Published for
+@@ -1547,9 +2040,14 @@ def child_concurrency_for_this_session(configured: int,
+     others = max(0, int(a.get("children_active_total") or 0) - own_active)
+     mine = max(1, min(configured, total - others))
+     vram = a.get("vram") or {}
+-    # Device VRAM caps concurrency independently of the pool: the 2026-09-30 OOM
+-    # happened at pool 0.73 [bd-dre-i4qoy]. Serialise to one child while the card
+-    # cannot afford a second concurrent prefill.
++    prefill = a.get("prefill") or {}
++    # ⛔ PREFILL CONTENTION, NOT DEVICE VRAM, is what caps concurrency now
++    # [bd-dre-i4qoy]: the pool is in host RAM and prefill transients are flat at
++    # 32 MiB, so free VRAM reads 6,463 MiB under any load. Serialise to one child
++    # while the prefill backlog cannot drain inside the control-plane budget — or,
++    # as a backstop, while the card is below its VRAM floor.
++    if prefill.get("state") in ("critical", "tight"):
++        mine = 1
+     if vram.get("state") in ("critical", "tight"):
+         mine = 1
+     if mine >= configured:
+@@ -1557,6 +2055,8 @@ def child_concurrency_for_this_session(configured: int,
+     why = (f"{total} child stream(s) across {a.get('n_mains')} main session(s), "
+            f"{others} already in use by other sessions; pool "
+            f"{a.get('token_usage', 0):.0%} ({a.get('pressure')})")
++    if prefill.get("state") in ("critical", "tight"):
++        why += f"; prefill {prefill.get('state')} — {prefill.get('why')}"
+     if vram.get("state") in ("critical", "tight"):
+         why += f"; device VRAM {vram.get('state')} — {vram.get('why')}"
+     return mine, f"broker cap {configured} -> {mine}: {why}."
+@@ -1773,58 +2273,78 @@ def wrap_mounts_for_priority(base_url: str, mounts: dict, async_mode: bool = Fal
+         return mounts
+ 
+ 
+-def vram_admission_hold(n_children: int = 1) -> tuple:
+-    """Hold a subagent dispatch off while GPU0 cannot afford ONE prefill.
++def admission_hold(n_children: int = 1) -> tuple:
++    """Hold a subagent dispatch off while GPU0 genuinely cannot absorb it.
+ 
+-    (waited_s, note). [bd-dre-i4qoy] "Below a critical floor, admit no new
+-    children and let in-flight work drain" — implemented as a BOUNDED hold, not
+-    a refusal: an OOM that kills the lane for every session is worse than a slow
+-    dispatch, and a failed task is worse than a risked one. So it waits up to
+-    VRAM_HOLD_MAX_S (polling every VRAM_HOLD_POLL_S, which re-reads the sample
+-    past its TTL), then proceeds regardless and says so.
++    (waited_s, note). Two reasons to hold, in the order they now matter
++    [bd-dre-i4qoy]:
++      * PREFILL CRITICAL — the uncached waiting backlog already exceeds what can
++        drain inside the control-plane budget, so the mains' own turns and their
++        goal-judge calls are the ones timing out. This is the state Andre was
++        watching at 11-17 tok/s per main.
++      * VRAM FLOOR BREACHED — the backstop: runtime free VRAM is below the
++        largest allocation measured to be fatal plus one transient per scheduler
++        slot. GPU0 died twice on this today.
+ 
+-    Returns immediately when the signal is absent (fail open), when the pool
+-    broker has no allowance, or when the card can afford a prefill. Never raises.
++    Implemented as a BOUNDED hold, not a refusal: a dead lane is worse than a slow
++    dispatch, and a stalled agent is worse than a risked one. So it waits up to
++    VRAM_HOLD_MAX_S (polling every VRAM_HOLD_POLL_S, which re-reads the VRAM sample
++    past its TTL and re-probes the backend), then proceeds regardless and says so.
++
++    Returns immediately when the signals are absent (fail open), when the pool
++    broker has no allowance, or when neither leg is critical. Never raises.
+     """
+     if os.environ.get("HERMES_POOL_VRAM_HOLD", "1") == "0":
+         return 0.0, ""
+     started = time.monotonic()
+     polls = 0
+     first = None
++    max_s = float(tunable("vram_hold_max_s"))
+     try:
+         while True:
+             a = get_allowance()
+             vram = (a or {}).get("vram") or {}
+-            state = vram.get("state")
+-            if state != "critical":
++            prefill = (a or {}).get("prefill") or {}
++            critical = [(label, d) for label, d in (("prefill", prefill), ("VRAM", vram))
++                        if d.get("state") == "critical"]
++            if not critical:
+                 break
++            label, detail = critical[0]
+             if first is None:
+-                first = dict(vram)
++                first = dict(detail)
+                 logger.warning(
+-                    "pool broker: HOLDING a %d-child dispatch — GPU0 device VRAM is "
+-                    "critical: %s. Waiting up to %.0fs for in-flight prefills to "
+-                    "drain (pool is NOT the constraint here).",
+-                    n_children, vram.get("why"), VRAM_HOLD_MAX_S)
++                    "pool broker: HOLDING a %d-child dispatch — GPU0 %s is critical: "
++                    "%s. Waiting up to %.0fs for the mains' in-flight prefill to "
++                    "drain.", n_children, label, detail.get("why"), max_s)
+             waited = time.monotonic() - started
+-            if waited >= VRAM_HOLD_MAX_S:
+-                note = (f"proceeded after holding {waited:.0f}s: device VRAM still "
+-                        f"critical ({vram.get('why')}). Dispatching anyway — a "
++            if waited >= max_s:
++                note = (f"proceeded after holding {waited:.0f}s: {label} still "
++                        f"critical ({detail.get('why')}). Dispatching anyway — a "
+                         f"stalled agent is worse than a risked prefill.")
+                 logger.warning("pool broker: %s", note)
+                 return round(waited, 1), note
+             polls += 1
+-            time.sleep(min(VRAM_HOLD_POLL_S, max(0.1, VRAM_HOLD_MAX_S - waited)))
++            time.sleep(min(VRAM_HOLD_POLL_S, max(0.1, max_s - waited)))
+             # Force a fresh sample: the shared allowance may be refreshed by
+             # another process, but this one must not spin on a cached reading.
+             vram_sample(force=True)
+             _refresh_locked()
+     except Exception:
+-        logger.debug("pool broker: VRAM hold check failed; proceeding", exc_info=True)
++        logger.debug("pool broker: admission hold check failed; proceeding",
++                     exc_info=True)
+         return round(time.monotonic() - started, 1), ""
+     waited = time.monotonic() - started
+     if first is None:
+         return 0.0, ""
+-    note = (f"released after {waited:.0f}s ({polls} poll(s)): device VRAM recovered "
+-            f"to {(get_allowance() or {}).get('vram', {}).get('free_mib')} MiB free.")
+-    logger.info("pool broker: VRAM hold %s", note)
++    fresh = get_allowance() or {}
++    note = (f"released after {waited:.0f}s ({polls} poll(s)): backlog "
++            f"{(fresh.get('prefill') or {}).get('backlog_tokens')} tokens, "
++            f"{(fresh.get('vram') or {}).get('free_mib')} MiB free VRAM.")
++    logger.info("pool broker: admission hold %s", note)
+     return round(waited, 1), note
++
++
++# ⛔ BACK-COMPAT NAME. tools/delegate_tool.py calls vram_admission_hold(); that
++# file is owned by another agent right now, so the old name stays an alias rather
++# than becoming an edit over there. Same behaviour, now gated on prefill too.
++vram_admission_hold = admission_hold
+diff --git a/tests/agent/test_pool_broker.py b/tests/agent/test_pool_broker.py
+index b91615d..01470cf 100644
+--- a/tests/agent/test_pool_broker.py
++++ b/tests/agent/test_pool_broker.py
+@@ -133,11 +133,37 @@ def test_reservations_never_exceed_pool(n, tu, prompt):
+ def test_unmeasured_mains_scale_and_one_child_fits(n):
+     a = pb.compute_allowance(INFO, _load(0.2), _mains(n), {})
+     _check(a)
+-    assert a["child_streams_total"] >= 1
++    # ⛔ WHAT "ONE CHILD FITS" MEANS HERE IS A MEMORY STATEMENT, AND IT STILL HOLDS:
++    # the usable pool always leaves room for one floor-sized child and the derived
++    # ceilings always reserve one.
++    assert pb.inflight(pb.CHILD_FLOOR, a["child_max_tokens"],
++                       a["compression_threshold"]) <= a["child_pool_tokens"]
++    # SLOTS are a separate axis and they are exhausted at this geometry: this load
++    # has all 4 of max_running_requests already running, and a slot is held for
++    # every live main before a child is counted [bd-dre-i4qoy], so the advertised
++    # child-STREAM budget is 0. That is the intended answer — a main's turn
++    # outranks a subagent — and it is not a refusal: `admit_children` stays True
++    # (saturated slots read "tight", never "critical"), the per-session rail still
++    # floors child_streams at 1, and child_concurrency_for_this_session floors a
++    # dispatch at 1. Children serialise; they are never blocked.
++    assert a["prefill"]["state"] == "tight"
++    assert a["admit_children"] is True
++    assert min(s["child_streams"] for s in a["sessions"].values()) >= 1
+     if n >= 3:
+         assert a["invariant"]["mains_scaled"]
+ 
+ 
++@pytest.mark.parametrize("n", [1, 2])
++def test_an_idle_backend_still_advertises_a_child_stream(n):
++    """The complement of the test above: with slots FREE, children get one."""
++    load = dict(_load(0.2), num_running_reqs=0, num_waiting_reqs=0,
++                num_waiting_uncached_tokens=0)
++    a = pb.compute_allowance(INFO, load, _mains(n), {})
++    _check(a)
++    assert a["child_streams_total"] >= (1 if n == 1 else 0)
++    assert a["admit_children"] is True
++
++
+ def test_measured_mains_reserve_what_they_use():
+     a = pb.compute_allowance(INFO, _load(0.2), _mains(2),
+                              {1000: {"prompt_tokens": 20_000}, 1001: {"prompt_tokens": 20_000}})
+@@ -207,9 +233,13 @@ def _architect(monkeypatch):
+     monkeypatch.setattr(pb, "_profile_numbers", lambda p: {
+         "context_length": 393_216, "max_tokens": 8_192,
+         "delegation_max_tokens": 24_576, "compression_threshold": 0.85})
++    # These tests are about the GRANTS. Both admission legs are stubbed "unknown"
++    # (the fail-open state) so neither the VRAM backstop nor the prefill gate can
++    # change the stream count underneath them. **kw: the real signatures grow.
+     monkeypatch.setattr(pb, "vram_assessment",
+-                        lambda queued=0, sample=None: {"state": "unknown", "why": "",
+-                                                       "child_cap": 9})
++                        lambda **kw: {"state": "unknown", "why": "", "child_cap": None})
++    monkeypatch.setattr(pb, "prefill_assessment",
++                        lambda **kw: {"state": "unknown", "why": "", "child_cap": None})
+ 
+ 
+ def test_two_mains_on_the_live_pool_are_not_each_granted_all_of_it(_architect):
+diff --git a/tests/agent/test_vram_throttle.py b/tests/agent/test_vram_throttle.py
+index cfc67b2..1ab8da8 100644
+--- a/tests/agent/test_vram_throttle.py
++++ b/tests/agent/test_vram_throttle.py
+@@ -1,10 +1,21 @@
+ # Copyright © 2026 Ligandal, Inc. All rights reserved.
+-"""Device-VRAM throttling, calibrated on the 2026-09-30 16:44:17 OOM [bd-dre-i4qoy].
+-
+-That crash happened at KV pool usage 0.73 with 287 MiB device-free and 14 queued
+-requests, killed by a 560 MiB prefill allocation. These tests pin the behaviour
+-at those exact numbers, and pin the two false-alarm traps: a fixed absolute floor
+-and the watchdog's learned baseline were both silent or permanently tripped.
++"""Child-admission throttling: the PREFILL gate and the VRAM backstop [bd-dre-i4qoy].
++
++Two incidents calibrate this file, and they pull in opposite directions.
++
++1. 2026-09-30 16:44:17 — torch.OutOfMemoryError at KV pool usage 0.73 with 287 MiB
++   device-free and 14 queued requests, killed by a 560 MiB prefill allocation. The
++   pool was fine; driver-level VRAM outside it was not. That is why a runtime
++   free-VRAM floor still exists, and why it is checked against the numbers that
++   made a fixed floor and the watchdog's learned baseline both useless.
++
++2. 2026-09-30 evening — the GPU0 KV pool moved to HOST RAM (451,264 -> 1,310,720
++   tokens; KV VRAM 5.6 -> 1.26 GB; free VRAM 935-1,533 -> 6,463 MiB) and the
++   bounded-gather fix put prefill transients flat at 32 MiB. The free-VRAM divisor
++   then licensed ELEVEN concurrent children where it had licensed one, and Andre's
++   two main sessions were measured at 11-17 tok/s each. ``test_tonight_geometry_*``
++   is the regression that would have caught it: same arithmetic, same inputs, a
++   small cap instead of ~11.
+ """
+ import json
+ 
+@@ -12,9 +23,32 @@ import pytest
+ 
+ import agent.pool_broker as pb
+ 
+-# The incident, and the post-fix (mem-fraction 0.97) expectation.
++# ── The 16:44:17 OOM, and the two mem-fraction steady states around it ──────
+ INCIDENT = {"free_mib": 287, "baseline_free_mib": 287, "queued": 14}
+-POST_FIX_FREE = 1266
++POST_FIX_FREE = 1266            # mem-fraction 0.97, pre-cutover
++PRE_CUTOVER_FREE = 935          # the low end of the measured 935-1,533 MiB band
++
++# ── Tonight's live GPU0 geometry, post-cutover (the regression case) ─────────
++TONIGHT_POOL = 1_310_720
++TONIGHT_FREE_MIB = 6_463
++TONIGHT_BACKLOG = 482_779       # num_waiting_uncached_tokens, measured
++# The server's own cumulative prefill counters at 2026-09-30 23:54Z:
++# 7,535,276 tokens / 888.43 s = 8,481 tok/s.
++PREFILL_COUNTERS = {"total_prefill_uncached_tokens": 7_535_276,
++                    "total_prefill_busy_us": 888_433_873}
++MEASURED_RATE_TPS = 8_481
++
++ARCHITECT_PROFILE = {"context_length": 393_216, "max_tokens": 8_192,
++                     "delegation_max_tokens": 24_576, "compression_threshold": 0.85}
++
++
++@pytest.fixture(autouse=True)
++def _no_env_tunables(monkeypatch):
++    """A developer shell (or a dispatched worker) must not retune the throttle
++    under the tests. Every throttle env var is cleared, so each test sees the
++    module defaults unless it sets one deliberately."""
++    for env, _ckey in pb._TUNABLE_SPEC.values():
++        monkeypatch.delenv(env, raising=False)
+ 
+ 
+ def _sample(free, baseline=287, age=1.0, backend_ok=True):
+@@ -23,44 +57,360 @@ def _sample(free, baseline=287, age=1.0, backend_ok=True):
+             "sample_ts": "2026-09-30T16:44:00Z", "source": "test"}
+ 
+ 
+-def test_incident_geometry_admits_nothing():
+-    a = pb.vram_assessment(queued=INCIDENT["queued"], sample=_sample(287))
+-    assert a["affordable_prefills"] == 0        # 287 // 560
++def _load(backlog, pool=TONIGHT_POOL, usage=0.14, running=3, waiting=4, mrr=4,
++          counters=True):
++    load = {"max_total_num_tokens": pool, "max_running_requests": mrr,
++            "num_used_tokens": int(pool * usage), "token_usage": usage,
++            "num_running_reqs": running, "num_waiting_reqs": waiting,
++            "num_waiting_uncached_tokens": backlog}
++    if counters:
++        load.update(PREFILL_COUNTERS)
++    return load
++
++
++def _assess(backlog, n_mains=2, children_in_flight=0, **kw):
++    load = _load(backlog, **kw)
++    pool = int(load["max_total_num_tokens"])
++    return pb.prefill_assessment(
++        load=load, n_mains=n_mains, children_in_flight=children_in_flight,
++        pool_tokens=pool, used_tokens=int(load["num_used_tokens"]),
++        cache_reserve_tokens=int(pool * 0.10),
++        floor_child_cost=pb.inflight(pb.CHILD_FLOOR, 24_576, 0.85))
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# THE REGRESSION: tonight's exact geometry must NOT license ~11 children
++# ══════════════════════════════════════════════════════════════════════════
++def test_tonight_geometry_yields_a_small_cap_not_eleven():
++    """6,463 MiB free, pool 1,310,720 at 14%, 482,779 uncached waiting, 3 running
++    / 4 waiting, two mains. The OLD rule was free_mib // 560 = 11 affordable
++    children. The new gate must give a SMALL number."""
++    old_rule = TONIGHT_FREE_MIB // pb.PREFILL_ALLOC_MIB
++    assert old_rule == 11, "the rule being replaced still reads as 11 here"
++
++    a = _assess(TONIGHT_BACKLOG)
+     assert a["child_cap"] == 0
++    assert a["child_cap"] <= 2 < old_rule
+     assert a["state"] == "critical"
+-    assert "560" in a["why"] and "287" in a["why"]
++    # Both the backlog and the slot leg are at zero here, and both are named.
++    assert "backlog" in a["binding_legs"] and a["backlog_cap"] == 0
++    # ⛔ The pool is NOT what is scarce — 14% used. If this leg ever becomes the
++    # binding one at this geometry, the gate has been re-keyed onto the wrong axis
++    # again.
++    assert a["pool_cap"] >= 8
++    # Free VRAM contributes nothing: it is 9.4x the floor.
++    v = pb.vram_assessment(queued=4, sample=_sample(TONIGHT_FREE_MIB),
++                           max_running_requests=4)
++    assert v["state"] == "ok" and v["child_cap"] is None
++
++
++def test_tonight_geometry_through_the_whole_allowance(monkeypatch, caplog):
++    """End to end: compute_allowance at tonight's numbers publishes 0 child
++    streams and admit_children False, and says why in the log."""
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
++    monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
++    monkeypatch.setattr(pb, "vram_sample",
++                        lambda force=False: _sample(TONIGHT_FREE_MIB))
++    info = {"context_length": 540_000, "max_req_input_len": 539_994,
++            "max_running_requests": 4, "max_total_num_tokens": TONIGHT_POOL}
++    mains = [{"pid": 1000, "profile": "architect"}, {"pid": 1001, "profile": "architect"}]
++    with caplog.at_level("WARNING"):
++        a = pb.compute_allowance(info, _load(TONIGHT_BACKLOG), mains, {})
++    assert a["child_streams_total"] == 0
++    assert a["admit_children"] is False
++    assert a["prefill"]["state"] == "critical"
++    assert a["vram"]["state"] == "ok"          # the backstop did NOT fire
++    assert a["invariant"]["ok"], a["invariant"]
++    assert "PREFILL CRITICAL" in caplog.text and "482,779" in caplog.text
++
++
++def test_backlog_is_measured_in_drain_seconds_not_a_round_number():
++    a = _assess(TONIGHT_BACKLOG)
++    # 482,779 / 8,481 tok/s = 57 s against a 30 s control-plane budget.
++    assert a["prefill_rate_source"] == "live /v1/loads counters"
++    assert round(a["prefill_rate_tps"]) == pytest.approx(MEASURED_RATE_TPS, abs=2)
++    assert a["backlog_s"] == pytest.approx(56.9, abs=0.5)
++    assert a["drain_budget_s"] == pb.DRAIN_BUDGET_S == 30.0
++    assert a["headroom_tokens"] < 0
++
++
++def test_prefill_rate_is_read_from_the_servers_own_counters():
++    rate, src = pb.prefill_rate_tps(_load(0))
++    assert src == "live /v1/loads counters"
++    assert rate == pytest.approx(7_535_276 / 888.433873, rel=1e-6)
++    # Absent or not-yet-accumulated counters fall back to the measured default,
++    # never to a rate derived from a warm-up-dominated sample.
++    assert pb.prefill_rate_tps({})[1] == "configured default"
++    assert pb.prefill_rate_tps({"total_prefill_uncached_tokens": 10,
++                                "total_prefill_busy_us": 1000})[1] == "configured default"
++
++
++def test_waste_curve_matches_its_two_measured_anchors():
++    """W(k) = 2,622 * 2.145**k, fitted through the measured 114,385 tokens of
++    wasted prefill per call at five other in-flight requests."""
++    assert pb.WASTE_BASE_TOKENS == 2_622
++    w5 = pb.waste_curve_cumulative(5) - pb.waste_curve_cumulative(4)
++    assert w5 == pytest.approx(pb.WASTE_ANCHOR_HIGH_TOKENS, rel=0.05)
++    # Strictly superlinear: that is the whole reason concurrency is cheap to add
++    # and expensive to have.
++    steps = [pb.waste_curve_cumulative(k) - pb.waste_curve_cumulative(k - 1)
++             for k in range(1, 6)]
++    assert steps == sorted(steps) and steps[-1] > 20 * steps[0]
++
++
++@pytest.mark.parametrize("backlog,cap,state", [
++    (0, 1, "tight"),              # idle: the 2-stream cap leaves one for a child
++    (100_000, 1, "tight"),        # 12 s of backlog: still room for that one
++    (254_445, 0, "critical"),     # exactly the budget -> no headroom left
++    (TONIGHT_BACKLOG, 0, "critical"),
++])
++def test_backlog_ladder(backlog, cap, state):
++    a = _assess(backlog, n_mains=1, running=1, waiting=0)
++    assert (a["child_cap"], a["state"]) == (cap, state)
++
++
++def test_slots_bind_before_the_backlog_does():
++    """An idle lane still only gets what the stream cap leaves after a slot per
++    main. The warm concurrency curve has NO interior aggregate peak below mrr=4
++    (176 -> 282 -> 340 -> 410 tok/s), so 'as many as the headroom fits' is
++    deliberately not the rule — see TOTAL_STREAM_CAP."""
++    a = _assess(0, n_mains=1, running=0, waiting=0)
++    assert a["backlog_cap"] >= 5 and a["slot_cap"] == 1
++    assert a["child_cap"] == 1 and a["binding_leg"] == "slots"
++    # Children already in flight are debited from the same slots.
++    assert _assess(0, n_mains=2, children_in_flight=2)["child_cap"] == 0
++    # Four mains on a 4-slot server leaves nothing for children. Mains win.
++    assert _assess(0, n_mains=4)["child_cap"] == 0
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# THE CONCURRENCY CAP — derived from the WARM decode curve, runtime-tunable
++# ══════════════════════════════════════════════════════════════════════════
++# Re-measured on 2026-09-30 from 6,436 `Decode batch` samples of the current build
++# era, warmup dropped and cold-prefill-contended steps segmented out:
++#   conc   n   median aggregate tok/s   per-stream   share of solo
++#     1  1060                   176.5        176.5          100.0%
++#     2   613                   282.2        141.1           80.0%
++#     3   221                   340.2        113.4           64.2%
++#     4   128                   409.6        102.4           58.0%
++WARM_CURVE = {1: 176.5, 2: 282.2, 3: 340.2, 4: 409.6}
++
++
++def test_the_cap_is_where_a_main_lane_keeps_two_thirds_of_its_solo_rate():
++    """⛔ THE DERIVATION. There is no interior AGGREGATE maximum below mrr=4 —
++    aggregate rises monotonically — so the cap cannot be read off the aggregate
++    curve at all. It is keyed on a MAIN LANE's own throughput, which is what Andre
++    is reading at 22-28 tok/s, and set at the largest concurrency that keeps a lane
++    above two thirds of solo."""
++    agg = WARM_CURVE
++    assert sorted(agg.values()) == list(agg.values()), "no interior aggregate peak"
++    share = {k: (v / k) / agg[1] for k, v in agg.items()}
++    assert share[2] == pytest.approx(0.800, abs=0.005)
++    assert share[3] == pytest.approx(0.642, abs=0.005)
++    kept = [k for k in sorted(agg) if share[k] >= 2 / 3]
++    assert max(kept) == pb.TOTAL_STREAM_CAP == 2
++
++
++def test_children_take_the_second_slot_and_no_more():
++    """One main + one child = the 2-stream cap. The SECOND concurrent child is
++    refused outright — not after a 12-deep queue has taught the throttle, which is
++    how six children came to be running at once."""
++    first = _assess(0, n_mains=1, children_in_flight=0, running=1, waiting=0)
++    assert first["child_cap"] == 1 and first["state"] == "tight"
++    second = _assess(0, n_mains=1, children_in_flight=1, running=2, waiting=0)
++    assert second["child_cap"] == 0 and second["state"] == "critical"
++    assert second["tuned_slot_cap"] == 0 and second["hard_slot_cap"] >= 1
++    # ⛔ The queue is EMPTY in `second` — nothing taught it. The backlog leg alone
++    # would still have allowed five.
++    assert second["backlog_tokens"] == 0 and second["backlog_cap"] >= 5
++
++
++def test_the_observed_226_state_reads_critical():
++    """Lane 226, 2026-09-30: "3 mine · 3/4 backend · 1 free · 15 queued" — three of
++    one session's own children on three of four slots. Every dispatch that led
++    there must now be refused."""
++    for kids, running in ((1, 2), (2, 3), (3, 4)):
++        a = _assess(0, n_mains=1, children_in_flight=kids, running=running, waiting=0)
++        assert a["state"] == "critical", kids
++        assert a["child_cap"] == 0
++    observed = _assess(300_000, n_mains=1, children_in_flight=3, running=4, waiting=15)
++    assert observed["hard_slot_cap"] == 0 and observed["state"] == "critical"
++
++
++def test_one_slot_is_reserved_for_a_main_even_with_no_main_discovered():
++    """"No main discovered" is a process-scan result, not evidence that Andre is
++    not typing. A slot is held regardless."""
++    a = _assess(0, n_mains=0, children_in_flight=0, running=0, waiting=0)
++    assert a["main_slots_reserved"] >= 1
++    assert a["child_cap"] <= pb.TOTAL_STREAM_CAP - 1
++
++
++def test_a_main_already_in_flight_is_not_double_sold():
++    """Requests running that are not children are the mains' own (turn, compaction,
++    goal judge). They are debited from the reserve, not ignored."""
++    a = _assess(0, n_mains=1, children_in_flight=0, running=3, waiting=0)
++    assert a["mains_in_flight"] == 3 and a["main_slots_reserved"] == 3
++    assert a["child_cap"] == 0
++
++
++def test_two_mains_still_get_to_delegate_one_child():
++    """With two mains the throughput preference reaches 0 while the invariant leg
++    still has room. That must NOT be a block: refusing delegation outright whenever
++    Andre has two sessions open would be a self-inflicted restriction, and three
++    streams with two of them mains still queues no main."""
++    a = _assess(0, n_mains=2, children_in_flight=0, running=0, waiting=0)
++    assert a["tuned_slot_cap"] == 0 and a["hard_slot_cap"] == 2
++    assert a["state"] == "tight"            # serialise, do not block
++    # ...and the dispatch-time cap floors a delegating session at one child.
++    assert pb.child_concurrency_for_this_session(
++        4, 0) is not None   # smoke: never raises
++
++
++@pytest.mark.parametrize("cap,expect_idle_cap", [(2, 1), (3, 2), (4, 3)])
++def test_the_cap_is_runtime_tunable(monkeypatch, cap, expect_idle_cap):
++    """Andre: "maybe we should cap concurrency at where max tok/s are achieved so
++    we can push things more". Pushing it is a config edit, not a relaunch."""
++    monkeypatch.setenv("HERMES_POOL_TOTAL_STREAM_CAP", str(cap))
++    a = _assess(0, n_mains=1, children_in_flight=0, running=1, waiting=0)
++    assert a["total_stream_cap"] == cap
++    assert a["child_cap"] == expect_idle_cap
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# A MAIN'S TURN ALWAYS WINS
++# ══════════════════════════════════════════════════════════════════════════
++def test_a_mains_turn_is_never_blocked_by_children(monkeypatch):
++    """At the worst geometry the throttle knows how to produce — zero child
++    streams, prefill critical, VRAM floor breached — the mains keep their window,
++    their growth ceiling and the higher request priority. The throttle may only
++    ever reduce CHILDREN."""
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
++    monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
++    info = {"context_length": 540_000, "max_req_input_len": 539_994,
++            "max_running_requests": 4, "max_total_num_tokens": TONIGHT_POOL,
++            "enable_priority_scheduling": True,
++            "abort_on_priority_when_disabled": False}
++    mains = [{"pid": 1000, "profile": "architect"}, {"pid": 1001, "profile": "architect"}]
++    beats = {1000: {"prompt_tokens": 300_000, "main_context_length": 393_216},
++             1001: {"prompt_tokens": 280_000, "main_context_length": 393_216}}
++
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(TONIGHT_FREE_MIB))
++    calm = pb.compute_allowance(info, _load(0, running=0, waiting=0), mains, beats)
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(287))
++    worst = pb.compute_allowance(info, _load(TONIGHT_BACKLOG), mains, beats)
++
++    assert worst["child_streams_total"] == 0 and worst["admit_children"] is False
++    assert worst["vram"]["state"] == "critical"          # backstop fired too
++    for pid in ("1000", "1001"):
++        c, w = calm["sessions"][pid], worst["sessions"][pid]
++        # Not one token of a main's window or growth ceiling is taken by the
++        # throttle: Andre's mains are the product, children are discretionary.
++        assert w["main_window"] == c["main_window"] >= pb.MAIN_WINDOW_FLOOR
++        assert w["main_grow_max"] == c["main_grow_max"]
++        assert w["priority_main"] > w["priority_child"]
++    # Andre's 532,480-per-main share-bounded grant on the 1.31M pool is untouched
++    # by child throttling (commit 301b96a must not be weakened).
++    assert worst["grants"]["ok"] if "grants" in worst else True
++    assert worst["invariant"]["grants"]["ok"], worst["invariant"]
++
++
++def test_throttle_never_lowers_a_main_below_the_window_floor(monkeypatch):
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
++    monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(287))
++    info = {"context_length": 540_000, "max_req_input_len": 539_994,
++            "max_running_requests": 4, "max_total_num_tokens": TONIGHT_POOL}
++    a = pb.compute_allowance(info, _load(TONIGHT_BACKLOG),
++                             [{"pid": 7, "profile": "architect"}], {})
++    assert a["sessions"]["7"]["main_window"] >= pb.MAIN_WINDOW_FLOOR
++    assert a["sessions"]["7"]["main_grow_max"] >= pb.MAIN_WINDOW_FLOOR
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# THE VRAM BACKSTOP — a floor, and one that should almost never fire
++# ══════════════════════════════════════════════════════════════════════════
++def test_vram_floor_is_derived_from_the_fatal_allocation_and_the_slots():
++    """560 MiB (the 16:44:17 OOM's own 'Tried to allocate 560.00 MiB') plus one
++    32 MiB prefill transient per schedulable request."""
++    assert pb.vram_floor_mib(4) == 560 + 4 * 32 == 688
++    assert pb.vram_floor_mib(12) == 560 + 12 * 32
++
++
++@pytest.mark.parametrize("free,state,cap", [
++    (287, "critical", 0),              # the 16:44:17 OOM
++    (PRE_CUTOVER_FREE, "ok", None),    # pre-cutover steady state: above the floor
++    (POST_FIX_FREE, "ok", None),
++    (TONIGHT_FREE_MIB, "ok", None),    # post-cutover: contributes NO cap
++])
++def test_vram_is_a_floor_not_a_divisor(free, state, cap):
++    a = pb.vram_assessment(queued=14, sample=_sample(free), max_running_requests=4)
++    assert (a["state"], a["child_cap"]) == (state, cap)
++    assert a["role"] == "backstop"
++
++
++def test_vram_backstop_does_not_fire_at_tonights_geometry():
++    """With transients flat at 32 MiB this must be a backstop that almost never
++    fires — 6,463 MiB is 9.4x the floor."""
++    a = pb.vram_assessment(queued=4, sample=_sample(TONIGHT_FREE_MIB),
++                           max_running_requests=4)
++    assert a["headroom_mib"] == TONIGHT_FREE_MIB - 688
++    assert a["free_mib"] / a["floor_mib"] > 9
+ 
+ 
+ def test_baseline_relative_would_have_been_silent():
+-    """Why the throttle is NOT keyed on the watchdog's baseline: it had learned
++    """Why the backstop is NOT keyed on the watchdog's baseline: it had learned
+     287 MiB as normal, so the deviation was zero at the moment of the crash."""
+     a = pb.vram_assessment(queued=14, sample=_sample(287, baseline=287))
+     assert a["below_baseline_mib"] == 0         # no deviation to detect
+-    assert a["state"] == "critical"             # capacity rule still fires
++    assert a["state"] == "critical"             # the floor still fires
+ 
+ 
+-def test_fixed_floor_would_be_permanently_tripped():
+-    """Why it is NOT an absolute floor: at 0.98 the steady state (287) and at
+-    0.97 (~1,266) both sit under the suggested 1.5 GiB warn floor, so a floor is
+-    a constant, not a signal. The capacity rule separates them."""
++def test_fixed_floor_separates_the_two_mem_fraction_states():
++    """At 0.98 the steady state was 287 MiB and at 0.97 ~1,266 — the suggested
++    1.5 GiB watchdog warn floor was breached by both, so it was a constant, not a
++    signal. A floor derived from the fatal allocation separates them."""
+     assert pb.vram_assessment(queued=0, sample=_sample(287))["state"] == "critical"
+     assert pb.vram_assessment(queued=0, sample=_sample(POST_FIX_FREE))["state"] == "ok"
+ 
+ 
+-@pytest.mark.parametrize("free,queued,cap,state", [
+-    (287, 14, 0, "critical"),      # the incident
+-    (287, 0, 0, "critical"),       # cannot afford one prefill at all
+-    (POST_FIX_FREE, 0, 2, "ok"),   # 0.97: two concurrent prefills affordable
+-    (POST_FIX_FREE, 1, 1, "tight"),
+-    (POST_FIX_FREE, 2, 0, "tight"),  # queue already claims the headroom
+-    (5000, 0, 8, "ok"),
+-])
+-def test_capacity_ladder(free, queued, cap, state):
+-    a = pb.vram_assessment(queued=queued, sample=_sample(free))
+-    assert (a["child_cap"], a["state"]) == (cap, state)
++# ══════════════════════════════════════════════════════════════════════════
++# PRE-CUTOVER GEOMETRY still yields a safe cap
++# ══════════════════════════════════════════════════════════════════════════
++def test_pre_cutover_geometry_still_safe(monkeypatch):
++    """935 MiB free, pool 451,264 at 93.5% with 479,548 uncached waiting (the
++    2026-09-30 daytime stall). The re-key must not have loosened the old case:
++    zero children, and the pool-memory rung still reads critical."""
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
++    monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
++    monkeypatch.setattr(pb, "vram_sample",
++                        lambda force=False: _sample(PRE_CUTOVER_FREE))
++    pool = 451_264
++    info = {"context_length": 540_000, "max_req_input_len": 451_258,
++            "max_running_requests": 4, "max_total_num_tokens": pool}
++    load = {"max_total_num_tokens": pool, "max_running_requests": 4,
++            "num_used_tokens": 421_888, "token_usage": 0.9349,
++            "num_running_reqs": 1, "num_waiting_reqs": 10,
++            "num_waiting_uncached_tokens": 479_548, **PREFILL_COUNTERS}
++    a = pb.compute_allowance(info, load, [{"pid": 1, "profile": "architect"},
++                                          {"pid": 2, "profile": "architect"}], {})
++    assert a["pressure"] == "critical"            # 93.5% of the pool in use
++    assert a["child_streams_total"] == 0
++    assert a["admit_children"] is False
++    assert a["vram"]["state"] == "ok"             # 935 > 688: the floor is a backstop
++    assert a["prefill"]["state"] == "critical"    # the backlog is what stops it
++
++
++def test_pre_cutover_quiet_pool_still_admits_children():
++    """The same small pool with nothing queued must still let children run —
++    the re-key must not have turned into a blanket refusal."""
++    a = _assess(0, n_mains=1, pool=451_264, usage=0.20, running=1, waiting=0)
++    assert a["child_cap"] == 1 and a["state"] == "tight"
+ 
+ 
+-def test_absent_signal_fails_open(monkeypatch):
++# ══════════════════════════════════════════════════════════════════════════
++# FAIL OPEN
++# ══════════════════════════════════════════════════════════════════════════
++def test_absent_vram_signal_fails_open(monkeypatch):
+     monkeypatch.setattr(pb, "VRAM_SAMPLE_CMD", [])
+     monkeypatch.setattr(pb, "_vram_cache", {"at": 0.0, "value": None})
+     a = pb.vram_assessment(queued=99)
+@@ -68,8 +418,10 @@ def test_absent_signal_fails_open(monkeypatch):
+     assert "fail open" in a["why"]
+ 
+ 
+-def test_stale_sample_is_discarded_not_trusted(monkeypatch, tmp_path):
+-    """A dead watchdog must read as 'no signal', never as 'the card is fine'."""
++def test_stale_vram_sample_is_discarded_not_trusted(monkeypatch, tmp_path):
++    """A dead watchdog must read as 'no signal', never as 'the card is fine'.
++    The 90 s staleness window and the ssh-ControlMaster pull are unchanged."""
++    assert pb.VRAM_SAMPLE_MAX_AGE_S == 90
+     stale = tmp_path / "latest.json"
+     stale.write_text(json.dumps({"ts_epoch": 0, "ts": "1970-01-01T00:00:00Z",
+                                  "gpus": {"0": {"free_mib": 9999, "total_mib": 97887}},
+@@ -87,78 +439,166 @@ def test_stale_sample_is_discarded_not_trusted(monkeypatch, tmp_path):
+     assert pb.vram_sample(force=True)["free_mib"] == 1266
+ 
+ 
++def test_stale_vram_sample_still_admits_children(monkeypatch):
++    """Fail open end to end: a dead watchdog must not stop subagents, and the
++    prefill gate carries on alone."""
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
++    monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: None)
++    info = {"context_length": 540_000, "max_req_input_len": 539_994,
++            "max_running_requests": 4, "max_total_num_tokens": TONIGHT_POOL}
++    a = pb.compute_allowance(info, _load(0, running=0, waiting=0),
++                             [{"pid": 1, "profile": "architect"}], {})
++    assert a["vram"]["state"] == "unknown"
++    assert a["admit_children"] is True and a["child_streams_total"] >= 1
++
++
++def test_unusable_load_fails_open_on_the_prefill_gate():
++    a = pb.prefill_assessment(load={}, n_mains=2)
++    assert a["state"] == "unknown" and a["child_cap"] is None
++    assert "fail open" in a["why"]
++
++
+ def test_no_ssh_to_delta_under_pytest(monkeypatch):
+     monkeypatch.setattr(pb, "VRAM_SAMPLE_CMD", None)
+     assert pb._vram_sample_cmd() is None        # refuses to build the ssh pull
+ 
+ 
+-def test_allowance_clamps_child_streams_and_logs(monkeypatch, caplog):
+-    info = {"context_length": 540_000, "max_req_input_len": 522_874,
+-            "max_running_requests": 4, "max_total_num_tokens": 522_880}
+-    load = {"max_total_num_tokens": 522_880, "max_running_requests": 4,
+-            "num_used_tokens": int(522_880 * 0.73), "token_usage": 0.73,
+-            "num_running_reqs": 4, "num_waiting_reqs": 14}
+-    monkeypatch.setattr(pb, "_profile_numbers", lambda p: {
+-        "context_length": 393_216, "max_tokens": 8_192,
+-        "delegation_max_tokens": 24_576, "compression_threshold": 0.85})
++# ══════════════════════════════════════════════════════════════════════════
++# RUNTIME RETUNING — no reimport, no session relaunch
++# ══════════════════════════════════════════════════════════════════════════
++def test_config_file_retunes_without_a_reimport(monkeypatch, tmp_path):
++    """⛔ THE POINT OF tunable(). Today the only way to change these numbers was
++    to relaunch the sessions that imported this module — i.e. Andre's mains."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(pb, "_config_cache", {"key": None, "value": {}})
++    cfg = tmp_path / pb.BROKER_CONFIG_NAME
++
++    assert pb.tunable("main_slot_reserve") == pb.MAIN_SLOT_RESERVE == 1
++    assert _assess(0, n_mains=1, running=0, waiting=0)["slot_cap"] == 1
++
++    cfg.write_text(json.dumps({"throttle": {"main_slot_reserve": 2}}))
++    # No import, no reload, no restart — the very next call sees it.
++    assert pb.tunable("main_slot_reserve") == 2
++    assert _assess(0, n_mains=1, running=0, waiting=0)["slot_cap"] == 0
++
++    cfg.write_text(json.dumps({"throttle": {"main_slot_reserve": 1,
++                                            "drain_budget_s": 120.0}}))
++    a = _assess(TONIGHT_BACKLOG)
++    assert a["drain_budget_s"] == 120.0 and a["headroom_tokens"] > 0
++    assert a["state"] != "critical"
++
++
++def test_env_beats_config_beats_default(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(pb, "_config_cache", {"key": None, "value": {}})
++    assert pb.tunable("stream_cap") == pb.STREAM_CAP == 12
++    (tmp_path / pb.BROKER_CONFIG_NAME).write_text(
++        json.dumps({"throttle": {"stream_cap": 6}}))
++    assert pb.tunable("stream_cap") == 6
++    monkeypatch.setenv("HERMES_POOL_STREAM_CAP", "3")
++    assert pb.tunable("stream_cap") == 3
++    assert pb.tunables()["stream_cap"] == {"value": 3, "source": "env"}
++
++
++def test_a_malformed_tunable_falls_back_to_the_default(monkeypatch, tmp_path):
++    """Nothing on this path may raise: a typo in the config must not stop a
++    dispatch, it must read as 'use the default' and say so in the log."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(pb, "_config_cache", {"key": None, "value": {}})
++    (tmp_path / pb.BROKER_CONFIG_NAME).write_text(
++        json.dumps({"throttle": {"drain_budget_s": "half a minute"}}))
++    assert pb.tunable("drain_budget_s") == pb.DRAIN_BUDGET_S
++    (tmp_path / pb.BROKER_CONFIG_NAME).write_text("{ not json")
++    assert pb.tunable("drain_budget_s") == pb.DRAIN_BUDGET_S
++    assert pb.tunable("stream_cap") == pb.STREAM_CAP
++
++
++def test_allowance_publishes_the_resolved_tunables(monkeypatch):
++    monkeypatch.setattr(pb, "_profile_numbers", lambda p: dict(ARCHITECT_PROFILE))
+     monkeypatch.setattr(pb, "_measured_prompts", lambda: {})
+-    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(287))
+-    mains = [{"pid": 1000, "profile": "architect"}]
+-    with caplog.at_level("WARNING"):
+-        a = pb.compute_allowance(info, load, mains, {})
+-    assert a["vram"]["state"] == "critical"
+-    assert a["child_streams_total"] == 0
+-    assert a["admit_children"] is False
+-    assert a["invariant"]["ok"], a["invariant"]
+-    assert "VRAM CRITICAL" in caplog.text and "287" in caplog.text
+-
+-    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(POST_FIX_FREE))
+-    b = pb.compute_allowance(info, load, mains, {})
+-    assert b["admit_children"] is True and b["vram"]["state"] != "unknown"
+-
+-
+-def test_concurrency_cap_serialises_on_vram(monkeypatch):
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(TONIGHT_FREE_MIB))
++    info = {"context_length": 540_000, "max_req_input_len": 539_994,
++            "max_running_requests": 4, "max_total_num_tokens": TONIGHT_POOL}
++    a = pb.compute_allowance(info, _load(TONIGHT_BACKLOG),
++                             [{"pid": 1, "profile": "architect"}], {})
++    assert a["tunables"]["drain_budget_s"]["value"] == 30.0
++    assert a["tunables"]["drain_budget_s"]["source"] == "default"
++    # Every number behind the decision is published, so a stall is diagnosable
++    # from the allowance file alone.
++    for key in ("backlog_tokens", "backlog_s", "prefill_rate_tps", "headroom_tokens",
++                "slot_cap", "backlog_cap", "pool_cap", "binding_leg", "why"):
++        assert key in a["prefill"], key
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# DISPATCH-TIME CAP AND THE BOUNDED HOLD
++# ══════════════════════════════════════════════════════════════════════════
++def test_concurrency_cap_serialises_on_prefill_pressure(monkeypatch):
+     base = {"child_streams_total": 4, "children_active_total": 0, "n_mains": 1,
+             "token_usage": 0.10, "pressure": "normal"}
+-    monkeypatch.setattr(pb, "get_allowance", lambda: dict(base, vram={"state": "ok"}))
++    monkeypatch.setattr(pb, "get_allowance", lambda: dict(
++        base, vram={"state": "ok"}, prefill={"state": "ok"}))
+     assert pb.child_concurrency_for_this_session(4)[0] == 4
+     for state in ("tight", "critical"):
+         monkeypatch.setattr(pb, "get_allowance", lambda s=state: dict(
+-            base, vram={"state": s, "why": f"{s} detail"}))
++            base, vram={"state": "ok"}, prefill={"state": s, "why": f"{s} backlog"}))
++        workers, note = pb.child_concurrency_for_this_session(4)
++        assert workers == 1 and state in note and "backlog" in note
++    # The VRAM backstop still serialises on its own.
++    for state in ("tight", "critical"):
++        monkeypatch.setattr(pb, "get_allowance", lambda s=state: dict(
++            base, prefill={"state": "ok"}, vram={"state": s, "why": f"{s} detail"}))
+         workers, note = pb.child_concurrency_for_this_session(4)
+         assert workers == 1 and state in note and "detail" in note
+ 
+ 
+-def test_hold_returns_immediately_when_not_critical(monkeypatch):
++def test_hold_returns_immediately_when_nothing_is_critical(monkeypatch):
+     monkeypatch.delenv("HERMES_POOL_VRAM_HOLD", raising=False)
+-    monkeypatch.setattr(pb, "get_allowance", lambda: {"vram": {"state": "ok"}})
+-    assert pb.vram_admission_hold(3) == (0.0, "")
+-    monkeypatch.setattr(pb, "get_allowance", lambda: {"vram": {"state": "unknown"}})
+-    assert pb.vram_admission_hold(3) == (0.0, "")
++    for legs in ({"vram": {"state": "ok"}, "prefill": {"state": "ok"}},
++                 {"vram": {"state": "unknown"}, "prefill": {"state": "unknown"}},
++                 {"vram": {"state": "ok"}, "prefill": {"state": "tight"}}):
++        monkeypatch.setattr(pb, "get_allowance", lambda l=legs: l)
++        assert pb.admission_hold(3) == (0.0, "")
+ 
+ 
+-def test_hold_is_bounded_and_then_proceeds(monkeypatch):
++@pytest.mark.parametrize("leg", ["prefill", "vram"])
++def test_hold_is_bounded_and_then_proceeds(monkeypatch, leg):
++    """Either leg can hold a dispatch, and neither may hold it forever: a stalled
++    agent is worse than a risked prefill."""
+     monkeypatch.delenv("HERMES_POOL_VRAM_HOLD", raising=False)
+     monkeypatch.setattr(pb, "VRAM_HOLD_MAX_S", 0.25)
+     monkeypatch.setattr(pb, "VRAM_HOLD_POLL_S", 0.05)
+-    monkeypatch.setattr(pb, "get_allowance", lambda: {
+-        "vram": {"state": "critical", "why": "287 MiB", "free_mib": 287}})
++    legs = {"vram": {"state": "ok"}, "prefill": {"state": "ok"}}
++    legs[leg] = {"state": "critical", "why": "the measured reason", "free_mib": 287,
++                 "backlog_tokens": TONIGHT_BACKLOG}
++    monkeypatch.setattr(pb, "get_allowance", lambda: legs)
+     monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(287))
+     monkeypatch.setattr(pb, "_refresh_locked", lambda: None)
+-    waited, note = pb.vram_admission_hold(1)
++    waited, note = pb.admission_hold(1)
+     assert waited >= 0.25 and "proceeded after holding" in note
++    assert "the measured reason" in note
+ 
+ 
+-def test_hold_releases_when_vram_recovers(monkeypatch):
++def test_hold_releases_when_pressure_clears(monkeypatch):
+     monkeypatch.delenv("HERMES_POOL_VRAM_HOLD", raising=False)
+     monkeypatch.setattr(pb, "VRAM_HOLD_MAX_S", 5.0)
+     monkeypatch.setattr(pb, "VRAM_HOLD_POLL_S", 0.05)
+-    states = [{"state": "critical", "why": "287 MiB"},
+-              {"state": "critical", "why": "287 MiB"},
+-              {"state": "ok", "free_mib": 1266}]
+-    monkeypatch.setattr(pb, "get_allowance", lambda: {"vram": states[min(len(states) - 1, 0)]}
+-                        if not states else {"vram": states.pop(0) if len(states) > 1 else states[0]})
+-    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(1266))
++    seq = [{"state": "critical", "why": "backlog"}, {"state": "critical", "why": "backlog"},
++           {"state": "ok", "backlog_tokens": 0}]
++
++    def _allowance():
++        leg = seq.pop(0) if len(seq) > 1 else seq[0]
++        return {"vram": {"state": "ok", "free_mib": 6463}, "prefill": leg}
++
++    monkeypatch.setattr(pb, "get_allowance", _allowance)
++    monkeypatch.setattr(pb, "vram_sample", lambda force=False: _sample(6463))
+     monkeypatch.setattr(pb, "_refresh_locked", lambda: None)
+-    waited, note = pb.vram_admission_hold(1)
++    waited, note = pb.admission_hold(1)
+     assert "released after" in note and waited < 5.0
++
++
++def test_the_old_hold_name_still_works():
++    """tools/delegate_tool.py calls vram_admission_hold(); it is owned by another
++    agent right now, so the alias must stay."""
++    assert pb.vram_admission_hold is pb.admission_hold
+-- 
+2.43.0

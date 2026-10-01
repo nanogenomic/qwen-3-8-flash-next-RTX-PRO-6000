@@ -156,11 +156,13 @@ backstop here leaves a timestamp a human can check in one command, and liveness 
 
 ## Scope, stated honestly
 
-**Much of this layer is published as design and interface rather than as source**, for the same
-reason the client work is ([`clients/hermes/NOTICE`](../clients/hermes/NOTICE)): these scripts
-are dense with one fleet's absolute paths, host names, addresses, unit names, state-file
-locations and ssh key paths, and as source they would be a liability to read and useless to
-run. Where a file is genuinely portable it is in [`examples/`](examples/) in full. Where it is
+**Much of this layer is published as design and interface rather than as source.** The
+[client patches](../clients/hermes/README.md#the-patch-series) were scrubbed line by line and
+shipped ([`clients/hermes/NOTICE`](../clients/hermes/NOTICE) records exactly what was
+substituted); these scripts resist the same treatment, because they are dense with one fleet's
+absolute paths, host names, addresses, unit names, state-file locations and ssh key paths, and
+those paths are not decoration — they are most of what each file says. As source they would be
+a liability to read and useless to run. Where a file is genuinely portable it is in [`examples/`](examples/) in full. Where it is
 only meaningful with its paths, its design and its knobs are here and the file is not. Each
 document says which it is, at the top.
 

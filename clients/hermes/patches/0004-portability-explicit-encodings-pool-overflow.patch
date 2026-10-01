@@ -1,0 +1,115 @@
+From d23146698c84c217b8506a9f06d56e644afc14d9 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 16:32:45 -0400
+Subject: [PATCH] portability: explicit encodings in the pool and overflow
+ modules
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Housekeeping, included in the series because patch 0012 edits lines this one
+rewrote -- skip it and 0012 needs a three-way merge.
+
+The repository's own portability scanner reported 25 findings against a
+documented baseline of 1. Every one is the same class: a read_text /
+write_text / open with no encoding, which on Windows resolves to the ANSI
+code page and silently mangles any non-ASCII byte. One of them was a
+subprocess call that passed text=True with no encoding, which is the same
+defect wearing a different API.
+
+Fixed by stating the encoding, plus errors="replace" on the subprocess leg,
+and by annotating the two genuinely POSIX-only calls (os.getuid, and
+os.kill(pid, 0) as a liveness probe) rather than pretending they are portable:
+the broker reads /proc, flocks a unix path, and pulls a sample over ssh.
+
+Repo-wide findings 25 -> 1. No exclusion widened, no rule weakened.
+
+BASE: the tree left by patch 0003 (see BASELINE.md).
+
+---
+ agent/overflow_router.py        |   12 ++++++------
+ tools/goal_resume_supervisor.py |    4 ++--
+ 2 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/agent/overflow_router.py b/agent/overflow_router.py
+index 7fc90ea..bcbaf80 100644
+--- a/agent/overflow_router.py
++++ b/agent/overflow_router.py
+@@ -170,7 +170,7 @@ class Decision:
+ def load_state() -> Dict[str, Any]:
+     out = dict(DEFAULTS)
+     try:
+-        out.update(json.loads(_state_path().read_text()))
++        out.update(json.loads(_state_path().read_text(encoding="utf-8")))
+     except Exception:
+         pass
+     return out
+@@ -183,7 +183,7 @@ def save_state(state: Dict[str, Any]) -> None:
+     guard_production_write(path)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     tmp = path.with_suffix(".json.tmp")
+-    tmp.write_text(json.dumps(state, indent=1))
++    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+     os.chmod(tmp, 0o600)
+     os.replace(tmp, path)
+ 
+@@ -193,7 +193,7 @@ def provider_config() -> Optional[Dict[str, str]]:
+     try:
+         import yaml
+ 
+-        cfg = yaml.safe_load(_internal_config().read_text()) or {}
++        cfg = yaml.safe_load(_internal_config().read_text(encoding="utf-8")) or {}
+         p = (cfg.get("providers") or {}).get("cerebras") or {}
+         if p.get("base_url") and p.get("model"):
+             return {"base_url": str(p["base_url"]).rstrip("/"), "model": str(p["model"])}
+@@ -290,7 +290,7 @@ def record(event: Dict[str, Any]) -> None:
+     try:
+         row = {"ts": time.time(), "day": _today(), "pid": os.getpid(), **event}
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        with _ledger_lock, open(path, "a") as fh:
++        with _ledger_lock, open(path, "a", encoding="utf-8") as fh:
+             fh.write(json.dumps(row, default=str) + "\n")
+     except Exception:
+         logger.debug("overflow ledger write failed", exc_info=True)
+@@ -303,7 +303,7 @@ def today_totals() -> Dict[str, Any]:
+            "decisions": 0, "active": 0}
+     try:
+         started, finished = set(), set()
+-        with open(_ledger_path()) as fh:
++        with open(_ledger_path(), encoding="utf-8") as fh:
+             for line in fh:
+                 try:
+                     r = json.loads(line)
+@@ -521,7 +521,7 @@ def _decide(*, goal, context, local_only, parent_agent, need, child_mt) -> Decis
+         return Decision("local", pin_why, "route-pin", provider="cerebras", model=pc["model"],
+                         provider_limit=limit, need=need)
+     try:
+-        key = _cerebras_key().read_text().strip()
++        key = _cerebras_key().read_text(encoding="utf-8").strip()
+     except Exception:
+         return Decision("local", "cerebras key unreadable", "armed")
+     return Decision("cerebras", "local saturated; screens passed", "all",
+diff --git a/tools/goal_resume_supervisor.py b/tools/goal_resume_supervisor.py
+index 509f495..8d61df5 100644
+--- a/tools/goal_resume_supervisor.py
++++ b/tools/goal_resume_supervisor.py
+@@ -504,7 +504,7 @@ def ledger_path() -> Path:
+ 
+ def load_ledger() -> Dict[str, Any]:
+     try:
+-        data = json.loads(ledger_path().read_text())
++        data = json.loads(ledger_path().read_text(encoding="utf-8"))
+         return data if isinstance(data, dict) else {}
+     except Exception:
+         return {}
+@@ -515,7 +515,7 @@ def save_ledger(ledger: Dict[str, Any]) -> None:
+     try:
+         path.parent.mkdir(parents=True, exist_ok=True)
+         tmp = path.with_suffix(".tmp")
+-        tmp.write_text(json.dumps(ledger, indent=1, sort_keys=True))
++        tmp.write_text(json.dumps(ledger, indent=1, sort_keys=True), encoding="utf-8")
+         tmp.replace(path)
+     except Exception as exc:
+         LOG.warning("could not persist ledger at %s: %s", path, exc)
+-- 
+2.43.0

@@ -1,0 +1,150 @@
+From b54d5484d8d0baf587de7b6547d573cced16ae63 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 17:28:13 -0400
+Subject: [PATCH] overflow: mark overflowed subagents in the tree view, and a
+ hotkey to toggle the route
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the local backend saturates, a subagent dispatch can be routed to a
+hosted provider instead of queueing. The routing worked; the UI did not say so.
+A subagent that ran somewhere else was indistinguishable in the tree view from
+one that ran locally, which makes every capacity question unanswerable after
+the fact -- including "did that result come off the card I am reading the
+numbers for?".
+
+  * an overflowed child is prefixed in the tree view, gets a route line when
+    it spawns, and an outcome line when it finishes -- separately for
+    completed-remote, fell-back-to-local mid-task, and failed-and-rerun-local,
+    because those three have different causes and the same end state;
+  * Alt+O toggles this session's overflow, equivalent to the slash command. A
+    test asserts the binding is registered exactly once, so it cannot shadow
+    an existing chord by being added twice.
+
+The third change in this group is NOT shipped here: a correction to the status
+message, which said the runtime route pin was refusing the route when overflow
+was merely disarmed. Its diff REMOVES a line that is itself an absolute home
+path, and a removed line cannot be rewritten without the patch ceasing to
+apply to its stated base. It is described in README.md instead.
+
+Squashed from fork commits b54d548, 7d81775 (3272a15 is documented-only; see
+above).
+
+BASE: the tree left by patch 0005 (see BASELINE.md).
+
+---
+ cli.py                              |   18 ++++++++++++++++++
+ tests/cli/test_subagent_thinking.py |   15 +++++++++++++++
+ tools/delegate_tool.py              |   30 ++++++++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/cli.py b/cli.py
+index 9651118..bdc9e5d 100644
+--- a/cli.py
++++ b/cli.py
+@@ -19997,6 +19997,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             self._toggle_subagent_thinking()
+             event.app.invalidate()
+ 
++        @kb.add('escape', 'o')
++        def handle_alt_o(event):
++            """Alt+O — toggle this session's Cerebras overflow (== /overflow on|off).
++
++            [bd-dre-efeb8] Andre asked for a hotkey. Verified free the same way as
++            Alt+R: no other 'escape','o' in this repo, and prompt_toolkit's own
++            ESC-prefixed defaults are a/b/c/d/e/f/l/t/u/w/y (+ digits/punct).
++            A test pins both. Session-scoped: it never flips the global
++            `hermes-overflow` flag, and a new session starts OFF.
++            """
++            try:
++                from agent import overflow_router as _ov
++                _armed = bool(_ov.armed()[0])
++            except Exception:
++                _armed = False
++            self._handle_overflow_command("/overflow off" if _armed else "/overflow on")
++            event.app.invalidate()
++
+         # Dynamic prompt: shows Hermes symbol when agent is working,
+         # or answer prompt when clarify freetext mode is active.
+         cli_ref = self
+diff --git a/tests/cli/test_subagent_thinking.py b/tests/cli/test_subagent_thinking.py
+index 9957e58..fb7abc3 100644
+--- a/tests/cli/test_subagent_thinking.py
++++ b/tests/cli/test_subagent_thinking.py
+@@ -493,3 +493,18 @@ def test_alt_s_stays_quiet_about_reasoning_when_it_is_already_on():
+         cli._toggle_subagent_output()
+     assert printed
+     assert "Alt+R" not in printed[-1], printed[-1]
++
++
++def test_alt_o_overflow_hotkey_is_free_and_bound_once():
++    """[bd-dre-efeb8] Alt+O toggles Cerebras overflow; it must not shadow a
++    prompt_toolkit default and must be bound exactly once."""
++    from pathlib import Path
++    from prompt_toolkit.key_binding import defaults as pt_defaults
++
++    taken = {
++        tuple(str(k) for k in b.keys) for b in pt_defaults.load_key_bindings().bindings
++    }
++    assert ("Keys.Escape", "o") not in taken
++    text = (Path(__file__).resolve().parents[2] / "cli.py").read_text(encoding="utf-8")
++    assert text.count("@kb.add('escape', 'o')") == 1
++    assert '"/overflow off" if _armed else "/overflow on"' in text
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 2362aa0..36dcffc 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1803,6 +1803,16 @@ def _build_child_progress_callback(
+ 
+     # Show 1-indexed prefix only in batch mode (multiple tasks)
+     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
++    # [bd-dre-efeb8] Mark children running on the Cerebras overflow route so every
++    # tree line says where it ran; otherwise they are indistinguishable from local.
++    try:
++        from agent import overflow_router as _ovr
++
++        _ov_model = (_ovr.provider_config() or {}).get("model")
++        if model and _ov_model and model == _ov_model:
++            prefix = f"{prefix}⇪ "
++    except Exception:
++        pass
+     goal_label = (goal or "").strip()
+ 
+     # Gateway: batch tool names, flush periodically
+@@ -2918,6 +2928,15 @@ def _attach_overflow(child: Any, decision: Any, creds: Dict[str, Any],
+             comp.context_length = cap
+             child._config_context_length = cap
+         decision.window = int(comp.context_length)
++    try:
++        spinner = getattr(parent_agent, "_delegate_spinner", None)
++        if spinner is not None:
++            spinner.print_above(
++                f" ⇪ subagent → Cerebras {decision.model}"
++                + (f" (window {decision.window:,})" if decision.window else "")
++                + " — GPU0 saturated; falls back to local on any error")
++    except Exception:
++        pass
+     logger.info("[overflow] child routed to %s/%s, window %s (provider limit %s), "
+                 "fallback = local %s", decision.provider, decision.model,
+                 f"{decision.window:,}" if decision.window else "?",
+@@ -2996,6 +3015,17 @@ def _settle_overflow(result, args, kwargs, parent_agent):
+         return result
+     status = (result or {}).get("status")
+     fell_back = bool(getattr(child, "_fallback_activated", False))
++    try:
++        spinner = getattr(parent_agent, "_delegate_spinner", None)
++        if spinner is not None:
++            if status == "completed" and not fell_back:
++                spinner.print_above(" ⇪ Cerebras subagent completed — result returned to this session")
++            elif fell_back:
++                spinner.print_above(" ⇪ Cerebras subagent fell back to LOCAL GPU0 mid-task")
++            elif status not in ("interrupted", "stopped", "cancelled"):
++                spinner.print_above(" ⇪ Cerebras subagent failed — rerunning it LOCALLY")
++    except Exception:
++        pass
+     if status == "completed":
+         overflow_router.record_outcome(child, result,
+                                        "fell_back_local" if fell_back else "completed_on_cerebras")
+-- 
+2.43.0

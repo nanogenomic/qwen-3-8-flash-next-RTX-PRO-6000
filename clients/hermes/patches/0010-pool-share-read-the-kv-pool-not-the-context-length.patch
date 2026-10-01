@@ -1,0 +1,99 @@
+From 62b6f3f575e4a2bc1caaebcf2b9af59a5fbe9a34 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 19:40:56 -0400
+Subject: [PATCH] pool share: read the KV pool, not the per-request context
+ length, as the share bound
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A field-selection bug, and a good illustration of why two plausible fields
+with the same value are a latent defect rather than a redundancy.
+
+The published allowance document carries both `pool` (the backend's
+max_total_num_tokens -- how much KV exists) and `ceiling` (the configured
+per-request context length -- how long one request may be). Patch 0008
+preferred `ceiling`. That was invisible for as long as the two coincided.
+
+When a host-KV offload took the pool to 1,310,720 against a 540,000 ceiling,
+the status bar labelled 540K as "pool", judged two legitimate 532,480-token
+grants to be oversubscribed, and fell back to pinning the denominator at the
+static 393,216 -- which is the exact symptom patch 0008 exists to remove,
+reappearing through a different door.  [measured]
+
+Prefer `pool`, fall back to `ceiling` only when `pool` is absent, and test the
+diverged case explicitly so the two can never silently be treated as
+interchangeable again.
+
+Requires patch 0008.
+
+BASE: the tree left by patch 0009 (see BASELINE.md).
+
+---
+ hermes_cli/pool_share.py            |   11 ++++++++++-
+ tests/hermes_cli/test_pool_share.py |   30 ++++++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/pool_share.py b/hermes_cli/pool_share.py
+index 3a498ee..0c92d50 100644
+--- a/hermes_cli/pool_share.py
++++ b/hermes_cli/pool_share.py
+@@ -230,8 +230,17 @@ def lane_share(doc: Optional[dict], *, pid: Optional[int] = None,
+         # The LIVE pool, read from the document every repaint. A concurrent
+         # effort may raise it to ~1.31M via host-RAM KV offload; nothing here
+         # needs editing for that -- the number simply changes.
++        # ⛔ "pool" FIRST, not "ceiling". The document publishes BOTH: `pool` is
++        # the KV pool (`max_total_num_tokens`) that grants are carved out of, and
++        # `ceiling` is the per-request cap (`--context-length`). They coincided
++        # while the pool was 451,264 and the ceiling 540,000 never bound, so
++        # reading `ceiling` first was invisible -- until host-KV offload raised the
++        # pool to 1,310,720 on 2026-09-30. Then the bar labelled 540K as "pool" AND
++        # refused two legitimate 532,480 grants (1,064,960 > 540,000) as
++        # oversubscribed, falling back to the static 393.2K. Grants are pool
++        # allocations, so the pool is the only correct bound for both.
+         ceiling_tokens = 0
+-        for key in ("ceiling", "pool"):
++        for key in ("pool", "ceiling"):
+             try:
+                 ceiling_tokens = int(doc.get(key) or 0)
+             except Exception:
+diff --git a/tests/hermes_cli/test_pool_share.py b/tests/hermes_cli/test_pool_share.py
+index fb8b421..14cbdb0 100644
+--- a/tests/hermes_cli/test_pool_share.py
++++ b/tests/hermes_cli/test_pool_share.py
+@@ -420,3 +420,33 @@ class TestSegment:
+         assert ps._age_label(120) == "2m"
+         assert ps._age_label(7200) == "2h"
+         assert ps._age_label("nonsense") == "?"
++
++
++def test_pool_is_preferred_over_the_per_request_ceiling():
++    """⛔ Regression, 2026-09-30 host-KV cutover. The document publishes BOTH
++    `pool` (max_total_num_tokens, what grants are carved from) and `ceiling`
++    (--context-length, a per-request cap). Reading `ceiling` first was invisible
++    while they coincided; after the pool went 451,264 -> 1,310,720 with ceiling
++    540,000 it labelled 540K as "pool" AND refused two legitimate 532,480 grants
++    as oversubscribed (1,064,960 > 540,000), pinning the bar to static 393.2K."""
++    from hermes_cli import pool_share
++
++    doc = {
++        "updated": 9.0e9,
++        "pool": 1_310_720,
++        "ceiling": 540_000,
++        "n_mains": 2,
++        "sessions": {
++            "111": {"main_window": 393_216, "main_grow_max": 532_480},
++            "222": {"main_window": 393_216, "main_grow_max": 532_480},
++        },
++    }
++    view = pool_share.lane_share(
++        doc, pid=111, window=393_216, max_tokens=8192,
++        threshold_percent=85.0, age_s=1.0,
++    )
++    assert view["pool"] == 1_310_720, "must report the KV pool, not --context-length"
++    assert view["bounded"] is True, "grants summing under the pool are not oversubscribed"
++    assert view["ceiling"] == 532_480
++    assert view["ceiling_source"] == "grant"
++    assert "no share cap" not in pool_share.share_segment(view)
+-- 
+2.43.0

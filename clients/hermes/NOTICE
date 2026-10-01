@@ -25,9 +25,10 @@ relicensed.
 
 WHAT WAS MODIFIED
 -----------------
-Two changes (this directory currently covers patches 0001-0002 against
-upstream 0.20.4; see README.md for the refresh in progress), both concerning
-several Hermes sessions sharing ONE self-hosted model backend:
+Twelve patches. Patches 0001-0002 are against upstream 0.20.4; patches
+0003-0012 are a series against a stated commit of this fork (see BASELINE.md).
+All of them concern several Hermes sessions sharing ONE self-hosted model
+backend.
 
   patches/0001-status-bar-own-vs-backend-accounting.patch
       cli.py -- the status bar's delegation segment now distinguishes this
@@ -39,6 +40,63 @@ several Hermes sessions sharing ONE self-hosted model backend:
       logged explicitly at dispatch time instead of being inherited implicitly
       from the parent profile's model.context_length. Adds an "auto" ladder
       sized from live backend pressure, plus a runtime child-concurrency cap.
+
+  patches/0003-pool-broker-share-bounded-grant-ceilings.patch
+      agent/pool_policy.py, agent/pool_broker.py, agent/context_compressor.py
+      -- the cross-session KV-pool broker bounds the ceilings it GRANTS rather
+      than only the reservations it can measure. Adds
+      derive_window_ceilings(), a grant invariant over the worst case, and
+      grandfathering for a session already above its share.
+
+  patches/0004-portability-explicit-encodings-pool-overflow.patch
+      agent/pool_broker.py, agent/overflow_router.py,
+      tools/goal_resume_supervisor.py -- explicit encodings, and two
+      POSIX-only calls annotated rather than disguised.
+
+  patches/0005-auxiliary-work-yields-to-interactive-lanes.patch
+      agent/auxiliary_client.py, agent/title_generator.py,
+      agent/background_review.py, cli.py -- background auxiliary work carries
+      an explicit low request priority, a one-shot run is no longer classified
+      interactive, and a one-shot session skips the title model call.
+
+  patches/0006-overflow-tree-view-markers-and-route-hotkey.patch
+      tools/delegate_tool.py, cli.py -- a subagent routed to the hosted
+      overflow provider is marked in the tree view with a route line at spawn
+      and an outcome line at finish, and a hotkey toggles the route.
+
+  patches/0007-goal-loop-interrupt-provenance-and-blocked-verdict.patch
+      hermes_cli/goals.py, hermes_cli/cli_commands_mixin.py, cli.py,
+      tools/goal_resume_supervisor.py -- interrupts carry provenance, so a
+      machine interrupt is no longer labelled as the human's Ctrl+C; `blocked`
+      becomes a first-class judge verdict; `/goal resume` re-arms the
+      continuation; the resume supervisor gains the stalled-active class.
+
+  patches/0008-status-bar-live-shared-pool-share.patch
+      hermes_cli/pool_share.py (new), cli.py -- the status bar's ctx
+      denominator becomes the live share the broker granted, not the static
+      profile window. Display only, and the tests enforce that.
+
+  patches/0009-goal-loop-bounded-machine-interrupt-rearm.patch
+      hermes_cli/goals.py, cli.py -- the machine-interrupt re-arm 0007 added
+      is bounded, so a permanently wedged route pauses with an auto-resumable
+      reason instead of spinning.
+
+  patches/0010-pool-share-read-the-kv-pool-not-the-context-length.patch
+      hermes_cli/pool_share.py -- read the KV pool as the share bound, not the
+      per-request context length. A field-selection bug that was invisible
+      while the two values coincided.
+
+  patches/0011-goal-loop-delegate-the-wait-to-a-watcher.patch
+      hermes_cli/goal_watchers.py (new), hermes_cli/goals.py,
+      tools/goal_resume_supervisor.py, gateway/slash_commands.py -- a goal
+      delegates its wait to a zero-model-call watcher instead of parking
+      itself, with a barrier age ceiling and a quote-verified probe for other
+      advanceable work.
+
+  patches/0012-pool-broker-prefill-capacity-child-throttle.patch
+      agent/pool_broker.py -- the child-dispatch throttle is re-keyed off free
+      device VRAM onto slots, prefill backlog and pool residency, after a KV
+      offload took free VRAM out of the capacity path.
 
 upstream-modified/tools/delegate_tool.py is pristine upstream 0.20.4 with
 patch 0002 applied, provided so the change is readable in full.
@@ -58,6 +116,101 @@ deployment-specific strings. They are replaced here; nothing else differs:
     name. The architectural reasoning is unchanged and applies to any
     hybrid-attention model that pins a fixed recurrent state per in-flight
     request.
+
+Patches 0003-0012 were scrubbed the same way, mechanically. 82 lines were
+substituted in total, each one line for one line, and each patch that carries
+any of them says so in its own header.
+
+The scrub is confined to the lines a patch ADDS, with one deliberate exception.
+A context or removed line is quoted from the base the patch applies to, so
+rewriting one stops the patch applying -- EXCEPT where that base is an earlier
+patch in this same series, in which case the quoted line is our own published
+output and MUST be rewritten to match it. Exactly one line is of that kind: a
+docstring line in patch 0011 whose pre-image is a line patch 0007 adds. See
+"What could not be scrubbed" below for the lines that are not.
+
+The classes:
+
+  * PRIVATE ADDRESS. A private backend address becomes 127.0.0.1, with the
+    engine port published as 30000 and the second lane as 30001, following the
+    placeholder convention already used by patch 0002 and ops/README.md.
+    5 occurrences, all in test fixtures.
+  * ABSOLUTE PATHS. An absolute fleet log path becomes "<stack>/..."
+    (ops/README.md's placeholder for the serving host's stack root), and an
+    absolute agent-home path becomes the tilde form "~/.hermes/...", which is
+    what patch 0002 already publishes. One of the two is a test that reads the
+    live profile on purpose, so it is republished as
+    Path("~/.hermes/.../config.yaml").expanduser() -- same behaviour, and it
+    still pytest.skips when the file is absent.
+  * LIVE PROCESS IDS. Four (two in a comment, two in a test's expected
+    `grandfathered` list) become 900001-900004. Ordering is preserved, which is
+    all the assertion depends on.
+  * SESSION IDS. Three become synthetic ids of the same shape.
+  * AN INTERNAL PANE REFERENCE. Generalised to "the peer pane".
+  * THE SERVING HOST'S LOCAL NICKNAME, in three comments, becomes "the serving
+    host" -- ops/README.md's own placeholder for it.
+  * THE JUDGE-VERDICT FIXTURE CORPUS, which is the one case where a mechanical
+    scrub would have destroyed the artifact. Patch 0007's regression corpus is
+    five production judge verdicts and patch 0011's is a verbatim park, and
+    those exact strings are the evidence a classifier and a quote-verification
+    filter have to handle -- paraphrase them and the test no longer tests
+    anything. Three of the five, and the park, named a third-party platform
+    and described a blocked commercial submission. They are therefore
+    SUBSTITUTED, not paraphrased: structurally equivalent synthetic strings
+    with the same shape, the same trigger words ("blocked pending", "still
+    pending", "upload-ready", "login from the owner"), the same quoted spans,
+    an invented platform name and invented subject matter. The two verdicts
+    that carried no third-party subject are verbatim. No classifier pattern
+    was touched, and the proof that the substitution preserved what mattered
+    is that those suites still pass -- see BASELINE.md.
+
+WHAT COULD NOT BE SCRUBBED, AND IS DISCLOSED INSTEAD
+----------------------------------------------------
+A patch's REMOVED and CONTEXT lines are quoted from the base it applies to.
+Rewrite one and the patch stops applying to its stated base, which is the
+property BASELINE.md exists to prove. So the scrub above is confined to added
+lines, and everything the other lines carry was audited rather than edited.
+What they carry, exhaustively:
+
+  * one change held back entirely. A correction to an overflow status message
+    (fork commit 3272a15, agent/overflow_router.py, +10 -2) REMOVES a line
+    that is itself an absolute home path. It is therefore documented-only:
+    described in README.md, not shipped as a patch. Nothing else in the series
+    was held back.
+  * this deployment's internal tracker ids (bd-dre-*) appear in comments and
+    docstrings throughout, including on eight removed lines. They are opaque
+    references with no content behind them in this repository, and a
+    half-scrubbed set would be worse than an honest one, so they are retained.
+  * a profile name ("architect") appears in comments and as a test fixture
+    value. Patch 0002 generalised it because there it sat on a single added
+    comment line and was free to change; here it is woven through context and
+    removed lines and fixture values.
+  * the hosted overflow provider is named. It is a public inference vendor and
+    "cerebras" is a config provider key and a Decision field value; renaming
+    it would make the diff fiction. No key, endpoint, account identifier or
+    key path is published.
+  * the serving host's local nickname survives twice, both on context lines
+    this series does not author: one pre-existing test function name
+    (test_no_ssh_to_delta_under_pytest, in patch 0012) and one comment above a
+    constant patch 0012 edits. Its three occurrences on ADDED lines were
+    substituted; see above. No session ids survive -- all three were
+    substitutable.
+  * commit hashes of this fork appear in comments, and are also how BASELINE.md
+    states each patch's base. They are deliberate; they resolve only in the
+    private tree.
+  * files this series adds carry the fork's house header, "Copyright (c) 2026
+    Ligandal, Inc. All rights reserved." The NOTICE above governs: everything
+    in this directory, these modifications included, is offered under the same
+    MIT terms as the upstream work. That header is the fork's boilerplate, not
+    a reservation of rights against this publication.
+
+Not present anywhere in these patches: credentials, API keys or tokens; any
+routable address or public host name (the only addresses that appear are
+loopback placeholders); model weights or checkpoints; traffic-derived
+artifacts; customer, partner or third-party-platform names other than the
+inference vendor named above. The only email address in them is the author
+line each patch carries, which is the same address every commit in this
+repository carries.
 
 A quantity of surrounding operational tooling on the original deployment is
 deliberately NOT published, because it encodes that deployment's architecture

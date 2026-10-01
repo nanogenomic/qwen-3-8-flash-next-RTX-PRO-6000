@@ -10,10 +10,13 @@ is specific to one framework; wherever an example names a framework's setting, t
 underneath applies to every orchestrator.
 
 A **reference implementation** for Hermes Agent lives in [`hermes/`](hermes/). It is MIT
-licensed (unlike the rest of this repository, which is Apache-2.0). Two rules ship there as
-applicable patches — rule 3 (patch 0002) and own-versus-shared status accounting (patch 0001).
-Rules 10–14 were implemented on that framework too, but are published here as **write-ups
-rather than diffs**; its README says why.
+licensed (unlike the rest of this repository, which is Apache-2.0). **Twelve patches ship
+there**: rule 3 (patch 0002) and own-versus-shared status accounting (patch 0001) against
+upstream 0.20.4, and rules 10–14 as the series 0003–0012 against a stated commit of that
+fork — share-bounded pool grants, the live-share status bar, background-priority demotion,
+interrupt provenance for autonomous loops, the delegated goal wait, and the
+prefill-capacity gate. One change in that round is documented-only, and
+[its README](hermes/README.md#documented-only-and-why) says exactly which and why.
 
 > **These rules assume a backend that is up, and a monitor you can believe.** Neither is free.
 > The control-plane layer that keeps them true — the cross-session pool broker that publishes

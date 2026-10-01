@@ -1,0 +1,278 @@
+From 92dff5f7bdbea5d8b7c74a0469e406789c24f3f2 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 18:31:44 -0400
+Subject: [PATCH] goal loop: bound the machine-interrupt re-arm so a wedged
+ route cannot spin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes a gap patch 0007 opened. A turn the PROVIDER cut short costs no budget
+-- correctly, since it produced no work -- so the re-arm would retry a
+permanently wedged route forever without ever reaching max_turns. That is a
+better failure than the silent stall it replaced, and it is still a spin.
+
+After max_consecutive_machine_interrupts (default 12, configurable) the route
+is broken rather than busy, so the goal pauses -- with a TRANSPORT-shaped
+reason, which is the class an auto-resume supervisor WILL pick back up once
+the route answers. Bounded, not abandoned. 12 is generous deliberately: the
+measured stalls here are 33-137 s and recover on the next attempt, so the
+bound must only trip when the route is genuinely gone.  [measured]
+
+The streak is cleared by any turn that produced real work, and by
+`/goal resume`. That second clear is the flap guard: without it a resumed goal
+comes back AT the threshold and the first machine interrupt re-pauses it,
+which makes both the resume command and the supervisor useless against
+exactly the failure they exist for.
+
+Requires patch 0007 -- it extends the provenance classification that patch
+introduces.
+
+BASE: the tree left by patch 0008 (see BASELINE.md).
+
+---
+ cli.py                               |   42 +++++++++++++++++
+ hermes_cli/cli_commands_mixin.py     |    5 ++
+ hermes_cli/goals.py                  |   37 +++++++++++++++
+ tests/cli/test_cli_goal_interrupt.py |   83 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 166 insertions(+), 1 deletion(-)
+
+diff --git a/cli.py b/cli.py
+index f15c176..544e7a0 100644
+--- a/cli.py
++++ b/cli.py
+@@ -5703,6 +5703,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         # "continue" and the pane kept running turns for another 50 minutes.
+         # This flag is set ONLY at a seam a human actually drives.
+         self._human_interrupt_requested = False
++        # Consecutive turns the PROVIDER cut short. Bounds the machine-interrupt
++        # re-arm (which costs no budget, so it would otherwise spin forever on a
++        # permanently wedged route). Cleared by a turn that produced work, and by
++        # /goal resume.
++        self._consecutive_machine_interrupts = 0
+         # When stdout/PTY raises EIO (broken pipe after a stream-stall
+         # interrupt), freeze further UI paints so we don't spin the main
+         # thread at hundreds of escape-sequence writes/sec (#81521).
+@@ -14199,7 +14204,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         # call (the partial output is an "Operation interrupted" stub, so
+         # judging it is a wasted aux call) and no turn consumed — the turn
+         # produced no work to evaluate.
++        # BOUNDED, though. This path costs no turn, so a permanently wedged
++        # route would re-arm forever without ever reaching max_turns. After
++        # `max_consecutive_machine_interrupts` in a row the route is broken
++        # rather than busy, so pause — with a TRANSPORT-shaped reason, which
++        # hermes-goal-resume-supervisor auto-resumes once the route answers.
++        # Bounded, not abandoned.
+         if getattr(self, "_last_turn_interrupted", False):
++            streak = int(getattr(self, "_consecutive_machine_interrupts", 0)) + 1
++            self._consecutive_machine_interrupts = streak
++            try:
++                from hermes_cli.goals import (
++                    max_consecutive_machine_interrupts as _max_mi,
++                    provider_interrupt_paused_reason as _mi_reason,
++                )
++                ceiling = _max_mi()
++            except Exception:
++                ceiling, _mi_reason = 12, None
++            if ceiling and streak >= ceiling and _mi_reason is not None:
++                try:
++                    mgr.pause(reason=_mi_reason(streak))
++                except Exception as exc:
++                    logging.debug("goal pause-on-wedged-provider failed: %s", exc)
++                logging.warning(
++                    "goal loop: the provider cut %d consecutive turns short — "
++                    "pausing (auto-resumable once the route answers)", streak,
++                )
++                _cprint(
++                    f"  {_DIM}⏸ Goal paused — the provider cut {streak} turns "
++                    f"short in a row. The supervisor will resume it once the "
++                    f"route answers; /goal resume forces it now.{_RST}"
++                )
++                return
+             try:
+                 prompt = mgr.next_continuation_prompt()
+             except Exception as exc:
+@@ -14213,7 +14249,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             logging.info(
+                 "goal loop: turn was interrupted by the machine, not the user "
+                 "— goal stays active and the continuation is re-armed "
+-                "(session=%s)", getattr(self, "session_id", "?"),
++                "(streak %d/%s, session=%s)", streak, ceiling,
++                getattr(self, "session_id", "?"),
+             )
+             _cprint(
+                 f"  {_DIM}↻ Goal continuing — the turn was cut short by the "
+@@ -14221,6 +14258,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             )
+             return
+ 
++        # A turn that produced real work clears the wedged-provider streak.
++        self._consecutive_machine_interrupts = 0
++
+         # Extract the agent's final response for this turn.
+         last_response = ""
+         try:
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 9515844..f49f5d4 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -2726,6 +2726,11 @@ class CLICommandsMixin:
+         Never raises: a failure here degrades to the old "type continue"
+         behavior rather than breaking the command.
+         """
++        # ⛔ Clear the wedged-provider streak, for the same reason
++        # GoalManager.resume() clears the judge-health counters [bd-dre-6rpvx]:
++        # a goal resumed at the threshold would re-pause on the FIRST machine
++        # interrupt, turning resume into a pause/resume flap.
++        self._consecutive_machine_interrupts = 0
+         pending = getattr(self, "_pending_input", None)
+         if pending is None:
+             return False
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 87fabce..218d2a2 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -107,6 +107,19 @@ DEFAULT_JUDGE_TRANSPORT_RETRY_BUDGET_S = 240.0
+ # degrades to "keep working", never to "stop".
+ DEFAULT_MAX_UNJUDGED_TURNS = 25
+ 
++# ⛔ THE BOUND ON THE MACHINE-INTERRUPT RE-ARM [bd-dre-df78a].
++#
++# A turn the PROVIDER cut short costs no budget (it produced no work), so the
++# re-arm in cli.py::_maybe_continue_goal_after_turn would retry a permanently
++# wedged route forever without ever reaching max_turns. That is a better failure
++# than the silent stall it replaced, but it is still a spin — so it is bounded.
++#
++# Generous on purpose: a 33-137 s stall is routine on this box and recovers on
++# the next attempt, so the bound must only trip when the route is broken rather
++# than busy. The resulting pause is TRANSPORT-shaped, which means the resume
++# supervisor auto-resumes it once the route answers — bounded, not abandoned.
++DEFAULT_MAX_CONSECUTIVE_MACHINE_INTERRUPTS = 12
++
+ # Quality gates: deterministic shell commands that must pass before the goal
+ # judge may declare the goal done. Defaults mirror the bounded-autonomy
+ # pattern (per-gate retry limit + timeout, bounded output fed back to the
+@@ -1019,6 +1032,30 @@ def is_blocked_pause(paused_reason: Optional[str]) -> bool:
+     return BLOCKED_PAUSE_MARKER in (paused_reason or "").strip().lower()
+ 
+ 
++def provider_interrupt_paused_reason(consecutive: int) -> str:
++    """``paused_reason`` for a goal stopped by repeated MACHINE interrupts.
++
++    Marker-first, so the resume supervisor treats it as auto-recoverable: a
++    wedged provider is exactly the transient class it exists for, and the goal
++    should simply carry on once the route is answering. Distinct from
++    ``user-interrupted (Ctrl+C)``, which is Andre's signal and is never
++    auto-resumed [bd-dre-df78a].
++    """
++    return (
++        f"{TRANSPORT_PAUSE_MARKER}: the provider cut {consecutive} consecutive "
++        f"turns short before producing output, with no human interrupt — "
++        f"auto-resumable once the route answers"
++    )
++
++
++def max_consecutive_machine_interrupts() -> int:
++    return _goals_int(
++        "max_consecutive_machine_interrupts",
++        DEFAULT_MAX_CONSECUTIVE_MACHINE_INTERRUPTS,
++        minimum=1,
++    )
++
++
+ def is_transport_pause(paused_reason: Optional[str]) -> bool:
+     """True when this pause was caused by an unreachable judge ROUTE.
+ 
+diff --git a/tests/cli/test_cli_goal_interrupt.py b/tests/cli/test_cli_goal_interrupt.py
+index ee3293b..9ee2eb5 100644
+--- a/tests/cli/test_cli_goal_interrupt.py
++++ b/tests/cli/test_cli_goal_interrupt.py
+@@ -348,3 +348,86 @@ class TestResumeActuallyReArms:
+         assert "_kick_goal_after_resume" in resume_block, (
+             "/goal resume must re-arm the continuation, not just flip status"
+         )
++
++
++class TestMachineInterruptReArmIsBounded:
++    """The re-arm costs no turn, so it must not spin forever [bd-dre-df78a].
++
++    A permanently wedged route would re-arm past max_turns without ever reaching
++    it. The bound pauses with a TRANSPORT-shaped reason, which the resume
++    supervisor auto-resumes once the route answers — bounded, not abandoned.
++    """
++
++    def _machine_interrupt(self, cli):
++        # Drain first: in production the continuation queued by the previous
++        # re-arm has already been consumed as the next turn by the time this
++        # post-turn hook runs. A queued prompt makes the hook defer (it looks
++        # like pending work), which is correct but would not exercise the bound.
++        while not cli._pending_input.empty():
++            cli._pending_input.get_nowait()
++        cli._last_turn_interrupted = True
++        cli._human_interrupt_requested = False
++        cli.conversation_history = [
++            {"role": "assistant", "content": "Operation interrupted: ..."},
++        ]
++        with patch("hermes_cli.goals.judge_goal"):
++            cli._maybe_continue_goal_after_turn()
++
++    def test_pauses_after_the_configured_streak(self, hermes_home):
++        from hermes_cli.goals import (
++            is_transport_pause, max_consecutive_machine_interrupts,
++        )
++
++        ceiling = max_consecutive_machine_interrupts()
++        sid = f"sid-bound-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        mgr.state.max_turns = 400
++
++        for i in range(1, ceiling):
++            self._machine_interrupt(cli)
++            assert mgr.state.status == "active", f"paused early at {i}/{ceiling}"
++
++        self._machine_interrupt(cli)
++        assert mgr.state.status == "paused"
++        assert is_transport_pause(mgr.state.paused_reason), (
++            "a wedged-provider pause must be auto-resumable — it is a "
++            "transient, not Andre's signal"
++        )
++        assert "no human interrupt" in mgr.state.paused_reason
++
++    def test_a_working_turn_clears_the_streak(self, hermes_home):
++        """One good turn means the route recovered; the count must not carry."""
++        sid = f"sid-clear-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++
++        self._machine_interrupt(cli)
++        self._machine_interrupt(cli)
++        assert cli._consecutive_machine_interrupts == 2
++
++        while not cli._pending_input.empty():
++            cli._pending_input.get_nowait()
++        cli._last_turn_interrupted = False
++        cli._human_interrupt_requested = False
++        cli.conversation_history = [
++            {"role": "assistant", "content": "real work happened here"},
++        ]
++        with patch(
++            "hermes_cli.goals.judge_goal",
++            return_value=("continue", "more to do", False, None, False),
++        ):
++            cli._maybe_continue_goal_after_turn()
++        assert cli._consecutive_machine_interrupts == 0
++
++    def test_resume_clears_the_streak(self, hermes_home):
++        """⛔ Otherwise resume is a pause/resume FLAP: the goal comes back at the
++        threshold and the first machine interrupt re-pauses it. Same defect the
++        transport work fixed for the judge-health counters (bd-dre-6rpvx)."""
++        sid = f"sid-flap-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        cli._consecutive_machine_interrupts = 99
++
++        mgr.pause(reason="goal-judge-route-unreachable: wedged")
++        mgr.resume()
++        cli._kick_goal_after_resume(mgr)
++
++        assert cli._consecutive_machine_interrupts == 0
+-- 
+2.43.0

@@ -1,0 +1,3270 @@
+From e83ccfbd8082bfd8c138c2d237f9133fb1c3652b Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 20:05:02 -0400
+Subject: [PATCH] goal loop: delegate the wait to a zero-model-call watcher
+ instead of parking the goal
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A goal that depends on one long-running job parked ITSELF on that job. The
+pane, verbatim:
+
+  Goal parked -- waiting on session proc_0a1b2c3d4e5f: The goal is not
+  complete because the final v8 cut and the ranking pass depend on the running
+  index_pass2 job, which the agent is waiting on.
+  Loop: next in 30m.
+
+The record behind it was active at turn 1 of 400, parked for 1,131 s, with
+zero subgoals, on a turn whose own report named three other pieces of work in
+progress. 399 turns unspent.  [measured]
+
+Three compounding defects:
+
+ 1. An un-itemised goal cannot escalate through DEFER. all_items_blocked()
+    returns False with no itemised criteria by design, so the judge is left
+    with a binary: continue, or park everything. Nothing enumerates the work
+    it is about to abandon.
+ 2. The whole-goal barrier had no age ceiling, while per-ITEM barriers have
+    carried one since they existed -- on the stated reasoning that a process
+    which never exits must not permanently remove an item from the work set.
+    The barrier that removes the WHOLE GOAL had none.
+ 3. stalled_active_goals() skipped every parked goal, because "its barrier
+    will release it". The release is LAZY, inside is_waiting(), which runs
+    only from the post-turn hook -- and a parked goal fires no turns. A park
+    had no backstop at all.
+
+SOMEONE ELSE OWNS THE WAIT. A new module dispatches a watcher on the existing
+async-delegation rail, in the single-unit form, so there is no parent agent
+and therefore no CLI edit: all three surfaces already honour should_continue
+and continuation_prompt.
+
+A watcher makes ZERO model calls. It re-tests the barrier's own release
+predicate and reports a bounded outcome, so there is no context, no toolset
+and no stream for the broker's throttle or stream cap to act on, and nothing
+to pay the measured contention tax with (2,622 wasted prefill tokens idle,
+114,385 against five in-flight peers).  [measured] Its runner enters the
+delegated-child context, so any incidental call is NORMAL priority while the
+judge stays on the control-plane lane. progress_fn is deliberately NOT passed:
+the stale-progress monitor kills a delegation on a frozen progress token, and
+a watcher's token is frozen by design. It reads list_sessions() and never
+poll()/read_log(), which would mark the session consumed and suppress the
+registry's own completion turn.
+
+The report re-enters the session through the completion queue, which forges a
+fresh turn, which re-judges -- so a CORRECT park stops being a dead end too.
+
+DECIDING "IS THERE OTHER WORK" HONESTLY. On a wait verdict, one small
+auxiliary call asks what else is advanceable. Asking a model "anything else to
+do?" reliably produces something, and busy-work is worse than the park, so the
+guard is a CODE filter and not a prompt instruction: every proposed item must
+carry a verbatim quote, and the quote is checked to really appear in the goal,
+its criteria, or the agent's own report. The work has to already be written
+down by the user or by the agent itself. A second filter drops the wait
+restated as work. Every failure direction -- no client, transport error, bad
+JSON, an honest NONE, nothing verified -- is the park.
+
+A verified probe converts the whole-goal park into an ITEM barrier, the same
+mechanism defer uses, and the continuation names the items and forbids
+polling.
+
+Also here: a default barrier age ceiling enforced in both is_waiting() and
+reconcile_barriers(); barrier_past_ceiling() / barrier_looks_dead(), imported
+by the supervisor rather than reimplemented; a waiting-session pid kept as a
+liveness HINT and never as a release condition, because the process registry
+persists nothing and a foreign process reads an unknown session as "not
+waiting"; and the supervisor's third stall class, stale_barrier_goals().
+
+Unchanged on purpose: a park with nothing advanceable still parks, and still
+gets a watcher; the all-items-blocked escalation is not re-probed, because a
+deterministic count outranks a model opinion; an explicit human `/goal wait`
+is marked probed at the source, since a human's park is an instruction; a
+`blocked` verdict still pauses for a human and is never auto-resumed; old
+state rows load unchanged.
+
+Squashed with two follow-ups:
+
+  * the watcher had no routable session key, so its report would have been
+    queued forever on exactly the surface it was written for. The CLI drains
+    background completions through a POSITIVE-ownership filter that fails
+    closed on an empty key, and the ambient resolver returns empty on the CLI
+    (the contextvar is only bound during gateway/TUI turns). The manager's own
+    durable session id IS that key; fall back to it, and refuse to dispatch
+    at all when neither resolves, rather than promise a report nobody can
+    claim.
+  * a supervisor test parametrized its barrier rows with time.time(), which
+    pytest evaluates at COLLECTION. In a 62-minute single-process run the test
+    ran about an hour after collection, every timestamp was past the new
+    1-hour barrier ceiling, and three "held park" cases read as stale barriers
+    -- three failures that do not reproduce in isolation. The ceiling is
+    right; the fixture was a clock captured at the wrong moment. Parametrize
+    on the barrier KIND and derive the timestamps inside the test. Verified by
+    running it with the wall clock shifted +2 h after collection, and by an AST
+    audit that no decorator-level or module-level time.time() remains in
+    either goal test file.
+
+Requires patches 0007 and 0009.
+
+Squashed from fork commits e83ccfb, 952f227, 7493255.
+
+BASE: the tree left by patch 0010 (see BASELINE.md).
+
+PUBLISHED FORM. The park this is built from is reproduced verbatim in the
+tests, and it named an internal campaign and a session id. Those strings are
+load-bearing for the quote-verification filter -- the test asserts a quote
+really appears in the goal text -- so they are SUBSTITUTED rather than
+paraphrased: the same structure and the same quoted spans, invented subject
+matter. Two session ids are replaced throughout. A third replacement lands
+on a CONTEXT line, which is normally forbidden -- that line's pre-image is a
+line patch 0007 ADDS, so the published series is its base and the line has
+to match what 0007 wrote. It is the only context line substituted anywhere
+in the series; NOTICE says so.
+
+---
+ gateway/slash_commands.py                       |    4 
+ hermes_cli/cli_commands_mixin.py                |    4 
+ hermes_cli/goal_watchers.py                     |  584 ++++++++++++++
+ hermes_cli/goals.py                             |  932 +++++++++++++++++++++++
+ tests/hermes_cli/test_goal_wait_is_delegated.py |  932 +++++++++++++++++++++++
+ tests/tools/test_goal_resume_supervisor.py      |  176 ++++
+ tools/goal_resume_supervisor.py                 |  181 ++++
+ 7 files changed, 2780 insertions(+), 33 deletions(-)
+
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index d66162f..c668d7b 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -2756,6 +2756,10 @@ class GatewaySlashCommandsMixin:
+             reason = wtokens[1].strip() if len(wtokens) > 1 else ""
+             try:
+                 mgr.wait_on(pid, reason=reason)
++                # A human's park is an instruction, not a guess — keep the
++                # advanceable-work probe off it [bd-dre-n0vpl.4]. Mirrors the CLI
++                # handler in hermes_cli/cli_commands_mixin.py.
++                mgr.mark_wait_probed()
+             except (RuntimeError, ValueError) as exc:
+                 return f"/goal wait: {exc}"
+             rtxt = f" ({reason})" if reason else ""
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index f49f5d4..00c51b3 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -2860,6 +2860,10 @@ class CLICommandsMixin:
+             reason = wtokens[1].strip() if len(wtokens) > 1 else ""
+             try:
+                 mgr.wait_on(pid, reason=reason)
++                # ⛔ A HUMAN'S PARK IS AN INSTRUCTION, NOT A GUESS [bd-dre-n0vpl.4].
++                # Marking it probed keeps the advanceable-work probe — which
++                # exists to overturn the JUDGE's parks — from overruling Andre.
++                mgr.mark_wait_probed()
+             except (RuntimeError, ValueError) as exc:
+                 _cprint(f"  /goal wait: {exc}")
+                 return
+diff --git a/hermes_cli/goal_watchers.py b/hermes_cli/goal_watchers.py
+new file mode 100644
+index 0000000..b950187
+--- /dev/null
++++ b/hermes_cli/goal_watchers.py
+@@ -0,0 +1,584 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""Delegate the WAIT so the parent goal loop can keep grinding.
++
++⛔ THE PROBLEM THIS EXISTS FOR [bd-dre-n0vpl.4]. Andre, 2026-09-30, watching it
++happen: *"you shouldn't park your goals; you should have subagents processing
++their own goals so you can continue grinding while waiting"* and *"problem is it
++parks goals rather than assigning goals/loops to subagents, while keeping itself
++as active as possible, too."*
++
++The measured failure, from ``architect`` session ``20260929_125951_bbbbbb``
++(state record read live at 19:20 ET, barrier 1131 s old, turn 1 of 400):
++
++    ⏳ Goal parked — waiting on session proc_0a1b2c3d4e5f: The goal is not
++       complete because the final v8 cut and the ranking pass depend on the
++       running index_pass2 job, which the agent is waiting on.
++    ↻ Loop: next in 30m.
++
++One long-running job took the WHOLE goal off the road with 399 turns unspent,
++while the same turn's report named GPU packing work, queued rows and an ACK'd
++workflow split with a peer session.
++
++This module is the other half of the fix. ``hermes_cli.goals`` decides *whether*
++the park is right (see ``probe_advanceable_work``); this decides *who owns the
++wait* when it is. A watcher is dispatched onto the existing async-delegation rail
++and the parent goes back to work.
++
++WHAT A WATCHER IS, AND WHY IT IS THIS CHEAP
++-------------------------------------------
++A watcher makes **zero model calls**. It is a poll loop over the *same*
++release predicate the barrier itself uses — ``process_registry.is_session_waiting``
++for a session barrier, ``goals._barrier_pid_alive`` for a pid barrier, the
++deadline for a time barrier — and when that predicate flips it returns a bounded
++report of the job's outcome.
++
++That matters because GPU0's KV pool is shared with Andre's other main session,
++and a prior agent measured wasted prefill per call rising from 2,622 tokens with
++no contention to 114,385 with five other in-flight requests. A watcher that
++reasons about the job would pay that tax once per poll, forever, for a job whose
++completion is a boolean. So it does not reason:
++
++  * no ``call_llm``, no context window, no toolset, no tokens — nothing for the
++    broker's VRAM throttle or child-stream caps to throttle, because it never
++    opens a stream;
++  * it runs on the shared ``tools.daemon_pool`` executor the async-delegation
++    rail already owns, at ``PRIORITY_NORMAL`` — a delegated child's priority,
++    below the goal judge's control-plane 100, which is unchanged;
++  * ``progress_fn`` is deliberately NOT passed. The stale monitor marks a
++    delegation stuck on a frozen progress token, and a watcher's token is frozen
++    by design (it makes no api calls) — handing it one would get every watcher
++    killed as stalled. Its bound is its own ``WATCHER_MAX_SECONDS`` ceiling.
++
++The report re-enters the parent session through the rail's existing completion
++queue (``process_registry.completion_queue`` → the CLI/gateway idle drain), which
++forges a fresh turn. That turn runs the goal hook, which re-judges. So the
++watcher does not merely observe the release — **it is what wakes the goal up**,
++which is also why a correctly-parked goal is no longer a dead end.
++
++BOUNDS (no path may spawn unbounded watchers)
++---------------------------------------------
++  1. One watcher per (goal session, watch target). A goal re-parking on the same
++     job every turn refreshes nothing and spawns nothing.
++  2. At most ``max_wait_watchers`` (default 2) live watchers per goal.
++  3. A watcher is never dispatched into the LAST free async-delegation slot, so
++     watching can never starve the real subagents the parent needs in order to
++     keep grinding — which would defeat the entire point.
++  4. Every watcher has a hard wall-clock ceiling. A job that never finishes
++     yields a watcher that reports "still running after N s" and exits.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++# How often a watcher re-tests its release predicate. The predicate is a cheap
++# in-process dict lookup (or a /proc stat), so this is about latency-to-wake, not
++# cost: 15 s means the parent learns a job finished within 15 s of it happening.
++DEFAULT_WATCHER_POLL_SECONDS = 15.0
++
++# Hard wall-clock ceiling on one watcher. Mirrors
++# ``goals.DEFAULT_ITEM_BARRIER_MAX_SECONDS`` — a watcher that could live forever
++# is the same defect as a barrier that can never release, one layer out. On
++# expiry it reports what it saw and exits, so the parent is told rather than left
++# guessing.
++DEFAULT_WATCHER_MAX_SECONDS = 3600.0
++
++# Live watchers per goal. Two is enough for the shape this exists for (a long
++# job plus a peer session), and small enough that watchers never dominate the
++# shared async-delegation pool.
++DEFAULT_MAX_WAIT_WATCHERS = 2
++
++#: Characters of the watched job's output carried back in the report.
++_OUTPUT_TAIL_CHARS = 1200
++
++#: Dispatch role, so ``/agents`` and the delegation ledger show what these are.
++WATCHER_ROLE = "goal_wait_watcher"
++
++
++# ─────────────────────────────────────────────────────────── config resolution
++
++
++def _goals_cfg(key: str, default: Any) -> Any:
++    """Read ``goals.<key>`` from config, degrading to *default*.
++
++    Reuses ``hermes_cli.goals._goals_config`` so watcher knobs live in the same
++    config block as every other goal-loop knob rather than a second namespace.
++    """
++    try:
++        from hermes_cli.goals import _goals_config
++
++        raw = (_goals_config() or {}).get(key)
++    except Exception:
++        return default
++    if raw is None:
++        return default
++    try:
++        if isinstance(default, bool):
++            return bool(raw)
++        if isinstance(default, int) and not isinstance(default, bool):
++            return int(raw)
++        if isinstance(default, float):
++            return float(raw)
++    except (TypeError, ValueError):
++        return default
++    return raw
++
++
++def watcher_poll_seconds() -> float:
++    value = _goals_cfg("watcher_poll_seconds", DEFAULT_WATCHER_POLL_SECONDS)
++    return max(1.0, float(value))
++
++
++def watcher_max_seconds() -> float:
++    value = _goals_cfg("watcher_max_seconds", DEFAULT_WATCHER_MAX_SECONDS)
++    return max(30.0, float(value))
++
++
++def max_wait_watchers() -> int:
++    value = _goals_cfg("max_wait_watchers", DEFAULT_MAX_WAIT_WATCHERS)
++    return max(0, int(value))
++
++
++# ───────────────────────────────────────────────────────────── the watch target
++
++
++def target_key(
++    *,
++    session_id: Optional[str] = None,
++    pid: Optional[int] = None,
++    until: Optional[float] = None,
++) -> str:
++    """Stable identity for one watch target, used for de-duplication.
++
++    Deliberately NOT derived from the reason text: the judge rewords its reason
++    every turn, so keying on it would spawn a fresh watcher per turn for the same
++    job — the unbounded-spawn failure this key exists to prevent.
++    """
++    if session_id:
++        return f"session:{session_id}"
++    if pid:
++        return f"pid:{int(pid)}"
++    if until:
++        # Bucket to the second: a deadline re-derived from ``until - now`` drifts
++        # by microseconds between turns and would otherwise look like a new
++        # target each time.
++        return f"deadline:{int(float(until))}"
++    return ""
++
++
++def describe_target(
++    *,
++    session_id: Optional[str] = None,
++    pid: Optional[int] = None,
++    until: Optional[float] = None,
++) -> str:
++    """Human-readable target, matching the goal loop's own park wording."""
++    if session_id:
++        return f"session {session_id}"
++    if pid:
++        return f"pid {int(pid)}"
++    if until:
++        remaining = max(0, int(float(until) - time.time()))
++        return f"{remaining}s"
++    return "an unnamed job"
++
++
++def barrier_released(
++    *,
++    session_id: Optional[str] = None,
++    pid: Optional[int] = None,
++    until: Optional[float] = None,
++    since: float = 0.0,
++    now_fn=time.time,
++) -> bool:
++    """True when this watch target's release condition has fired.
++
++    ⛔ Delegates to the EXACT predicates ``GoalManager.is_waiting`` uses, for the
++    same reason the resume supervisor imports ``goals.is_transport_pause``
++    instead of re-implementing it: a watcher and a barrier that disagree about
++    "finished" is worse than no watcher, because the parent would be told the job
++    is done while the loop stays parked.
++
++    Fail direction is "released" on any error — a watcher that cannot evaluate
++    its predicate reports back and lets the parent's own judge decide, rather
++    than sitting on a wait nobody can see.
++    """
++    try:
++        if session_id:
++            from hermes_cli.goals import _session_waiting
++
++            return not _session_waiting(session_id)
++        if pid:
++            from hermes_cli.goals import _barrier_pid_alive
++
++            return not _barrier_pid_alive(int(pid), since)
++        if until:
++            # ⛔ ``now_fn``, not ``time.time()`` — the watch loop and its release
++            # predicate must read ONE clock. Two clocks meant an injected clock
++            # released a deadline barrier instantly, and the ceiling could never
++            # be reached (caught by test_the_watcher_has_a_hard_wall_clock_ceiling).
++            return now_fn() >= float(until)
++    except Exception as exc:  # noqa: BLE001 - never wedge a watcher
++        logger.debug("goal watcher: release predicate failed (%s) — releasing", exc)
++        return True
++    return True
++
++
++def _outcome_snapshot(session_id: Optional[str], pid: Optional[int]) -> str:
++    """Bounded description of how the watched job ended.
++
++    ⛔ Reads ONLY ``list_sessions()``. ``process_registry.poll()`` /
++    ``read_log()`` mark a session poll-observed / completion-consumed, which
++    SUPPRESSES the registry's own ``[SYSTEM: ...]`` completion turn for that
++    process — so a watcher using them would silence the very notification the
++    parent may still need if this report fails to deliver. A watcher observes;
++    it does not consume.
++    """
++    if not session_id:
++        if pid:
++            return f"pid {int(pid)} is no longer running."
++        return ""
++    try:
++        from tools.process_registry import process_registry
++
++        for entry in process_registry.list_sessions() or []:
++            if not isinstance(entry, dict) or entry.get("session_id") != session_id:
++                continue
++            bits = [f"status={entry.get('status')}"]
++            if entry.get("exit_code") is not None:
++                bits.append(f"exit_code={entry.get('exit_code')}")
++            if entry.get("watch_hit"):
++                bits.append("watch_pattern=hit")
++            if entry.get("command"):
++                bits.append(f"command={str(entry['command'])[:160]}")
++            tail = str(entry.get("output_preview") or "")[-_OUTPUT_TAIL_CHARS:]
++            text = "  ".join(bits)
++            if tail.strip():
++                text = f"{text}\nOutput (tail):\n{tail}"
++            return text
++        return (
++            f"Session {session_id} is no longer in the process registry "
++            f"(it exited, or the registry was restarted)."
++        )
++    except Exception as exc:  # noqa: BLE001
++        logger.debug("goal watcher: outcome snapshot failed: %s", exc)
++        return f"Session {session_id} released; its outcome could not be read ({exc})."
++
++
++# ───────────────────────────────────────────────────────────── the watcher body
++
++
++def run_watch_loop(
++    *,
++    session_id: Optional[str],
++    pid: Optional[int],
++    until: Optional[float],
++    since: float,
++    reason: str,
++    goal_text: str,
++    poll_seconds: Optional[float] = None,
++    max_seconds: Optional[float] = None,
++    sleep_fn=time.sleep,
++    now_fn=time.time,
++) -> Dict[str, Any]:
++    """Own the wait. Return an async-delegation result dict.
++
++    Makes no model call and holds no context — see the module docstring. The
++    ``sleep_fn`` / ``now_fn`` seams exist so the tests can drive this
++    deterministically instead of sleeping.
++    """
++    poll = watcher_poll_seconds() if poll_seconds is None else max(0.0, float(poll_seconds))
++    ceiling = watcher_max_seconds() if max_seconds is None else max(0.0, float(max_seconds))
++    started = now_fn()
++    target = describe_target(session_id=session_id, pid=pid, until=until)
++    polls = 0
++
++    while True:
++        if barrier_released(session_id=session_id, pid=pid, until=until,
++                            since=since, now_fn=now_fn):
++            waited = round(now_fn() - started, 1)
++            outcome = _outcome_snapshot(session_id, pid)
++            summary = (
++                f"The job this goal was waiting on has finished: {target}.\n"
++                f"Waited {waited}s across {polls} check(s). "
++                f"Why the goal was waiting: {reason or '(no reason recorded)'}\n"
++            )
++            if outcome:
++                summary += f"\n{outcome}\n"
++            summary += (
++                "\nThe wait barrier on this goal is released. Pick the work that "
++                "depended on this job back up, verify its result before building "
++                "on it, and keep going."
++            )
++            return {
++                "status": "completed",
++                "summary": summary,
++                "error": None,
++                "api_calls": 0,
++                "duration_seconds": waited,
++                "released": True,
++                "polls": polls,
++            }
++
++        elapsed = now_fn() - started
++        if elapsed >= ceiling:
++            waited = round(elapsed, 1)
++            return {
++                "status": "completed",
++                "summary": (
++                    f"Stopped watching {target} after {waited}s — it is STILL "
++                    f"RUNNING and this watcher hit its {ceiling:.0f}s ceiling.\n"
++                    f"Why the goal was waiting: {reason or '(no reason recorded)'}\n\n"
++                    "Nothing is wrong with the job; nobody is watching it any "
++                    "more. Check it yourself this turn (one status line, no "
++                    "blocking poller), and if it still matters, get on with the "
++                    "rest of the goal while it runs."
++                ),
++                "error": None,
++                "api_calls": 0,
++                "duration_seconds": waited,
++                "released": False,
++                "polls": polls,
++            }
++
++        polls += 1
++        sleep_fn(min(poll, max(0.0, ceiling - elapsed)))
++
++
++# ──────────────────────────────────────────────────────────────────── dispatch
++
++
++def _async_headroom() -> Tuple[bool, str]:
++    """Whether there is a spare async-delegation slot BESIDES the last one.
++
++    ⛔ Bound 3. Watchers share ``delegation.max_concurrent_children`` with real
++    subagents. Letting a watcher take the final slot would mean the parent,
++    freshly un-parked and told to get on with other work, could not dispatch the
++    subagent it needs to do that work — trading one stall for another.
++    """
++    try:
++        from tools.async_delegation import active_count
++        from tools.delegate_tool import _get_max_async_children
++
++        cap = int(_get_max_async_children())
++        live = int(active_count())
++    except Exception as exc:  # noqa: BLE001
++        return False, f"async-delegation registry unavailable ({exc})"
++    if cap <= 1:
++        return False, f"async-delegation cap is {cap} — no slot to spare for a watcher"
++    if live >= cap - 1:
++        return False, (
++            f"async-delegation pool is near capacity ({live}/{cap}) — the last "
++            f"slot is reserved for real work"
++        )
++    return True, ""
++
++
++def spawn_wait_watcher(
++    *,
++    goal_session_id: str,
++    goal_text: str,
++    reason: str,
++    session_id: Optional[str] = None,
++    pid: Optional[int] = None,
++    until: Optional[float] = None,
++    since: Optional[float] = None,
++    existing_keys: Optional[List[str]] = None,
++    live_watchers: int = 0,
++) -> Dict[str, Any]:
++    """Dispatch a background watcher that owns this wait. Never raises.
++
++    Returns ``{"status": "dispatched", "delegation_id", "target_key"}``, or
++    ``{"status": "skipped", "reason": ...}``. Every refusal is a reason string so
++    the caller can log why a wait was not delegated instead of silently
++    pretending it was.
++    """
++    key = target_key(session_id=session_id, pid=pid, until=until)
++    if not key:
++        return {"status": "skipped", "reason": "no watchable target"}
++
++    # Bound 1 — one watcher per target. A goal re-parking on the same job every
++    # turn must not accumulate watchers.
++    if existing_keys and key in set(existing_keys):
++        return {"status": "skipped", "reason": f"already watching {key}", "target_key": key}
++
++    # Bound 2 — per-goal ceiling.
++    ceiling = max_wait_watchers()
++    if ceiling <= 0:
++        return {"status": "skipped", "reason": "wait watchers disabled (max_wait_watchers=0)",
++                "target_key": key}
++    if int(live_watchers) >= ceiling:
++        return {"status": "skipped", "target_key": key,
++                "reason": f"already at the watcher ceiling ({live_watchers}/{ceiling})"}
++
++    # Bound 3 — leave the last async slot for real work.
++    ok, why = _async_headroom()
++    if not ok:
++        return {"status": "skipped", "reason": why, "target_key": key}
++
++    # ⛔ A WATCHER WHOSE REPORT CANNOT BE DELIVERED IS WORSE THAN NO WATCHER.
++    #
++    # The whole point is that the completion event forges a fresh turn in the
++    # parent session. On a one-shot runner (``hermes -z``, cron, a Kanban worker,
++    # a stateless HTTP call) there is no later turn to forge, so the event would
++    # be queued and never drained — the wait would look delegated and be owned by
++    # nobody. ``delegate_task`` makes the same check before backgrounding.
++    try:
++        from gateway.session_context import async_delivery_supported
++
++        if not async_delivery_supported():
++            return {"status": "skipped", "target_key": key, "reason": (
++                "this session cannot receive a later turn, so a watcher's report "
++                "would never be delivered"
++            )}
++    except Exception as exc:  # noqa: BLE001 - absence of the check is not a refusal
++        logger.debug("goal watcher: delivery-support check unavailable: %s", exc)
++
++    # The operator kill switch for runaway fan-out covers watchers too.
++    try:
++        from tools.delegate_tool import is_spawn_paused
++
++        if is_spawn_paused():
++            return {"status": "skipped", "target_key": key,
++                    "reason": "delegation spawning is paused"}
++    except Exception:
++        pass
++
++    try:
++        from tools.async_delegation import (
++            _current_origin_session_id,
++            dispatch_async_delegation,
++        )
++        from tools.delegate_tool import _get_max_async_children
++    except Exception as exc:  # noqa: BLE001
++        return {"status": "skipped", "target_key": key,
++                "reason": f"delegation machinery unavailable ({exc})"}
++
++    # ⛔ AN EMPTY session_key MEANS THE REPORT IS NEVER DELIVERED.
++    #
++    # The CLI drains completions through a POSITIVE-ownership filter
++    # (``cli.py::_owns_process_notification``) that compares the event's
++    # ``session_key`` to its own ``session_id`` and FAILS CLOSED on an empty one.
++    # ``get_current_session_key`` resolves empty on the CLI — the approval
++    # contextvar is only bound during gateway/TUI turns and HERMES_SESSION_KEY is
++    # not in the CLI environment — so passing it alone would leave every watcher's
++    # report queued forever, which is exactly the "owned by nobody" failure the
++    # delivery-support check above exists to prevent.
++    #
++    # ``goal_session_id`` IS that durable id: ``cli.py::_get_goal_manager``
++    # constructs ``GoalManager(session_id=self.session_id)``. Same fallback shape
++    # as ``delegate_tool.delegate_task``, which stamps ``parent_agent.session_id``
++    # for the same reason (#64240 / #64484); compression rotations are resolved on
++    # the drain side via ``resolve_resume_session_id`` lineage.
++    try:
++        from tools.approval import get_current_session_key
++
++        session_key = get_current_session_key("")
++    except Exception:
++        session_key = ""
++    if not session_key:
++        session_key = str(goal_session_id or "")
++    if not session_key:
++        return {"status": "skipped", "target_key": key, "reason": (
++            "no routable session key — a watcher's report could not be claimed "
++            "by any session"
++        )}
++    try:
++        origin_session_id = _current_origin_session_id()
++    except Exception:
++        origin_session_id = ""
++    origin_ui_session_id = ""
++    try:
++        from gateway.session_context import get_session_env
++
++        origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or ""
++    except Exception:
++        pass
++
++    barrier_since = float(since or 0.0) or time.time()
++    target = describe_target(session_id=session_id, pid=pid, until=until)
++
++    def _runner() -> Dict[str, Any]:
++        # ⛔ Run inside ``delegated_child_context`` even though this watcher makes
++        # no model call. It is what ``pool_broker.current_priority()`` reads to
++        # demote a subagent to PRIORITY_NORMAL (0), so entering it means any
++        # incidental GPU0-bound call from here — now or after a later edit — is
++        # tagged as a child rather than inheriting the parent's interactive 100.
++        # It also scopes the session ContextVar so the watcher cannot clobber the
++        # parent's identity. ⛔ NEVER wrap this in ``control_plane_call()``: that
++        # would promote a watcher to the goal judge's 100 and re-create exactly
++        # the starvation the broker docstring warns about.
++        try:
++            from agent.delegation_context import delegated_child_context
++
++            with delegated_child_context():
++                return run_watch_loop(
++                    session_id=session_id, pid=pid, until=until,
++                    since=barrier_since, reason=reason, goal_text=goal_text,
++                )
++        except Exception:
++            # The context manager is a priority/identity nicety; a watcher that
++            # cannot enter it must still do its job.
++            return run_watch_loop(
++                session_id=session_id, pid=pid, until=until,
++                since=barrier_since, reason=reason, goal_text=goal_text,
++            )
++
++    try:
++        dispatch = dispatch_async_delegation(
++            goal=f"Own the wait on {target} so the goal loop keeps working",
++            context=(
++                "Dispatched by the goal loop instead of parking the whole goal "
++                f"[bd-dre-n0vpl.4]. Watching: {target}. The goal was gated on it "
++                f"because: {reason or '(no reason recorded)'}. This watcher makes "
++                "no model calls — it re-tests the barrier's own release "
++                "predicate and reports the outcome back into this session."
++            ),
++            toolsets=[],
++            role=WATCHER_ROLE,
++            model=None,
++            session_key=session_key,
++            parent_session_id=str(goal_session_id) if goal_session_id else None,
++            runner=_runner,
++            origin_ui_session_id=origin_ui_session_id,
++            origin_session_id=origin_session_id,
++            max_async_children=int(_get_max_async_children()),
++            # progress_fn deliberately omitted — see the module docstring.
++        )
++    except Exception as exc:  # noqa: BLE001 - a failed watcher must not stop a goal
++        logger.debug("goal watcher: dispatch raised: %s", exc)
++        return {"status": "skipped", "target_key": key, "reason": f"dispatch failed ({exc})"}
++
++    if (dispatch or {}).get("status") != "dispatched":
++        return {"status": "skipped", "target_key": key,
++                "reason": str((dispatch or {}).get("error") or "dispatch rejected")}
++
++    logger.info(
++        "goal loop: delegated the wait on %s to watcher %s (goal session %s)",
++        target, dispatch.get("delegation_id"), goal_session_id,
++    )
++    return {
++        "status": "dispatched",
++        "delegation_id": dispatch.get("delegation_id"),
++        "target_key": key,
++        "target": target,
++    }
++
++
++__all__ = [
++    "DEFAULT_MAX_WAIT_WATCHERS",
++    "DEFAULT_WATCHER_MAX_SECONDS",
++    "DEFAULT_WATCHER_POLL_SECONDS",
++    "WATCHER_ROLE",
++    "barrier_released",
++    "describe_target",
++    "max_wait_watchers",
++    "run_watch_loop",
++    "spawn_wait_watcher",
++    "target_key",
++    "watcher_max_seconds",
++    "watcher_poll_seconds",
++]
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 218d2a2..730c9f6 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -143,6 +143,22 @@ _GATE_OUTPUT_TAIL_CHARS = 3000
+ DEFAULT_DEFER_TTL_SECONDS = 900
+ DEFAULT_ITEM_BARRIER_MAX_SECONDS = 3600
+ 
++# ⛔ THE WHOLE-GOAL BARRIER HAD NO CEILING [bd-dre-n0vpl.4].
++#
++# Item barriers have carried ``DEFAULT_ITEM_BARRIER_MAX_SECONDS`` since they
++# existed, for the stated reason that "a process that never exits can never
++# permanently remove an item from the agent's work set". The WHOLE-GOAL barrier —
++# which removes the entire goal, not one item — had no such bound, so a
++# ``wait`` verdict on a job that never exits was an unbounded stop. Worse, the
++# resume supervisor deliberately skips parked goals, so there was no backstop
++# either.
++#
++# Same tolerance and same argument as the item ceiling: worst case the loop
++# re-examines the barrier one turn early, the judge sees the job still running
++# and re-parks (which refreshes ``waiting_since``). One judge call an hour is the
++# entire cost, and an hour is well past any wait a human would call "parked".
++DEFAULT_GOAL_BARRIER_MAX_SECONDS = 3600
++
+ # A pid ALONE is not a safe liveness key for a barrier: the OS recycles
+ # pids, so a goal parked for hours can find a DIFFERENT process wearing the
+ # pid it waited on and conclude its job is still running. Every barrier
+@@ -248,6 +264,118 @@ CONTINUATION_BLOCKED_ITEMS_TEMPLATE = (
+ )
+ 
+ 
++# ──────────────────────────────────────────────────────────────────────
++# The advanceable-work probe — the honest second opinion on a WAIT
++# ──────────────────────────────────────────────────────────────────────
++#
++# ⛔ WHY A SECOND CALL AT ALL [bd-dre-n0vpl.4]. Andre, 2026-09-30: "you shouldn't
++# park your goals; you should have subagents processing their own goals so you
++# can continue grinding while waiting."
++#
++# The judge's WAIT contract already says "choose this ONLY when there is no other
++# part of the goal to work on", and it still parked a goal whose own turn report
++# named GPU packing work, queued rows and an ACK'd workflow split with a peer.
++# The structural reason is visible in the measured record: that goal had ZERO
++# subgoals, and ``all_items_blocked()`` returns False for an un-itemised goal by
++# design — so DEFER could never escalate and the judge had only the binary
++# CONTINUE-or-park-everything. Nothing enumerated the work it was about to
++# abandon.
++#
++# ⛔ AND WHY IT CANNOT BE ALLOWED TO INVENT WORK. Asking a language model "is
++# there anything else to do?" reliably produces something. Busy-work would be
++# strictly worse than the park: it burns the budget AND hides the real wait.
++#
++# So the probe must QUOTE. Every item it returns carries a verbatim fragment of
++# the goal text, a subgoal, the contract, or the agent's own report — and
++# ``_verify_quoted_items`` checks, in code, that the fragment actually appears
++# there. An item whose quote cannot be found is DROPPED, without appeal. That
++# turns "don't fabricate" from an instruction the model may ignore into a
++# deterministic filter it cannot get past: the work has to already be written
++# down by the user or by the agent itself.
++#
++# Failure direction is always the park. No probe, unreachable probe, unparseable
++# probe, zero surviving items — the goal parks exactly as it does today.
++
++ADVANCEABLE_WORK_PROBE_SYSTEM_PROMPT = (
++    "You are checking ONE narrow thing for an autonomous agent's goal loop. The "
++    "loop is about to STOP the entire goal and go idle because the agent said it "
++    "is waiting on a long-running job. Your job is to find out whether that is "
++    "actually the agent's only remaining work.\n\n"
++    "You will be given: the goal, the agent's most recent report, and the thing "
++    "it is waiting on. List the concrete next steps toward this goal that do NOT "
++    "depend on that thing.\n\n"
++    "⛔ THE ONE HARD RULE: every step you list MUST be something the goal, its "
++    "criteria, or the agent's own report ALREADY names. You are not planning and "
++    "you are not brainstorming — you are reading back work that is already "
++    "written down and checking it does not depend on the wait. For each step you "
++    "must supply ``quote``: a short VERBATIM fragment (5-25 words) copied "
++    "character-for-character out of the goal, the criteria, or the report, which "
++    "is where that work is named. A step whose quote is not found in those texts "
++    "is discarded automatically, so do not paraphrase and do not invent a quote.\n"
++    "⛔ Do NOT list: polling, checking on, monitoring, or waiting for the thing "
++    "being waited on; 'review the results when it finishes'; generic hygiene "
++    "nobody asked for (write more tests, tidy up, update docs) unless the goal "
++    "or the report names it; or anything that needs the waited-on job's output.\n"
++    "⛔ If the agent genuinely has nothing else to advance, say so. NONE is a "
++    "correct, expected, and frequently right answer — an honest NONE is far more "
++    "useful than a step that turns out to be busy-work.\n\n"
++    "Reply ONLY with a single JSON object on one line:\n"
++    '{"items": [{"work": "<short imperative>", "quote": "<verbatim fragment>"}], '
++    '"reason": "<one sentence>"}\n'
++    'When there is genuinely nothing else: {"items": [], "reason": "<why '
++    'everything else is gated too>"}'
++)
++
++ADVANCEABLE_WORK_PROBE_USER_TEMPLATE = (
++    "Goal:\n{goal}\n\n"
++    "{criteria_block}"
++    "The agent's most recent report:\n{response}\n\n"
++    "What it is waiting on: {waiting_on}\n"
++    "Why it says it is waiting: {reason}\n\n"
++    "List the concrete next steps toward the goal that do NOT depend on that, "
++    "each with a verbatim quote from the goal, criteria, or report that names it. "
++    "Reply NONE (an empty items list) if there are genuinely none."
++)
++
++#: Max items the probe may return. A park overturned by a dozen "next steps" is
++#: a probe that is planning, not reading.
++_PROBE_MAX_ITEMS = 5
++
++#: A quote shorter than this proves nothing — "the" appears in every text.
++_PROBE_MIN_QUOTE_CHARS = 12
++
++#: Work descriptions that are the wait itself wearing a different hat. Dropped
++#: even when their quote verifies, because the quote would verify against the
++#: agent's own sentence about waiting.
++_PROBE_REJECT_PATTERNS = (
++    r"^\s*(?:poll|monitor|watch|await|wait)\b",
++    r"\bwait (?:for|on|until)\b",
++    r"\bpoll(?:ing)? (?:for|on|the)\b",
++    r"\bcheck (?:on|the status of) \b",
++    r"\bonce (?:it|the job|that) (?:finishes|completes|is done)\b",
++    r"\bwhen (?:it|the job|that) (?:finishes|completes|is done)\b",
++    r"\bafter (?:it|the job|that) (?:finishes|completes|is done)\b",
++)
++
++
++# Fed back when a would-be park was overturned: the wait now belongs to a
++# watcher, and these are the things the agent is expected to move instead.
++CONTINUATION_WAIT_DELEGATED_TEMPLATE = (
++    "[Continuing toward your standing goal — the wait is delegated, you are not]\n"
++    "Goal: {goal}\n\n"
++    "You said you are waiting on {waiting_on}. You are not going to sit on it: "
++    "{watcher_note}\n\n"
++    "⛔ Do NOT poll it, do NOT wait on it, and do NOT work on anything that "
++    "needs its output this turn. You will be told when it lands.\n\n"
++    "These parts of the goal do not depend on it and are open right now:\n"
++    "{work_block}\n\n"
++    "Pick the one that moves the goal furthest and take a real, concrete step on "
++    "it this turn — dispatch sub-agents to run independent ones in parallel. If "
++    "you find that every one of the above is in fact gated on the same thing, "
++    "say exactly that and name the gate for each."
++)
++
++
+ JUDGE_SYSTEM_PROMPT = (
+     "You are a strict judge evaluating whether an autonomous agent has "
+     "achieved a user's stated goal. You receive the goal text, the agent's "
+@@ -295,7 +423,14 @@ JUDGE_SYSTEM_PROMPT = (
+     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
+     "just because work remains — only when re-poking now would be pure "
+     "busy-work because the agent can't progress until the async thing "
+-    "finishes.\n\n"
++    "finishes.\n"
++    "⛔ WAIT IS THE RAREST VERDICT AND YOU SHOULD EXPECT TO BE OVERRULED. A "
++    "background job never owns a whole goal on its own: the wait is handed to a "
++    "watcher, and if ANY other part of the goal can move, the loop keeps working "
++    "and your WAIT becomes a DEFER. So do not reach for WAIT to express 'the "
++    "important thing is blocked' — that is DEFER. Reach for it only when you "
++    "have read the agent's report and there is nothing in the entire goal it "
++    "could take a step on.\n\n"
+     "DEFER — the goal is NOT done; the ONE thing the agent just described is "
+     "gated on async work, but the goal contains other work that can proceed "
+     "right now. This is the correct verdict whenever the goal is broader than "
+@@ -803,6 +938,111 @@ def _item_released(item: "BlockedItem") -> bool:
+     return True
+ 
+ 
++# ──────────────────────────────────────────────────────────────────────
++# Whole-goal barrier staleness — ONE predicate, shared in and out of process
++# ──────────────────────────────────────────────────────────────────────
++#
++# ⛔ [bd-dre-n0vpl.4] These two functions are deliberately module-level and
++# dict-tolerant, because ``tools/goal_resume_supervisor.py`` must reach the same
++# verdict from OUTSIDE the process holding the barrier. That is the same
++# discipline that made the supervisor import ``is_transport_pause`` instead of
++# re-implementing it: a supervisor whose idea of "stale" drifts from the loop's
++# either misses real stalls or resumes a goal that is waiting exactly as
++# designed.
++
++
++def _barrier_field(record: Any, name: str, default: Any = None) -> Any:
++    """Read one barrier field from a ``GoalState`` OR a raw ``state_meta`` dict."""
++    if isinstance(record, dict):
++        return record.get(name, default)
++    return getattr(record, name, default)
++
++
++def barrier_past_ceiling(
++    record: Any, *, now: Optional[float] = None, max_seconds: Optional[float] = None
++) -> bool:
++    """True when a whole-goal barrier is older than its hard age ceiling.
++
++    A barrier with no ``waiting_since`` is NOT past the ceiling: an unknown age
++    is not old age, the same reading the resume supervisor applies to a missing
++    ``last_turn_at``. Treating it as infinitely stale would un-park every barrier
++    written before this field existed.
++    """
++    since = 0.0
++    try:
++        since = float(_barrier_field(record, "waiting_since", 0.0) or 0.0)
++    except (TypeError, ValueError):
++        since = 0.0
++    if since <= 0:
++        return False
++    ceiling = (
++        float(max_seconds)
++        if max_seconds is not None
++        else float(_goals_float("barrier_max_seconds", DEFAULT_GOAL_BARRIER_MAX_SECONDS,
++                                minimum=60.0))
++    )
++    ts = time.time() if now is None else float(now)
++    return (ts - since) > ceiling
++
++
++def barrier_looks_dead(
++    record: Any, *, now: Optional[float] = None, max_seconds: Optional[float] = None
++) -> Tuple[bool, str]:
++    """Whether a parked goal's barrier can no longer release it, and why.
++
++    Written for an observer that is NOT the process holding the barrier, so it
++    uses only evidence that survives a process boundary:
++
++      * a ``waiting_on_pid`` barrier whose process is gone (reuse-aware, via the
++        same ``_barrier_pid_alive`` the loop uses) — the job finished;
++      * a ``waiting_on_session`` barrier whose recorded ``waiting_session_pid``
++        is gone — the process behind the registry session finished. The session
++        id itself is NOT usable here: ``process_registry`` persists nothing, so
++        a foreign process asking about it always gets "unknown → not waiting",
++        which would read EVERY session barrier as dead;
++      * an elapsed ``waiting_until``;
++      * any barrier older than the ceiling.
++
++    Returns ``(False, "")`` for a session barrier with no pid hint and no excess
++    age — genuinely undecidable from outside, and the safe answer to an
++    undecidable question is "leave it alone".
++    """
++    ts = time.time() if now is None else float(now)
++    sess = _barrier_field(record, "waiting_on_session")
++    try:
++        pid = int(_barrier_field(record, "waiting_on_pid") or 0) or None
++    except (TypeError, ValueError):
++        pid = None
++    try:
++        hint = int(_barrier_field(record, "waiting_session_pid") or 0) or None
++    except (TypeError, ValueError):
++        hint = None
++    try:
++        until = float(_barrier_field(record, "waiting_until", 0.0) or 0.0)
++    except (TypeError, ValueError):
++        until = 0.0
++    try:
++        since = float(_barrier_field(record, "waiting_since", 0.0) or 0.0)
++    except (TypeError, ValueError):
++        since = 0.0
++
++    if not (sess or pid or until):
++        return False, ""
++
++    if barrier_past_ceiling(record, now=ts, max_seconds=max_seconds):
++        age = int(ts - since) if since else 0
++        return True, f"the wait barrier is {age}s old, past its age ceiling"
++    if pid and not _barrier_pid_alive(pid, since):
++        return True, f"the watched process (pid {pid}) has exited"
++    if sess and hint and not _barrier_pid_alive(hint, since):
++        return True, (
++            f"the process behind watched session {sess} (pid {hint}) has exited"
++        )
++    if until and ts >= until:
++        return True, "the wait deadline has passed"
++    return False, ""
++
++
+ def reconcile_barriers(state: Optional["GoalState"]) -> bool:
+     """Drop every barrier on ``state`` that is PROVABLY no longer held.
+ 
+@@ -882,6 +1122,10 @@ def reconcile_barriers(state: Optional["GoalState"]) -> bool:
+         held = _barrier_pid_alive(state.waiting_on_pid, state.waiting_since)
+     elif state.waiting_until:
+         held = time.time() < state.waiting_until
++    # The age ceiling overrides every kind [bd-dre-n0vpl.4] — same rule
++    # is_waiting() applies, so the two cannot disagree about "parked".
++    if held and barrier_past_ceiling(state):
++        held = False
+ 
+     if not held and (
+         state.waiting_on_pid is not None
+@@ -895,6 +1139,8 @@ def reconcile_barriers(state: Optional["GoalState"]) -> bool:
+         state.waiting_until = 0.0
+         state.waiting_reason = None
+         state.waiting_since = 0.0
++        state.waiting_session_pid = None
++        state.waiting_probed = False
+         changed = True
+ 
+     # Per-item barriers (the ``defer`` verdict) carry the same exposure in a
+@@ -1201,6 +1447,35 @@ class GoalState:
+     waiting_until: float = 0.0
+     waiting_reason: Optional[str] = None
+     waiting_since: float = 0.0
++    # ⛔ OBSERVABLE LIVENESS FOR A SESSION BARRIER [bd-dre-n0vpl.4].
++    #
++    # ``waiting_on_session`` names a ``process_registry`` session, and that
++    # registry is PURELY IN-MEMORY — it persists nothing. Measured: a fresh
++    # process asked ``is_session_waiting("proc_0a1b2c3d4e5f")`` about a barrier
++    # the live architect session was holding and got False, because an unknown
++    # session reads as "not waiting". So an out-of-process observer — the resume
++    # supervisor — cannot tell a held session barrier from a released one, and
++    # its only safe move was to skip every parked goal.
++    #
++    # The judge's background-process snapshot already carries the session's pid,
++    # so record it here as a liveness HINT. It is never the release condition
++    # (``is_waiting`` still consults the session's own trigger, which may fire
++    # mid-run without the process exiting) — it exists so a dead barrier is
++    # provable from outside the process that set it.
++    waiting_session_pid: Optional[int] = None
++    # Whether the advanceable-work probe has already been asked about THIS
++    # barrier [bd-dre-n0vpl.4]. Set by the ``wait`` verdict path (which probes
++    # before it parks) and by ``/goal wait`` (a human's explicit instruction is
++    # not second-guessed). False on every row written before the probe existed,
++    # so a park inherited across this change gets exactly one re-examination.
++    waiting_probed: bool = False
++    # Live wait watchers for this goal: the background delegations that OWN the
++    # waits so the loop does not have to [bd-dre-n0vpl.4]. Each entry is
++    # ``{"key", "delegation_id", "spawned_at", "target"}``, keyed by
++    # ``goal_watchers.target_key`` so a goal re-parking on the same job every
++    # turn refreshes nothing and spawns nothing. Empty on every row written
++    # before watchers existed.
++    watchers: List[Dict[str, Any]] = field(default_factory=list)
+     # Optional structured completion contract (outcome / verification /
+     # constraints / boundaries / stop_when). Empty by default; a goal with
+     # no contract behaves exactly like the original free-form goal.
+@@ -1249,6 +1524,17 @@ class GoalState:
+             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
+             waiting_reason=data.get("waiting_reason"),
+             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
++            waiting_session_pid=(
++                int(data["waiting_session_pid"]) if data.get("waiting_session_pid") else None
++            ),
++            waiting_probed=bool(data.get("waiting_probed", False)),
++            # Unusable entries are dropped rather than raising, for the same
++            # reason ``blocked_on`` drops them: one corrupt watcher record must
++            # never make a live goal unloadable.
++            watchers=[
++                w for w in (data.get("watchers") or [])
++                if isinstance(w, dict) and str(w.get("key") or "").strip()
++            ],
+             contract=GoalContract.from_dict(data.get("contract")),
+             gates=[
+                 GoalGate.from_dict(g)
+@@ -1611,6 +1897,30 @@ def _barrier_pid_alive(pid: Optional[int], since: float = 0.0) -> bool:
+     return started <= float(since) + PID_REUSE_TOLERANCE_SECONDS
+ 
+ 
++def _session_pid_from_snapshot(
++    session_id: str, background_processes: Optional[List[Dict[str, Any]]]
++) -> Optional[int]:
++    """Pull a watched session's pid out of the judge's own snapshot.
++
++    The snapshot the judge was shown (``gather_background_processes`` →
++    ``process_registry.list_sessions``) already carries ``pid`` for every running
++    session, so recording it costs nothing. It becomes
++    ``GoalState.waiting_session_pid`` — the liveness hint that lets the resume
++    supervisor prove a dead session barrier from outside this process.
++    """
++    if not session_id or not background_processes:
++        return None
++    for entry in background_processes:
++        if not isinstance(entry, dict) or entry.get("session_id") != session_id:
++            continue
++        try:
++            pid = int(entry.get("pid") or 0)
++        except (TypeError, ValueError):
++            return None
++        return pid if pid > 0 else None
++    return None
++
++
+ def _session_waiting(session_id: str) -> bool:
+     """Whether a goal parked on a process_registry session should stay parked.
+ 
+@@ -2234,6 +2544,176 @@ def judge_goal_resilient(
+     return (*result, attempts)
+ 
+ 
++# ──────────────────────────────────────────────────────────────────────
++# probe_advanceable_work — see the prompt block above for the rationale
++# ──────────────────────────────────────────────────────────────────────
++
++_QUOTE_NOISE_RE = re.compile(r"[^a-z0-9]+")
++
++
++def _normalize_for_quote_match(text: str) -> str:
++    """Collapse a string to lowercase alphanumerics for substring matching.
++
++    Quote verification must survive the model reflowing whitespace, swapping a
++    hyphen for an en-dash, or dropping a trailing comma — none of which make a
++    quote fabricated. It must NOT survive the model writing different words,
++    which is what fabrication looks like.
++    """
++    return _QUOTE_NOISE_RE.sub("", (text or "").lower())
++
++
++def _verify_quoted_items(
++    items: Any, haystacks: List[str]
++) -> Tuple[List[Dict[str, str]], List[str]]:
++    """Keep only probe items whose quote really appears in the source texts.
++
++    Returns ``(kept, dropped_reasons)``. This is the deterministic anti-fabrication
++    filter: an item is admissible only when a human could point at the sentence in
++    the goal, the criteria, or the agent's own report that asks for it.
++    """
++    kept: List[Dict[str, str]] = []
++    dropped: List[str] = []
++    if not isinstance(items, list):
++        return kept, ["probe returned a non-list 'items'"]
++    corpus = _normalize_for_quote_match("\n".join(h for h in haystacks if h))
++    seen: set = set()
++    for raw in items:
++        if len(kept) >= _PROBE_MAX_ITEMS:
++            dropped.append(f"more than {_PROBE_MAX_ITEMS} items — extras ignored")
++            break
++        if not isinstance(raw, dict):
++            dropped.append("item was not an object")
++            continue
++        work = str(raw.get("work") or raw.get("item") or "").strip()
++        quote = str(raw.get("quote") or "").strip()
++        if not work:
++            dropped.append("item had no 'work'")
++            continue
++        low = work.lower()
++        if any(re.search(p, low) for p in _PROBE_REJECT_PATTERNS):
++            dropped.append(f"{work[:60]!r}: it IS the wait, restated")
++            continue
++        norm_quote = _normalize_for_quote_match(quote)
++        if len(norm_quote) < _PROBE_MIN_QUOTE_CHARS:
++            dropped.append(f"{work[:60]!r}: quote too short to prove anything")
++            continue
++        if norm_quote not in corpus:
++            dropped.append(f"{work[:60]!r}: quote is not in the goal or the report")
++            continue
++        key = _normalize_for_quote_match(work)[:80]
++        if key in seen:
++            dropped.append(f"{work[:60]!r}: duplicate")
++            continue
++        seen.add(key)
++        kept.append({"work": _truncate(work, 200), "quote": _truncate(quote, 200)})
++    return kept, dropped
++
++
++def probe_advanceable_work(
++    goal: str,
++    last_response: str,
++    *,
++    waiting_on: str,
++    reason: str = "",
++    subgoals: Optional[List[str]] = None,
++    contract: Optional[GoalContract] = None,
++    timeout: Optional[float] = None,
++) -> Tuple[List[Dict[str, str]], str]:
++    """Is the park about to happen actually the agent's only option?
++
++    Returns ``(verified_items, note)``. A NON-EMPTY list means the park is wrong:
++    there is work, already named by the user or by the agent itself, that does not
++    depend on the wait.
++
++    ⛔ EVERY failure mode returns ``([], why)`` — no aux client, transport error,
++    unparseable reply, an honest NONE, or every item failing quote verification.
++    The park is the safe answer, and it is what the loop does today, so a broken
++    probe can only ever cost the fix, never correctness.
++
++    This costs one small auxiliary call on the ~6% of turns that reach a WAIT
++    verdict (14 of 244 measured verdicts), on the SAME ``goal_judge`` task and the
++    same control-plane priority lane the judge already rides — so it introduces no
++    new model, no new route, and no new config surface. There is no fallback
++    model: an unreachable route parks the goal, exactly as before.
++    """
++    goal_text = (goal or "").strip()
++    response = (last_response or "").strip()
++    if not goal_text or not response:
++        return [], "no goal text or no response to read work out of"
++
++    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
++    criteria_parts: List[str] = []
++    if contract is not None and not contract.is_empty():
++        criteria_parts.append(contract.render_block())
++    if clean_subgoals:
++        criteria_parts.append(
++            "\n".join(f"- {i}. {t}" for i, t in enumerate(clean_subgoals, start=1))
++        )
++    criteria = "\n".join(criteria_parts)
++    criteria_block = f"Its criteria:\n{_truncate(criteria, 2500)}\n\n" if criteria else ""
++
++    try:
++        from agent.auxiliary_client import call_llm
++    except Exception as exc:
++        logger.debug("advanceable-work probe: auxiliary client unavailable: %s", exc)
++        return [], f"probe unavailable ({type(exc).__name__})"
++
++    prompt = ADVANCEABLE_WORK_PROBE_USER_TEMPLATE.format(
++        goal=_truncate(goal_text, 2000),
++        criteria_block=criteria_block,
++        response=_truncate(response, _JUDGE_RESPONSE_SNIPPET_CHARS),
++        waiting_on=_truncate(waiting_on or "a long-running job", 200),
++        reason=_truncate(reason or "(no reason recorded)", 400),
++    )
++    try:
++        with _control_plane_priority():
++            resp = call_llm(
++                task="goal_judge",
++                messages=[
++                    {"role": "system", "content": ADVANCEABLE_WORK_PROBE_SYSTEM_PROMPT},
++                    {"role": "user", "content": prompt},
++                ],
++                temperature=0,
++                max_tokens=_goal_judge_max_tokens(),
++                timeout=judge_timeout_seconds() if timeout is None else timeout,
++            )
++    except Exception as exc:
++        logger.info(
++            "advanceable-work probe: call failed (%s) — the park stands", exc
++        )
++        return [], f"probe call failed ({type(exc).__name__})"
++
++    try:
++        raw = resp.choices[0].message.content or ""
++    except Exception:
++        raw = ""
++    data = _extract_json_object(raw)
++    if not isinstance(data, dict):
++        return [], "probe reply was not usable JSON"
++
++    kept, dropped = _verify_quoted_items(
++        data.get("items"),
++        [goal_text, criteria, response],
++    )
++    probe_reason = _truncate(str(data.get("reason") or "").strip(), 200)
++    if dropped:
++        logger.info(
++            "advanceable-work probe: dropped %d unverifiable item(s): %s",
++            len(dropped), "; ".join(dropped[:4]),
++        )
++    if not kept:
++        return [], (
++            f"nothing else is advanceable ({probe_reason or 'probe returned none'})"
++            if not dropped
++            else f"no item survived quote verification ({len(dropped)} dropped)"
++        )
++    logger.info(
++        "advanceable-work probe: %d verified item(s) — the park is WRONG: %s",
++        len(kept), "; ".join(i["work"][:60] for i in kept),
++    )
++    return kept, probe_reason
++
++
+ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+     """Return the live background-process snapshot for the goal judge.
+ 
+@@ -2522,6 +3002,8 @@ class GoalManager:
+         self._state.waiting_until = 0.0
+         self._state.waiting_reason = None
+         self._state.waiting_since = 0.0
++        self._state.waiting_session_pid = None
++        self._state.waiting_probed = False
+         self._state.blocked_on = []
+         save_goal(self.session_id, self._state)
+         return self._state
+@@ -2538,6 +3020,8 @@ class GoalManager:
+         self._state.waiting_until = 0.0
+         self._state.waiting_reason = None
+         self._state.waiting_since = 0.0
++        self._state.waiting_session_pid = None
++        self._state.waiting_probed = False
+         self._state.blocked_on = []
+         # ⛔ Clear the judge-health counters too [bd-dre-6rpvx]. Without this a
+         # goal resumed after a route-unreachable pause came back already at the
+@@ -2791,10 +3275,14 @@ class GoalManager:
+         self._state.waiting_until = 0.0
+         self._state.waiting_reason = (reason or "").strip() or None
+         self._state.waiting_since = time.time()
++        self._state.waiting_session_pid = None
++        self._state.waiting_probed = False
+         save_goal(self.session_id, self._state)
+         return self._state
+ 
+-    def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
++    def wait_on_session(
++        self, session_id: str, reason: str = "", *, observed_pid: Optional[int] = None
++    ) -> GoalState:
+         """Park the goal loop on a process_registry session's OWN trigger.
+ 
+         Unlike ``wait_on`` (which releases only on PID exit), this releases
+@@ -2802,6 +3290,12 @@ class GoalManager:
+         with ``watch_patterns`` — its pattern matches. This is the right
+         barrier for a long-lived watcher/server/poller that signals mid-run
+         and may never exit. Requires an active goal.
++
++        ``observed_pid`` is a LIVENESS HINT only, recorded so an out-of-process
++        observer can prove a dead barrier (see ``GoalState.waiting_session_pid``
++        and ``barrier_looks_dead``). It never becomes the release condition —
++        a watch-pattern session releases while its process is still alive, so
++        promoting the hint to a barrier would un-park a goal early.
+         """
+         if self._state is None or self._state.status != "active":
+             raise RuntimeError("no active goal to park")
+@@ -2813,6 +3307,11 @@ class GoalManager:
+         self._state.waiting_until = 0.0
+         self._state.waiting_reason = (reason or "").strip() or None
+         self._state.waiting_since = time.time()
++        try:
++            hint = int(observed_pid) if observed_pid else None
++        except (TypeError, ValueError):
++            hint = None
++        self._state.waiting_session_pid = hint if (hint or 0) > 0 else None
+         save_goal(self.session_id, self._state)
+         return self._state
+ 
+@@ -2834,9 +3333,29 @@ class GoalManager:
+         self._state.waiting_until = time.time() + seconds
+         self._state.waiting_reason = (reason or "").strip() or None
+         self._state.waiting_since = time.time()
++        self._state.waiting_session_pid = None
++        self._state.waiting_probed = False
+         save_goal(self.session_id, self._state)
+         return self._state
+ 
++    def mark_wait_probed(self) -> bool:
++        """Record that this barrier's park has already been justified.
++
++        Two callers, for two different kinds of justification [bd-dre-n0vpl.4]:
++        the ``wait`` path, which just ran the advanceable-work probe and got
++        nothing; and ``/goal wait``, where the justification is that a HUMAN
++        asked for the park — an instruction the loop does not second-guess.
++        Without this the ``is_waiting()`` short-circuit would re-probe the same
++        barrier on every tick, spending aux calls to re-derive a settled answer.
++        """
++        if self._state is None:
++            return False
++        if self._state.waiting_probed:
++            return False
++        self._state.waiting_probed = True
++        save_goal(self.session_id, self._state)
++        return True
++
+     def stop_waiting(self) -> bool:
+         """Clear every barrier — whole-goal (pid / session / time) AND
+         per-item. Returns True if anything was cleared.
+@@ -2860,6 +3379,8 @@ class GoalManager:
+         self._state.waiting_until = 0.0
+         self._state.waiting_reason = None
+         self._state.waiting_since = 0.0
++        self._state.waiting_session_pid = None
++        self._state.waiting_probed = False
+         self._state.blocked_on = []
+         save_goal(self.session_id, self._state)
+         return True
+@@ -2872,10 +3393,24 @@ class GoalManager:
+         barrier: active until the deadline passes. Side effect: a satisfied
+         barrier is cleared here (lazy auto-clear) so the next evaluation
+         resumes normal judging.
++
++        A barrier older than ``DEFAULT_GOAL_BARRIER_MAX_SECONDS`` is released
++        regardless of its kind [bd-dre-n0vpl.4]: an un-ceilinged whole-goal barrier
++        made a ``wait`` on a job that never exits an unbounded stop. Same rule as
++        ``reconcile_barriers``, so the two cannot disagree about "parked".
+         """
+         s = self._state
+         if s is None:
+             return False
++        if barrier_past_ceiling(s):
++            if s.waiting_on_pid or s.waiting_on_session or s.waiting_until:
++                logger.info(
++                    "goal loop: releasing a wait barrier past its age ceiling "
++                    "(session=%s, reason=%s)",
++                    self.session_id, _truncate(s.waiting_reason or "", 100),
++                )
++                self.stop_waiting()
++            return False
+         if s.waiting_on_session is not None:
+             if _session_waiting(s.waiting_on_session):
+                 return True
+@@ -3103,6 +3638,251 @@ class GoalManager:
+         self.wait_for_seconds(remaining, reason=reason)
+         return f"{remaining}s"
+ 
++    # --- delegating the wait instead of parking on it -----------------
++    #
++    # ⛔ THE THIRD SHAPE OF "A GOAL LOOP THAT STOPS WHEN IT SHOULD CONTINUE"
++    # [bd-dre-n0vpl.4], after the interrupt-provenance and false-`done` defects in
++    # 6a428aa / 92dff5f. Andre, 2026-09-30: "problem is it parks goals rather
++    # than assigning goals/loops to subagents, while keeping itself as active as
++    # possible, too."
++    #
++    # A park is now the LAST resort rather than the first response to a wait. The
++    # two things that change:
++    #   1. someone else owns the wait — a background watcher, dispatched onto the
++    #      async-delegation rail (hermes_cli.goal_watchers), which reports the
++    #      job's outcome back into this session as a fresh turn;
++    #   2. the loop keeps working whenever the advanceable-work probe can prove,
++    #      by quotation, that there is something else to move.
++    #
++    # When there is genuinely nothing else, PARKING IS STILL CORRECT AND STILL
++    # HAPPENS. That is not a concession — a goal poked into busy-work costs the
++    # budget and hides the real gate. The watcher is spawned either way, so a
++    # correct park is no longer a dead end: the watcher's completion is what wakes
++    # the loop up.
++
++    def active_watchers(self) -> List[Dict[str, Any]]:
++        """Live wait watchers, pruning any whose job is done or which have aged out.
++
++        Lazy prune with persistence, exactly like ``active_blocked_items``. The
++        prune is what keeps the per-goal ceiling meaningful: without it the first
++        two waits of a long goal would consume both slots forever.
++        """
++        s = self._state
++        if s is None or not s.watchers:
++            return []
++        try:
++            from hermes_cli.goal_watchers import watcher_max_seconds
++            ceiling = watcher_max_seconds()
++        except Exception:
++            ceiling = 3600.0
++        terminal = self._finished_delegation_ids()
++        now = time.time()
++        kept: List[Dict[str, Any]] = []
++        for w in s.watchers:
++            if not isinstance(w, dict):
++                continue
++            try:
++                spawned = float(w.get("spawned_at") or 0.0)
++            except (TypeError, ValueError):
++                spawned = 0.0
++            # Generous: a watcher holds its slot for its own ceiling plus the
++            # same again, so a slow completion delivery does not free a slot the
++            # watcher is still using.
++            if spawned and (now - spawned) > (ceiling * 2):
++                continue
++            if terminal is not None and str(w.get("delegation_id") or "") in terminal:
++                continue
++            kept.append(w)
++        if len(kept) != len(s.watchers):
++            s.watchers = kept
++            save_goal(self.session_id, s)
++        return list(kept)
++
++    @staticmethod
++    def _finished_delegation_ids() -> Optional[set]:
++        """Delegation ids the async registry no longer counts as in flight.
++
++        ``None`` when the registry cannot be read — in which case the age bound
++        is the only prune, which is the safe direction (a watcher slot is held a
++        little too long rather than double-spawned).
++        """
++        try:
++            from tools.async_delegation import list_async_delegations
++
++            records = list_async_delegations() or []
++        except Exception:
++            return None
++        return {
++            str(r.get("delegation_id"))
++            for r in records
++            if isinstance(r, dict)
++            and str(r.get("status") or "") not in ("running", "stalling", "finalizing")
++        }
++
++    def _spawn_wait_watcher(
++        self,
++        *,
++        session_id: Optional[str],
++        pid: Optional[int],
++        until: Optional[float],
++        reason: str,
++    ) -> Dict[str, Any]:
++        """Hand this wait to a background watcher. Never raises.
++
++        Records the watcher on the goal state so the de-dup key and the per-goal
++        ceiling survive a restart. Returns the watcher module's own result dict,
++        whose ``reason`` explains any refusal.
++        """
++        s = self._state
++        if s is None:
++            return {"status": "skipped", "reason": "no goal state"}
++        try:
++            from hermes_cli import goal_watchers
++        except Exception as exc:  # noqa: BLE001
++            logger.debug("goal loop: watcher module unavailable: %s", exc)
++            return {"status": "skipped", "reason": f"watchers unavailable ({exc})"}
++        live = self.active_watchers()
++        try:
++            result = goal_watchers.spawn_wait_watcher(
++                goal_session_id=self.session_id,
++                goal_text=s.goal,
++                reason=reason,
++                session_id=session_id,
++                pid=pid,
++                until=until,
++                since=s.waiting_since or time.time(),
++                existing_keys=[str(w.get("key") or "") for w in live],
++                live_watchers=len(live),
++            )
++        except Exception as exc:  # noqa: BLE001 - a failed watcher never stops a goal
++            logger.debug("goal loop: watcher spawn raised: %s", exc)
++            return {"status": "skipped", "reason": f"spawn raised ({exc})"}
++        if result.get("status") == "dispatched":
++            s.watchers = list(live) + [{
++                "key": result.get("target_key") or "",
++                "delegation_id": result.get("delegation_id") or "",
++                "target": result.get("target") or "",
++                "spawned_at": time.time(),
++            }]
++            save_goal(self.session_id, s)
++        else:
++            logger.info(
++                "goal loop: the wait was NOT delegated (%s)", result.get("reason")
++            )
++        return result
++
++    def _maybe_delegate_the_wait(
++        self,
++        *,
++        last_response: str,
++        session_id: Optional[str],
++        pid: Optional[int],
++        until: Optional[float],
++        seconds: Optional[int],
++        target: str,
++        reason: str,
++        item_label: Optional[str] = None,
++    ) -> Optional[Dict[str, Any]]:
++        """Try to keep working instead of parking. ``None`` means: park.
++
++        Order matters. The watcher is spawned FIRST, unconditionally, because it
++        is useful in both outcomes — and because a park with a watcher on it is
++        strictly better than today's park with nothing on it. Only then is the
++        probe consulted about whether the park is needed at all.
++
++        When the probe verifies other work, the whole-goal park is replaced by an
++        ITEM barrier on the waited-on thing: the same mechanism the ``defer``
++        verdict uses, so the agent is told exactly what is off-limits and every
++        existing release/prune path applies unchanged.
++        """
++        s = self._state
++        if s is None:
++            return None
++
++        watcher = self._spawn_wait_watcher(
++            session_id=session_id, pid=pid, until=until, reason=reason,
++        )
++        if watcher.get("status") == "dispatched":
++            watcher_note = (
++                f"a background watcher ({watcher.get('delegation_id')}) owns that "
++                f"wait now and will report its outcome back into this session"
++            )
++        else:
++            watcher_note = (
++                "nothing else is watching it, so check its status ONCE per turn "
++                "(one status line, no blocking poller) as you work"
++            )
++
++        items, probe_note = probe_advanceable_work(
++            s.goal,
++            last_response,
++            waiting_on=target,
++            reason=reason,
++            subgoals=s.subgoals or None,
++            contract=s.contract if s.has_contract() else None,
++        )
++        if not items:
++            # The park is correct. Say so with the evidence, so a wrong park is
++            # debuggable from the log rather than from a state record.
++            logger.info(
++                "goal loop: parking on %s is correct — %s (session=%s)",
++                target, probe_note, self.session_id,
++            )
++            return None
++
++        # Record the wait as an ITEM barrier and keep going.
++        label = (item_label or "").strip() or f"the job at {target}"
++        try:
++            self.block_item(
++                label,
++                pid=pid,
++                session_id=session_id,
++                seconds=seconds,
++                reason=reason,
++                subgoal_index=self._resolve_subgoal_index(label),
++            )
++        except Exception as exc:  # noqa: BLE001
++            # Without an item barrier the agent could be re-poked straight back
++            # onto the thing it is waiting on. Park rather than risk that.
++            logger.debug("goal loop: could not record the wait as an item: %s", exc)
++            return None
++
++        work_block = "\n".join(
++            f"- {i}. {it['work']}" for i, it in enumerate(items, start=1)
++        )
++        prompt = CONTINUATION_WAIT_DELEGATED_TEMPLATE.format(
++            goal=s.goal,
++            waiting_on=target,
++            watcher_note=watcher_note,
++            work_block=work_block,
++        ) + "\n\n" + NO_BLOCKING_POLLER_GUIDANCE
++        s.last_verdict = "defer"
++        s.last_reason = (
++            f"{reason} — the wait on {target} was delegated; "
++            f"{len(items)} other item(s) remain open"
++        )
++        save_goal(self.session_id, s)
++        logger.info(
++            "goal loop: DID NOT park on %s — the wait is delegated and %d verified "
++            "item(s) are still advanceable (session=%s)",
++            target, len(items), self.session_id,
++        )
++        return {
++            "status": "active",
++            "should_continue": True,
++            "continuation_prompt": prompt,
++            "verdict": "defer",
++            "reason": s.last_reason,
++            "message": (
++                f"↻ Goal continuing — the wait on {target} is delegated "
++                f"({watcher.get('status')}), {len(items)} other item(s) still open: "
++                f"{'; '.join(it['work'][:48] for it in items[:3])}"
++            ),
++            "delegated_wait": True,
++            "advanceable_items": items,
++            "watcher": watcher,
++        }
++
+     # --- the main entry point called after every turn -----------------
+ 
+     def evaluate_after_turn(
+@@ -3162,6 +3942,53 @@ class GoalManager:
+                 remaining = max(0, int(state.waiting_until - time.time()))
+                 tgt = f"{remaining}s remaining"
+             reason = state.waiting_reason or tgt
++
++            # ⛔ THIS IS THE LINE ANDRE SAW [bd-dre-n0vpl.4]:
++            #   "⏳ Goal parked — waiting on session proc_0a1b2c3d4e5f: … the
++            #    running index_pass2 job, which the agent is waiting on."
++            # A barrier reaching here has normally already been probed by the
++            # ``wait`` branch below, which only parks when nothing else is
++            # advanceable. A barrier that has NOT been probed — one set before
++            # this mechanism existed, or by any future path that parks without
++            # asking — gets exactly one probe here, so a pre-existing wrong park
++            # is not immortal. A barrier a HUMAN set with ``/goal wait`` is marked
++            # probed at the source: that is an instruction, not a guess.
++            if not state.waiting_probed and str(last_response or "").strip():
++                state.waiting_probed = True
++                save_goal(self.session_id, state)
++                decision = self._maybe_delegate_the_wait(
++                    last_response=last_response,
++                    session_id=state.waiting_on_session,
++                    pid=state.waiting_on_pid,
++                    until=state.waiting_until or None,
++                    seconds=None,
++                    target=tgt,
++                    reason=reason,
++                )
++                if decision is not None:
++                    # Un-parked: drop the whole-goal barrier (the wait is now an
++                    # item barrier recorded by _maybe_delegate_the_wait) and let
++                    # the loop fire on the remaining work.
++                    self._state.waiting_on_pid = None
++                    self._state.waiting_on_session = None
++                    self._state.waiting_until = 0.0
++                    self._state.waiting_reason = None
++                    self._state.waiting_since = 0.0
++                    self._state.waiting_session_pid = None
++                    self._state.waiting_probed = False
++                    save_goal(self.session_id, self._state)
++                    return decision
++            else:
++                # Parked and staying parked — but make sure SOMEONE owns the
++                # wait. This costs no model call, and it is what turns a correct
++                # park from a dead end into a wait that wakes the loop up when it
++                # finishes. Idempotent: deduped on the barrier's target key.
++                self._spawn_wait_watcher(
++                    session_id=state.waiting_on_session,
++                    pid=state.waiting_on_pid,
++                    until=state.waiting_until or None,
++                    reason=reason,
++                )
+             return {
+                 "status": "active",
+                 "should_continue": False,
+@@ -3262,21 +4089,74 @@ class GoalManager:
+         state.last_reason = reason
+ 
+         # WAIT verdict: the judge decided the agent is blocked on async work
+-        # and re-poking now would be busy-work. Set the barrier and park —
+-        # the turn we just counted stands (the judge call happened), but no
+-        # continuation fires. The loop resumes automatically when the pid
+-        # exits or the deadline passes (next evaluate_after_turn falls through
+-        # the is_waiting() short-circuit once the barrier clears).
++        # and re-poking now would be busy-work.
++        #
++        # ⛔ A WAIT IS NO LONGER A PARK BY DEFAULT [bd-dre-n0vpl.4]. Before the
++        # barrier goes on, the wait is handed to a background watcher and the
++        # advanceable-work probe is asked whether the agent really has nothing
++        # else. When it can prove otherwise — by quoting the goal or the agent's
++        # own report — the loop KEEPS WORKING with the wait recorded as an item
++        # barrier instead. When it cannot, the park happens exactly as it always
++        # did: the turn we just counted stands (the judge call happened) and no
++        # continuation fires. The loop then resumes when the barrier clears, when
++        # the watcher's completion forges a turn, or on the age ceiling.
++        if verdict == "wait" and wait_directive:
++            w_session = (
++                str(wait_directive["session_id"]) if wait_directive.get("session_id") else None
++            )
++            w_pid = int(wait_directive["pid"]) if wait_directive.get("pid") else None
++            w_seconds = (
++                int(wait_directive["seconds"])
++                if (not w_session and not w_pid and wait_directive.get("seconds"))
++                else None
++            )
++            if w_session:
++                tgt = f"session {w_session}"
++            elif w_pid:
++                tgt = f"pid {w_pid}"
++            elif w_seconds:
++                tgt = f"{w_seconds}s"
++            else:
++                # Defensive: ``_parse_judge_response`` already degrades a
++                # targetless wait to continue, so this is unreachable today. If a
++                # future parse change lets one through, keep working rather than
++                # park on nothing — the failure direction the whole module takes.
++                logger.warning(
++                    "goal loop: a wait verdict reached the park path with no "
++                    "release condition — continuing instead (session=%s)",
++                    self.session_id,
++                )
++                verdict = "continue"
++                state.last_verdict = "continue"
++                wait_directive = None
++
+         if verdict == "wait" and wait_directive:
+-            if wait_directive.get("session_id"):
+-                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
+-                tgt = f"session {wait_directive['session_id']}"
+-            elif wait_directive.get("pid"):
+-                self.wait_on(int(wait_directive["pid"]), reason=reason)
+-                tgt = f"pid {wait_directive['pid']}"
++            delegated = self._maybe_delegate_the_wait(
++                last_response=last_response,
++                session_id=w_session,
++                pid=w_pid,
++                until=(time.time() + w_seconds) if w_seconds else None,
++                seconds=w_seconds,
++                target=tgt,
++                reason=reason,
++                item_label=str(wait_directive.get("item") or "").strip() or None,
++            )
++            if delegated is not None:
++                return delegated
++
++            # Nothing else is advanceable — park, as designed.
++            if w_session:
++                self.wait_on_session(
++                    w_session, reason=reason,
++                    observed_pid=_session_pid_from_snapshot(w_session, background_processes),
++                )
++            elif w_pid:
++                self.wait_on(w_pid, reason=reason)
+             else:
+-                self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason)
+-                tgt = f"{wait_directive['seconds']}s"
++                self.wait_for_seconds(w_seconds, reason=reason)
++            # The probe has spoken for THIS barrier; don't re-spend an aux call
++            # on it from the is_waiting() short-circuit.
++            self.mark_wait_probed()
+             return {
+                 "status": "active",
+                 "should_continue": False,
+@@ -3302,7 +4182,21 @@ class GoalManager:
+                 # Every known item of this goal now carries a barrier, so
+                 # there is genuinely nothing left to work on: escalate to a
+                 # whole-goal park on this item's release condition.
++                #
++                # This escalation is much better evidenced than a bare ``wait``
++                # (every enumerated subgoal demonstrably carries its own
++                # barrier), so the probe is NOT re-run here — it would be asking
++                # a language model to overrule a deterministic count. But the
++                # wait still gets an owner, so the park wakes the loop when the
++                # job lands [bd-dre-n0vpl.4].
+                 tgt = self._park_on_item(deferred_item, reason)
++                self._spawn_wait_watcher(
++                    session_id=deferred_item.session_id,
++                    pid=deferred_item.pid,
++                    until=deferred_item.until or None,
++                    reason=reason,
++                )
++                self.mark_wait_probed()
+                 return {
+                     "status": "active",
+                     "should_continue": False,
+@@ -3729,4 +4623,12 @@ __all__ = [
+     "BLOCKED_PAUSE_MARKER",
+     "blocked_paused_reason",
+     "is_blocked_pause",
++    # Delegating the wait instead of parking on it [bd-dre-n0vpl.4].
++    "DEFAULT_GOAL_BARRIER_MAX_SECONDS",
++    "ADVANCEABLE_WORK_PROBE_SYSTEM_PROMPT",
++    "ADVANCEABLE_WORK_PROBE_USER_TEMPLATE",
++    "CONTINUATION_WAIT_DELEGATED_TEMPLATE",
++    "probe_advanceable_work",
++    "barrier_past_ceiling",
++    "barrier_looks_dead",
+ ]
+diff --git a/tests/hermes_cli/test_goal_wait_is_delegated.py b/tests/hermes_cli/test_goal_wait_is_delegated.py
+new file mode 100644
+index 0000000..6e4b980
+--- /dev/null
++++ b/tests/hermes_cli/test_goal_wait_is_delegated.py
+@@ -0,0 +1,932 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""A goal delegates the wait; it does not park itself on it [bd-dre-n0vpl.4].
++
++⛔ THE PROBLEM THIS EXISTS FOR. Andre, 2026-09-30, watching it happen:
++*"you shouldn't park your goals; you should have subagents processing their own
++goals so you can continue grinding while waiting"* and *"problem is it parks
++goals rather than assigning goals/loops to subagents, while keeping itself as
++active as possible, too."*
++
++The park below is VERBATIM from his pane, and the state record behind it was read
++live out of ``~/.hermes/profiles/architect/state.db`` at 19:20 ET:
++
++    goal:20260929_125951_bbbbbb
++      status=active  turns=1/400  last_verdict=wait
++      waiting_on_session=proc_0a1b2c3d4e5f   age=1131s
++      subgoals=0     blocked_on=0
++
++399 turns unspent, on a turn whose own report named GPU packing work, queued rows
++and an ACK'd workflow split with a peer session.
++
++This is the third shape of "a goal loop that stops when it should continue",
++after the interrupt-provenance and false-``done`` defects in 6a428aa / 92dff5f.
++It must COMPOSE with those, so the tests here also assert what must NOT change:
++a park with nothing else to advance is still correct and still happens, a human's
++``/goal wait`` is not second-guessed, and no path may spawn unbounded watchers.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++import uuid
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++
++# ──────────────────────────────────────────────────────────────────────
++# The measured park, verbatim
++# ──────────────────────────────────────────────────────────────────────
++
++#: The session id the goal was parked on.
++MEASURED_BARRIER_SESSION = "proc_0a1b2c3d4e5f"
++
++#: ``waiting_reason`` exactly as stored in the state record.
++MEASURED_WAIT_REASON = (
++    "The goal is not complete because the final v8 cut and ranking "
++    "scoring depend on the running index_pass2 job, which the agent is "
++    "waiting on."
++)
++
++MEASURED_GOAL = (
++    "Take the batch re-index campaign to a v8 cut: finish GPU packing "
++    "for the queued rows, keep the ACK'd workflow split with the peer session "
++    "moving, land the ranking pass once pass 2 lands, and write the final "
++    "v8 cut."
++)
++
++#: The shape of the turn report that preceded the park: productive, and naming
++#: work that has nothing to do with index_pass2.
++MEASURED_RESPONSE = (
++    "This turn: finished GPU packing for 14 of the queued rows and queued the "
++    "remaining 6. The ACK'd workflow split with the peer session is confirmed "
++    "on both sides. index_pass2 is still running as session "
++    f"{MEASURED_BARRIER_SESSION}, so the final v8 cut and ranking "
++    "scoring depend on it and I am waiting on that."
++)
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    """Isolated HERMES_HOME — these tests must never touch production state."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    from hermes_cli import goals
++
++    goals._DB_CACHE.clear()
++    yield home
++    goals._DB_CACHE.clear()
++
++
++def _function_code(name: str) -> str:
++    """CODE of one ``goal_watchers`` function — docstrings and comments stripped.
++
++    These source-shape assertions are about what the function CALLS. Scanning raw
++    text matched the docstring that explains which calls are forbidden, so the
++    test passed only while the prose was absent.
++    """
++    import ast
++    import io
++    import tokenize
++
++    from hermes_cli import goal_watchers as _gw
++
++    tree = ast.parse(Path(_gw.__file__).read_text(encoding="utf-8"))
++    for node in ast.walk(tree):
++        if isinstance(node, ast.FunctionDef) and node.name == name:
++            body = list(node.body)
++            if (body and isinstance(body[0], ast.Expr)
++                    and isinstance(body[0].value, ast.Constant)
++                    and isinstance(body[0].value.value, str)):
++                body = body[1:]      # drop the docstring
++            src = "\n".join(ast.unparse(stmt) for stmt in body)
++            # ast.unparse already drops comments; tokenize round-trip is belt and
++            # braces for any future string-literal weirdness.
++            return src
++    raise AssertionError(f"{name} not found in goal_watchers")
++
++
++def _running_job():
++    """Read barrier state under the same "the job is still running" premise."""
++    return patch("hermes_cli.goals._session_waiting", return_value=True)
++
++
++def _mgr(goal=MEASURED_GOAL, *, max_turns=400, subgoals=()):
++    from hermes_cli.goals import GoalManager
++
++    m = GoalManager(session_id=f"sid-{uuid.uuid4().hex}", default_max_turns=max_turns)
++    m.set(goal)
++    for s in subgoals:
++        m.add_subgoal(s)
++    return m
++
++
++def _aux_reply(payload) -> SimpleNamespace:
++    text = payload if isinstance(payload, str) else json.dumps(payload)
++    return SimpleNamespace(
++        choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
++    )
++
++
++class _Dispatches(list):
++    """Records every ``dispatch_async_delegation`` call the watcher path makes."""
++
++    def __call__(self, **kwargs):
++        self.append(kwargs)
++        return {"status": "dispatched", "delegation_id": f"deleg_{len(self):08x}"}
++
++
++@pytest.fixture
++def dispatched(monkeypatch):
++    """Capture watcher dispatches instead of spawning real background threads."""
++    import tools.async_delegation as ad
++    from hermes_cli import goal_watchers
++    from gateway import session_context
++
++    calls = _Dispatches()
++    monkeypatch.setattr(ad, "dispatch_async_delegation", calls)
++    monkeypatch.setattr(goal_watchers, "_async_headroom", lambda: (True, ""))
++    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
++    return calls
++
++
++def _drive(mgr, *, probe, response=MEASURED_RESPONSE, directive=None,
++           verdict="wait", reason=MEASURED_WAIT_REASON, background=None):
++    """Run the REAL ``evaluate_after_turn`` with only the two network calls stubbed.
++
++    ``judge_goal`` is the judge boundary; ``agent.auxiliary_client.call_llm`` is
++    the probe boundary. Everything between them — the parse, the quote
++    verification, the barrier bookkeeping, the watcher dispatch — is production
++    code.
++    """
++    import agent.auxiliary_client as aux
++
++    if directive is None:
++        directive = {"session_id": MEASURED_BARRIER_SESSION}
++    # ⛔ process_registry persists NOTHING, so in a test an unknown session id
++    # reads as "not waiting" and the barrier would auto-clear before any
++    # assertion could see it. Every test here premises a job that is STILL
++    # RUNNING, which is what this patch states.
++    with patch("hermes_cli.goals._session_waiting", return_value=True), patch(
++        "hermes_cli.goals.judge_goal",
++        return_value=(verdict, reason, False, directive, False),
++    ), patch.object(aux, "call_llm", lambda **kw: _aux_reply(probe)):
++        return mgr.evaluate_after_turn(
++            response, user_initiated=True, background_processes=background,
++        )
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 1. THE REGRESSION: the measured park must not happen
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestTheMeasuredParkDoesNotHappen:
++
++    PROBE_WITH_WORK = {
++        "items": [
++            {"work": "Finish GPU packing for the remaining queued rows",
++             "quote": "finish GPU packing for the queued rows"},
++            {"work": "Keep the ACK'd workflow split with the peer session moving",
++             "quote": "keep the ACK'd workflow split with the peer session"},
++        ],
++        "reason": "two lanes do not depend on index_pass2",
++    }
++
++    def test_the_goal_does_not_go_idle_when_other_work_exists(
++        self, hermes_home, dispatched
++    ):
++        """⛔ THE REGRESSION TEST FOR ANDRE'S PANE.
++
++            ⏳ Goal parked — waiting on session proc_0a1b2c3d4e5f: The goal is
++               not complete because the final v8 cut and the ranking pass
++               depend on the running index_pass2 job…
++            ↻ Loop: next in 30m.
++
++        Same goal, same judge verdict, same turn report. The goal must NOT be
++        parked and must NOT be idle: a continuation has to be queued.
++        """
++        mgr = _mgr()
++        decision = _drive(mgr, probe=self.PROBE_WITH_WORK)
++
++        assert decision["should_continue"] is True, (
++            "one long-running job must not take the whole goal off the road "
++            "while other work is open — that is 30 minutes of idle per tick"
++        )
++        assert decision["continuation_prompt"], "idle means no continuation queued"
++        assert decision["verdict"] == "defer"
++        assert decision["status"] == "active"
++
++        # No whole-goal barrier: nothing can quiesce the loop.
++        assert mgr.state.waiting_on_session is None
++        assert mgr.state.waiting_on_pid is None
++        assert not mgr.state.waiting_until
++        with _running_job():
++            assert mgr.is_waiting() is False
++
++            # The wait is recorded as an ITEM barrier instead, so the agent knows
++            # what is off-limits without the goal stopping.
++            items = mgr.active_blocked_items()
++            assert len(items) == 1
++            assert items[0].session_id == MEASURED_BARRIER_SESSION
++
++    def test_the_continuation_names_the_work_and_forbids_polling(
++        self, hermes_home, dispatched
++    ):
++        """An un-parked goal that is not TOLD what to advance will just report
++        that it is waiting again, and the next judge call re-parks it."""
++        mgr = _mgr()
++        prompt = _drive(mgr, probe=self.PROBE_WITH_WORK)["continuation_prompt"]
++
++        assert "GPU packing" in prompt
++        assert "workflow split" in prompt
++        assert MEASURED_BARRIER_SESSION in prompt
++        low = prompt.lower()
++        assert "do not poll" in low
++        assert "do not wait on it" in low
++        # The standing anti-poller guidance rides along, as on every other
++        # continuation, because it survives context compaction only by repetition.
++        assert "polling rule" in low
++
++    def test_the_wait_is_handed_to_a_watcher(self, hermes_home, dispatched):
++        """'you should have subagents processing their own goals' — someone other
++        than the parent has to own the wait."""
++        mgr = _mgr()
++        _drive(mgr, probe=self.PROBE_WITH_WORK)
++
++        assert len(dispatched) == 1, "exactly one watcher for one wait"
++        assert MEASURED_BARRIER_SESSION in dispatched[0]["goal"]
++        assert mgr.state.watchers and (
++            mgr.state.watchers[0]["key"] == f"session:{MEASURED_BARRIER_SESSION}"
++        )
++
++    def test_a_turn_is_still_counted(self, hermes_home, dispatched):
++        """The judge call happened, so the turn stands — un-parking must not
++        quietly make turns free, which would defeat the budget."""
++        mgr = _mgr()
++        before = mgr.state.turns_used
++        _drive(mgr, probe=self.PROBE_WITH_WORK)
++        assert mgr.state.turns_used == before + 1
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 2. A park that is still CORRECT stays parked
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestACorrectParkStaysParked:
++
++    NOTHING_ELSE = {"items": [], "reason": "every remaining item needs pass 2's output"}
++
++    def test_nothing_advanceable_still_parks(self, hermes_home, dispatched):
++        """⛔ This is NOT a concession. A goal poked into busy-work spends the
++        budget AND hides the real gate. When the probe honestly finds nothing,
++        parking is the right answer and must survive this change."""
++        mgr = _mgr()
++        decision = _drive(mgr, probe=self.NOTHING_ELSE)
++
++        assert decision["should_continue"] is False
++        assert decision["verdict"] == "wait"
++        assert decision["continuation_prompt"] is None
++        assert mgr.state.waiting_on_session == MEASURED_BARRIER_SESSION
++        with _running_job():
++            assert mgr.is_waiting() is True
++            assert not mgr.active_blocked_items()
++
++    def test_a_correct_park_still_gets_a_watcher(self, hermes_home, dispatched):
++        """A park with a watcher on it is strictly better than a park with
++        nothing: the watcher's completion forges the turn that un-parks it."""
++        mgr = _mgr()
++        _drive(mgr, probe=self.NOTHING_ELSE)
++        assert len(dispatched) == 1
++
++    def test_the_park_is_not_re_probed_every_tick(self, hermes_home, dispatched):
++        """The probe has spoken for this barrier. Re-asking on every /loop tick
++        would spend aux calls re-deriving a settled answer."""
++        import agent.auxiliary_client as aux
++
++        mgr = _mgr()
++        _drive(mgr, probe=self.NOTHING_ELSE)
++        assert mgr.state.waiting_probed is True
++
++        calls = []
++
++        def _boom(**kw):
++            calls.append(kw)
++            raise AssertionError("the probe must not run again for this barrier")
++
++        with _running_job(), patch.object(aux, "call_llm", _boom):
++            again = mgr.evaluate_after_turn("still working", user_initiated=True)
++        assert calls == []
++        assert again["verdict"] == "waiting"
++        assert again["should_continue"] is False
++
++    @pytest.mark.parametrize("probe", [
++        "not json at all",
++        {"items": "not a list"},
++        {"reason": "no items key"},
++        {},
++    ])
++    def test_an_unusable_probe_parks(self, hermes_home, dispatched, probe):
++        """⛔ EVERY failure direction is the park. A broken probe can only ever
++        cost the fix, never correctness."""
++        mgr = _mgr()
++        decision = _drive(mgr, probe=probe)
++        assert decision["should_continue"] is False
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++    def test_an_unreachable_probe_parks(self, hermes_home, dispatched):
++        """There is no fallback model for this call — an unreachable route parks
++        the goal, exactly as before."""
++        import agent.auxiliary_client as aux
++
++        def _down(**kw):
++            raise RuntimeError("Cannot connect to host 127.0.0.1:8011")
++
++        mgr = _mgr()
++        with _running_job(), patch(
++            "hermes_cli.goals.judge_goal",
++            return_value=("wait", MEASURED_WAIT_REASON, False,
++                          {"session_id": MEASURED_BARRIER_SESSION}, False),
++        ), patch.object(aux, "call_llm", _down):
++            decision = mgr.evaluate_after_turn(MEASURED_RESPONSE, user_initiated=True)
++        assert decision["should_continue"] is False
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 3. The probe may not INVENT work — the quote filter
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestTheProbeCannotFabricateWork:
++    """⛔ Asking a model 'is there anything else to do?' reliably produces
++    something. Busy-work would be strictly worse than the park. So every item
++    must quote the goal, the criteria, or the agent's own report — verified in
++    code, not requested in a prompt."""
++
++    def test_an_item_with_an_unfindable_quote_is_dropped(self, hermes_home, dispatched):
++        mgr = _mgr()
++        decision = _drive(mgr, probe={"items": [
++            {"work": "Write a comprehensive integration test suite",
++             "quote": "the goal requires comprehensive integration tests"},
++        ], "reason": "plenty to do"})
++        assert decision["should_continue"] is False, (
++            "an item whose quote is nowhere in the goal or the report is "
++            "fabricated, and a fabricated item must not overturn a park"
++        )
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++    def test_a_quote_too_short_to_prove_anything_is_dropped(self, hermes_home, dispatched):
++        mgr = _mgr()
++        decision = _drive(mgr, probe={"items": [
++            {"work": "Tidy up the repo", "quote": "the"},
++        ]})
++        assert decision["should_continue"] is False
++
++    def test_an_item_with_no_quote_at_all_is_dropped(self, hermes_home, dispatched):
++        mgr = _mgr()
++        decision = _drive(mgr, probe={"items": [{"work": "Update the docs"}]})
++        assert decision["should_continue"] is False
++
++    @pytest.mark.parametrize("work", [
++        "Poll index_pass2 until it finishes",
++        "Monitor the index_pass2 job",
++        "Wait for index_pass2 to finish",
++        "Check on the index_pass2 job",
++        "Run the ranking pass once it finishes",
++        "Write the v8 cut when the job is done",
++    ])
++    def test_the_wait_restated_is_not_other_work(self, hermes_home, dispatched, work):
++        """These all quote the goal verbatim, so the quote filter passes them.
++        They are still the wait wearing a different hat, and accepting one would
++        re-poke the agent onto the exact thing it cannot speed up."""
++        mgr = _mgr()
++        decision = _drive(mgr, probe={"items": [
++            {"work": work, "quote": "the ranking pass once pass 2 lands"},
++        ]})
++        assert decision["should_continue"] is False, work
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++    def test_a_quote_survives_reflowed_whitespace_and_punctuation(self, hermes_home,
++                                                                 dispatched):
++        """Verification must not be so brittle that a reflowed newline reads as
++        fabrication — that would make the whole mechanism inert."""
++        mgr = _mgr()
++        decision = _drive(mgr, probe={"items": [
++            {"work": "Finish GPU packing for the queued rows",
++             "quote": "finish   GPU-packing,\nfor the queued rows!"},
++        ]})
++        assert decision["should_continue"] is True
++
++    def test_more_than_five_items_is_a_probe_that_is_planning(self, hermes_home,
++                                                              dispatched):
++        """A park overturned by a dozen next steps is a probe writing a plan.
++        Only the first five are admitted."""
++        from hermes_cli.goals import _PROBE_MAX_ITEMS, _verify_quoted_items
++
++        items = [
++            {"work": f"Step {i} on GPU packing", "quote": "finish GPU packing"}
++            for i in range(12)
++        ]
++        kept, dropped = _verify_quoted_items(items, [MEASURED_GOAL])
++        assert len(kept) <= _PROBE_MAX_ITEMS
++        assert any("more than" in d for d in dropped)
++
++    def test_duplicate_items_collapse(self, hermes_home):
++        from hermes_cli.goals import _verify_quoted_items
++
++        kept, _ = _verify_quoted_items([
++            {"work": "Finish GPU packing", "quote": "finish GPU packing"},
++            {"work": "finish gpu packing", "quote": "finish GPU packing"},
++        ], [MEASURED_GOAL])
++        assert len(kept) == 1
++
++    def test_the_probe_prompt_says_none_is_a_right_answer(self):
++        """A prompt that only rewards finding work will find work."""
++        from hermes_cli.goals import ADVANCEABLE_WORK_PROBE_SYSTEM_PROMPT as P
++
++        low = P.lower()
++        assert "none is a" in low and "correct" in low
++        assert "verbatim" in low
++        assert "do not paraphrase" in low
++        assert "quote" in low
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 4. The watcher is CHEAP — the pool is shared
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestTheWatcherIsCheap:
++    """GPU0's KV pool is shared with Andre's other main session, and a prior
++    agent measured wasted prefill per call rising from 2,622 tokens with no
++    contention to 114,385 with five other in-flight requests. A watcher that
++    reasoned about its job would pay that per poll, forever, to answer a
++    boolean."""
++
++    def test_the_watcher_makes_no_model_call_at_all(self, hermes_home):
++        """The strongest possible form of 'small context': none."""
++        import agent.auxiliary_client as aux
++        from hermes_cli import goal_watchers
++
++        def _boom(**kw):
++            raise AssertionError("a watcher must never call a model")
++
++        with patch.object(aux, "call_llm", _boom):
++            result = goal_watchers.run_watch_loop(
++                session_id=None, pid=None, until=time.time() - 1, since=time.time(),
++                reason="a deadline that has already passed", goal_text="g",
++            )
++        assert result["status"] == "completed"
++        assert result["api_calls"] == 0
++        assert result["released"] is True
++
++    def test_the_dispatch_carries_no_toolset_and_no_model(self, hermes_home,
++                                                          dispatched):
++        """A watcher does not need the full toolset or a 300K context."""
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []})
++        call = dispatched[0]
++        assert call["toolsets"] == []
++        assert call["model"] is None
++        assert call["role"] == "goal_wait_watcher"
++
++    def test_the_dispatch_arms_no_stale_monitor(self, hermes_home, dispatched):
++        """⛔ The stale monitor marks a delegation stuck on a FROZEN progress
++        token, and a watcher's token is frozen by design because it makes no api
++        calls. Passing one would get every watcher killed as stalled."""
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []})
++        assert dispatched[0].get("progress_fn") is None
++
++    def test_the_watcher_runs_at_child_priority_not_control_plane(self, hermes_home):
++        """The goal judge stays at 100. A watcher is a child: PRIORITY_NORMAL.
++        Promoting one would re-create the starvation the broker warns about."""
++        from agent import pool_broker
++        from agent.delegation_context import delegated_child_context
++
++        with delegated_child_context():
++            assert pool_broker.current_priority() == pool_broker.PRIORITY_NORMAL
++        assert pool_broker.PRIORITY_CONTROL_PLANE == 100
++        assert pool_broker.PRIORITY_NORMAL < pool_broker.PRIORITY_CONTROL_PLANE
++
++    def test_the_watcher_body_enters_the_child_context(self, hermes_home, dispatched):
++        """So that any incidental GPU0 call from a watcher is tagged as a child
++        rather than inheriting the parent's interactive 100."""
++        from agent import pool_broker
++        from hermes_cli import goal_watchers
++
++        seen = {}
++        monkey_loop = lambda **kw: (                      # noqa: E731
++            seen.setdefault("priority", pool_broker.current_priority()),
++            {"status": "completed", "summary": "", "api_calls": 0,
++             "duration_seconds": 0.0},
++        )[1]
++        with patch.object(goal_watchers, "run_watch_loop", monkey_loop):
++            mgr = _mgr()
++            _drive(mgr, probe={"items": []})
++            dispatched[0]["runner"]()
++        assert seen["priority"] == pool_broker.PRIORITY_NORMAL
++
++    def test_the_watcher_has_a_hard_wall_clock_ceiling(self, hermes_home):
++        """A job that never finishes must not yield a watcher that never exits."""
++        from hermes_cli import goal_watchers
++
++        clock = {"t": 1000.0}
++        result = goal_watchers.run_watch_loop(
++            session_id=None, pid=None, until=clock["t"] + 10 ** 9,
++            since=clock["t"], reason="an endless job", goal_text="g",
++            poll_seconds=5.0, max_seconds=60.0,
++            sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + s),
++            now_fn=lambda: clock["t"],
++        )
++        assert result["released"] is False
++        assert "STILL" in result["summary"]
++        assert clock["t"] - 1000.0 <= 60.0 + 5.0
++
++    def test_the_watcher_observes_without_consuming(self, hermes_home):
++        """⛔ ``process_registry.poll()``/``read_log()`` mark a session
++        poll-observed / completion-consumed, which SUPPRESSES the registry's own
++        completion turn. A watcher that used them would silence the very
++        notification the parent still needs if its report fails to deliver."""
++        body = _function_code("_outcome_snapshot")
++        assert "list_sessions" in body
++        assert ".poll(" not in body, (
++            "poll() marks the session poll-observed and suppresses the "
++            "registry's own completion turn"
++        )
++        assert "read_log" not in body
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 5. No path may spawn unbounded watchers
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestWatchersAreBounded:
++
++    def test_the_same_target_is_never_watched_twice(self, hermes_home, dispatched):
++        """The judge rewords its reason every turn; the de-dup key is the TARGET,
++        so a goal re-parking on the same job spawns nothing."""
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []}, reason="reason one")
++        assert len(dispatched) == 1
++        mgr.stop_waiting()
++        _drive(mgr, probe={"items": []}, reason="a completely different wording")
++        assert len(dispatched) == 1, "same session id — one watcher, forever"
++
++    def test_a_per_goal_ceiling_caps_live_watchers(self, hermes_home, dispatched,
++                                                  monkeypatch):
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "max_wait_watchers", lambda: 2)
++        # Nothing ever finishes, so slots are never freed.
++        monkeypatch.setattr(
++            "hermes_cli.goals.GoalManager._finished_delegation_ids",
++            staticmethod(lambda: set()),
++        )
++        mgr = _mgr()
++        for n in range(5):
++            mgr.stop_waiting()
++            _drive(mgr, probe={"items": []},
++                   directive={"session_id": f"proc_target_{n}"})
++        assert len(dispatched) == 2, "the ceiling is the ceiling"
++        assert len(mgr.state.watchers) == 2
++
++    def test_max_wait_watchers_zero_disables_them(self, hermes_home, dispatched,
++                                                  monkeypatch):
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "max_wait_watchers", lambda: 0)
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []})
++        assert dispatched == []
++        # And the goal still parks correctly with no watcher.
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++    def test_a_watcher_never_takes_the_last_async_slot(self, hermes_home,
++                                                       monkeypatch):
++        """⛔ Watchers share delegation.max_concurrent_children with real
++        subagents. Letting one take the final slot would mean the parent,
++        freshly un-parked and told to get on with other work, could not dispatch
++        the subagent it needs — trading one stall for another."""
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "_async_headroom",
++                            goal_watchers._async_headroom)
++        with patch("tools.async_delegation.active_count", return_value=3), \
++             patch("tools.delegate_tool._get_max_async_children", return_value=4):
++            ok, why = goal_watchers._async_headroom()
++        assert ok is False and "last" in why
++        with patch("tools.async_delegation.active_count", return_value=0), \
++             patch("tools.delegate_tool._get_max_async_children", return_value=1):
++            ok, why = goal_watchers._async_headroom()
++        assert ok is False, "a cap of 1 has no slot to spare"
++        with patch("tools.async_delegation.active_count", return_value=1), \
++             patch("tools.delegate_tool._get_max_async_children", return_value=4):
++            ok, _ = goal_watchers._async_headroom()
++        assert ok is True
++
++    def test_a_session_that_cannot_receive_a_turn_gets_no_watcher(self, hermes_home,
++                                                                  monkeypatch):
++        """A watcher whose report can never be delivered is worse than none: the
++        wait would look delegated and be owned by nobody."""
++        from gateway import session_context
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "_async_headroom", lambda: (True, ""))
++        monkeypatch.setattr(session_context, "async_delivery_supported", lambda: False)
++        out = goal_watchers.spawn_wait_watcher(
++            goal_session_id="sid", goal_text="g", reason="r",
++            session_id=MEASURED_BARRIER_SESSION,
++        )
++        assert out["status"] == "skipped"
++        assert "later turn" in out["reason"]
++
++    def test_the_spawn_pause_kill_switch_covers_watchers(self, hermes_home,
++                                                         monkeypatch):
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "_async_headroom", lambda: (True, ""))
++        with patch("tools.delegate_tool.is_spawn_paused", return_value=True):
++            out = goal_watchers.spawn_wait_watcher(
++                goal_session_id="sid", goal_text="g", reason="r", pid=1,
++            )
++        assert out["status"] == "skipped" and "paused" in out["reason"]
++
++    def test_a_failing_watcher_never_stops_a_goal(self, hermes_home, monkeypatch):
++        """The watcher is an improvement to a park, not a precondition for one."""
++        from hermes_cli import goal_watchers
++
++        monkeypatch.setattr(goal_watchers, "_async_headroom", lambda: (True, ""))
++        monkeypatch.setattr(
++            "gateway.session_context.async_delivery_supported", lambda: True)
++        with patch("tools.async_delegation.dispatch_async_delegation",
++                   side_effect=RuntimeError("executor is gone")):
++            mgr = _mgr()
++            decision = _drive(mgr, probe={"items": []})
++        assert decision["verdict"] == "wait"
++        with _running_job():
++            assert mgr.is_waiting() is True
++
++    def test_a_finished_watcher_frees_its_slot(self, hermes_home, dispatched,
++                                              monkeypatch):
++        """Without the prune the first two waits of a long goal would hold both
++        slots forever, and the ceiling would silently become 'no watchers'."""
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []})
++        assert len(mgr.state.watchers) == 1
++        done = mgr.state.watchers[0]["delegation_id"]
++        monkeypatch.setattr(
++            "hermes_cli.goals.GoalManager._finished_delegation_ids",
++            staticmethod(lambda: {done}),
++        )
++        assert mgr.active_watchers() == []
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 6. The whole-goal barrier finally has a ceiling
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestTheBarrierHasACeiling:
++    """Item barriers have carried an age ceiling since they existed, because "a
++    process that never exits can never permanently remove an item from the
++    agent's work set". The WHOLE-GOAL barrier — which removes the whole goal —
++    had none, and the resume supervisor skipped parked goals, so a ``wait`` on an
++    endless job was an unbounded stop with no backstop."""
++
++    def test_a_barrier_past_the_ceiling_is_released(self, hermes_home):
++        from hermes_cli.goals import DEFAULT_GOAL_BARRIER_MAX_SECONDS as CEIL
++
++        mgr = _mgr()
++        mgr.wait_on_session(MEASURED_BARRIER_SESSION, reason=MEASURED_WAIT_REASON)
++        mgr.state.waiting_since = time.time() - (CEIL + 60)
++        assert mgr.is_waiting() is False
++        assert mgr.state.waiting_on_session is None
++
++    def test_a_fresh_barrier_is_not_past_the_ceiling(self, hermes_home):
++        mgr = _mgr()
++        mgr.wait_on(1, reason="r")
++        mgr.state.waiting_since = time.time()
++        assert mgr.state.waiting_since > 0
++
++    def test_an_unknown_barrier_age_is_not_old_age(self, hermes_home):
++        """Same reading the supervisor gives a missing ``last_turn_at``: a
++        missing timestamp is unknown age, and treating it as infinite would
++        un-park every barrier written before the field existed."""
++        from hermes_cli.goals import barrier_past_ceiling
++
++        assert barrier_past_ceiling({"waiting_on_session": "p", "waiting_since": 0}) is False
++        assert barrier_past_ceiling({"waiting_on_session": "p"}) is False
++
++    def test_reconcile_and_is_waiting_agree_about_the_ceiling(self, hermes_home):
++        """They read the same barrier through two code paths; a disagreement
++        would make 'parked' depend on which one ran last."""
++        from hermes_cli.goals import GoalState, reconcile_barriers
++
++        old = time.time() - (3600 * 4)
++        state = GoalState(goal="g", waiting_on_session="proc_x", waiting_since=old)
++        assert reconcile_barriers(state) is True
++        assert state.waiting_on_session is None
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 7. What must NOT change
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestComposesWithWhatIsAlreadyLanded:
++
++    def test_a_human_goal_wait_is_never_second_guessed(self, hermes_home):
++        """⛔ ``/goal wait`` is an instruction. The probe exists to overturn the
++        JUDGE's parks, never Andre's."""
++        mgr = _mgr()
++        mgr.wait_on(1, reason="I want this parked")
++        assert mgr.mark_wait_probed() is True
++        assert mgr.state.waiting_probed is True
++
++    def test_the_all_items_blocked_escalation_still_parks(self, hermes_home,
++                                                          dispatched):
++        """A deterministic count of 'every enumerated subgoal carries a barrier'
++        outranks the probe — that escalation is better evidenced than any model
++        opinion, so it parks without re-asking (but still gets a watcher)."""
++        import agent.auxiliary_client as aux
++
++        mgr = _mgr(subgoals=("ship the v8 cut",))
++        with patch(
++            "hermes_cli.goals.judge_goal",
++            return_value=("defer", MEASURED_WAIT_REASON, False,
++                          {"item": "ship the v8 cut", "subgoal": 1,
++                           "session_id": MEASURED_BARRIER_SESSION}, False),
++        ), _running_job(), patch.object(
++            aux, "call_llm", lambda **kw: pytest.fail("must not probe this path")):
++            decision = mgr.evaluate_after_turn(MEASURED_RESPONSE, user_initiated=True)
++        assert decision["should_continue"] is False
++        assert decision["verdict"] == "wait"
++        with _running_job():
++            assert mgr.is_waiting() is True
++        assert len(dispatched) == 1
++
++    def test_a_blocked_verdict_still_pauses_for_a_human(self, hermes_home,
++                                                         dispatched):
++        """bd-dre-df78a's contract: a decision only a human can make stops the
++        goal, and no machine may auto-resume it. Nothing here weakens that."""
++        from hermes_cli.goals import is_blocked_pause
++
++        mgr = _mgr()
++        decision = _drive(
++            mgr, verdict="blocked", directive=None,
++            reason="needs the ArchiveHub login from you", probe={"items": []},
++        )
++        assert decision["status"] == "paused"
++        assert is_blocked_pause(mgr.state.paused_reason) is True
++
++    def test_a_defer_with_other_work_is_unchanged(self, hermes_home, dispatched):
++        """The DEFER path already kept the loop working and must not start
++        paying for a probe it does not need."""
++        import agent.auxiliary_client as aux
++
++        mgr = _mgr()
++        with patch(
++            "hermes_cli.goals.judge_goal",
++            return_value=("defer", "pass 2 is running", False,
++                          {"item": "the ranking pass",
++                           "session_id": MEASURED_BARRIER_SESSION}, False),
++        ), _running_job(), patch.object(
++            aux, "call_llm", lambda **kw: pytest.fail("defer must not probe")):
++            decision = mgr.evaluate_after_turn(MEASURED_RESPONSE, user_initiated=True)
++        assert decision["should_continue"] is True
++        assert decision["verdict"] == "defer"
++        assert dispatched == []
++
++    def test_the_judge_prompt_warns_that_wait_gets_overruled(self):
++        """A judge that thinks WAIT means 'the important thing is blocked' will
++        keep emitting it. Tell it what actually happens."""
++        from hermes_cli.goals import JUDGE_SYSTEM_PROMPT
++
++        low = JUDGE_SYSTEM_PROMPT.lower()
++        assert "expect to be overruled" in low
++        assert "becomes a defer" in low
++
++    def test_the_session_pid_hint_is_recorded_from_the_judge_snapshot(
++        self, hermes_home, dispatched
++    ):
++        """The hint is what lets the resume supervisor prove a dead session
++        barrier from outside the process holding it."""
++        mgr = _mgr()
++        _drive(mgr, probe={"items": []}, background=[
++            {"session_id": MEASURED_BARRIER_SESSION, "pid": 4242, "status": "running"},
++        ])
++        assert mgr.state.waiting_session_pid == 4242
++
++    def test_the_hint_is_never_the_release_condition(self, hermes_home):
++        """⛔ A watch-pattern session releases while its process is still ALIVE.
++        Promoting the hint to a barrier would un-park a goal early."""
++        import os
++
++        mgr = _mgr()
++        mgr.wait_on_session("proc_x", reason="r", observed_pid=os.getpid())
++        with patch("hermes_cli.goals._session_waiting", return_value=False):
++            assert mgr.is_waiting() is False, (
++                "the session's own trigger decides, not the pid hint"
++            )
++
++    def test_the_watcher_and_the_barrier_share_one_release_predicate(self):
++        """A watcher that reports 'done' while the loop stays parked is worse
++        than no watcher. Both must read the same function."""
++        body = _function_code("barrier_released")
++        assert "_session_waiting" in body
++        assert "_barrier_pid_alive" in body
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 8. A park inherited across this change gets one re-examination
++# ──────────────────────────────────────────────────────────────────────
++
++
++def test_a_pre_existing_unprobed_park_is_re_examined(hermes_home, dispatched):
++    """The live architect record was ``waiting_on_session=proc_0a1b2c3d4e5f`` with
++    no ``waiting_probed`` field at all. A wrong park must not be immortal just
++    because it predates the probe."""
++    mgr = _mgr()
++    mgr.wait_on_session(MEASURED_BARRIER_SESSION, reason=MEASURED_WAIT_REASON)
++    assert mgr.state.waiting_probed is False
++
++    import agent.auxiliary_client as aux
++
++    with patch("hermes_cli.goals._session_waiting", return_value=True), \
++         patch.object(aux, "call_llm", lambda **kw: _aux_reply({"items": [
++             {"work": "Finish GPU packing for the queued rows",
++              "quote": "finish GPU packing for the queued rows"},
++         ]})):
++        decision = mgr.evaluate_after_turn(MEASURED_RESPONSE, user_initiated=True)
++
++    assert decision["should_continue"] is True
++    assert mgr.state.waiting_on_session is None
++    with _running_job():
++        assert mgr.active_blocked_items()
++
++
++def test_an_unprobed_park_with_nothing_else_stays_parked_and_gets_a_watcher(
++    hermes_home, dispatched
++):
++    mgr = _mgr()
++    mgr.wait_on_session(MEASURED_BARRIER_SESSION, reason=MEASURED_WAIT_REASON)
++
++    import agent.auxiliary_client as aux
++
++    with patch("hermes_cli.goals._session_waiting", return_value=True), \
++         patch.object(aux, "call_llm", lambda **kw: _aux_reply({"items": []})):
++        decision = mgr.evaluate_after_turn(MEASURED_RESPONSE, user_initiated=True)
++
++    assert decision["should_continue"] is False
++    assert decision["verdict"] == "waiting"
++    assert mgr.state.waiting_on_session == MEASURED_BARRIER_SESSION
++    assert len(dispatched) == 1
++
++
++# ──────────────────────────────── the report has to actually arrive
++
++
++def test_the_dispatch_carries_a_routable_session_key(hermes_home, dispatched):
++    """⛔ THE DELIVERY DEFECT. cli.py::_owns_process_notification compares the
++    event's session_key to the CLI's own session_id and FAILS CLOSED on an empty
++    one. get_current_session_key() resolves EMPTY on the CLI (the approval
++    contextvar is only bound during gateway/TUI turns and HERMES_SESSION_KEY is
++    not in the CLI environment), so a watcher dispatched with that alone would
++    have its report queued forever — the "owned by nobody" failure the
++    delivery-support check exists to prevent. delegate_task stamps
++    parent_agent.session_id for the same reason; a watcher has no parent_agent,
++    so it stamps the goal's session id, which IS that durable id."""
++    mgr = _mgr()
++    _drive(mgr, probe={"items": []})
++    assert dispatched[0]["session_key"] == mgr.session_id
++    assert dispatched[0]["parent_session_id"] == mgr.session_id
++
++
++def test_no_routable_session_key_means_no_watcher(hermes_home, monkeypatch):
++    """Better to say the wait was not delegated than to promise a report nobody
++    can claim."""
++    from hermes_cli import goal_watchers
++
++    monkeypatch.setattr(goal_watchers, "_async_headroom", lambda: (True, ""))
++    monkeypatch.setattr(
++        "gateway.session_context.async_delivery_supported", lambda: True)
++    with patch("tools.approval.get_current_session_key", return_value=""):
++        out = goal_watchers.spawn_wait_watcher(
++            goal_session_id="", goal_text="g", reason="r", pid=1,
++        )
++    assert out["status"] == "skipped"
++    assert "routable session key" in out["reason"]
+diff --git a/tests/tools/test_goal_resume_supervisor.py b/tests/tools/test_goal_resume_supervisor.py
+index efc19dd..121127b 100644
+--- a/tests/tools/test_goal_resume_supervisor.py
++++ b/tests/tools/test_goal_resume_supervisor.py
+@@ -8,6 +8,7 @@ mid-turn, guess between two candidate panes, or retry forever.
+ from __future__ import annotations
+ 
+ import json
++import os
+ import sqlite3
+ import time
+ 
+@@ -343,7 +344,7 @@ def test_the_only_command_is_goal_resume():
+     """Grep-level guarantee: no other command can be typed into a pane."""
+     assert sup.RESUME_COMMAND == "/goal resume"
+     src = (sup.__file__.replace(".pyc", ".py"))
+-    with open(src) as fh:
++    with open(src, encoding="utf-8") as fh:
+         body = fh.read()
+     assert body.count('"send-keys"') == 2, "send-keys appears only in send_resume"
+ 
+@@ -439,18 +440,33 @@ def test_a_goal_with_no_last_turn_at_is_left_alone(home, sent, monkeypatch):
+     assert _resume_sends(sent) == []
+ 
+ 
+-@pytest.mark.parametrize("parked", [
+-    {"waiting_on_pid": 4242},
+-    {"waiting_on_session": "20260930_030303_cccccc"},
+-    {"waiting_until": time.time() + 3600},
+-])
+-def test_a_parked_goal_is_not_stalled(home, sent, monkeypatch, parked):
++# ⛔ Barrier fields are built at RUN time, not collection time. A
++# collection-time ``time.time()`` ages with the session: a full-suite run reached
++# this file ~an hour after collection, every ``waiting_since`` was past the
++# 1-hour barrier ceiling [bd-dre-n0vpl.4], and all three "held" parks read as
++# stale. Parametrize on the KIND; derive the timestamps inside the test.
++@pytest.mark.parametrize("kind", ["live_pid", "session_no_hint", "future_deadline"])
++def test_a_parked_goal_is_not_stalled(home, sent, monkeypatch, kind):
+     """A wait barrier means the loop is waiting exactly as designed, and the
+     barrier will release it. Typing into it would cancel a legitimate park."""
++    now = time.time()
++    parked = {
++        # This pytest process itself: the barrier genuinely holds. (Was the
++        # literal 4242, which does not exist here — a dead pid is now the third
++        # stall class; see test_resumes_a_goal_parked_on_a_dead_pid.)
++        "live_pid": {"waiting_on_pid": os.getpid(), "waiting_since": now},
++        # No pid hint: deadness is NOT provable from outside the holding
++        # process, and an unprovable barrier is left alone.
++        "session_no_hint": {"waiting_on_session": "20260930_030303_cccccc",
++                            "waiting_since": now},
++        "future_deadline": {"waiting_until": now + 3600, "waiting_since": now},
++    }[kind]
+     _seed(home, {STALLED_SID: _active(**parked)})
+     _healthy(monkeypatch)
+     _one_session(monkeypatch, ids=(STALLED_SID,))
+-    assert sup.sweep(settle=0.0)["stalled_active_goals"] == 0
++    report = sup.sweep(settle=0.0)
++    assert report["stalled_active_goals"] == 0
++    assert report["stale_barrier_goals"] == 0
+     assert _resume_sends(sent) == []
+ 
+ 
+@@ -515,3 +531,147 @@ def test_stall_threshold_is_configurable(home, sent, monkeypatch):
+     _one_session(monkeypatch, ids=(STALLED_SID,))
+     assert sup.sweep(settle=0.0, stall_seconds=1200)["stalled_active_goals"] == 0
+     assert sup.sweep(settle=0.0, stall_seconds=120)["stalled_active_goals"] == 1
++
++
++# ──────────────────────────── the THIRD stall class [bd-dre-n0vpl.4]
++#
++# `stalled_active_goals` skips every parked goal, reasoning that "its barrier
++# will release it". That reasoning has one hole: the release is LAZY, inside
++# GoalManager.is_waiting(), which only runs from the post-turn hook — and a
++# parked goal fires no turns. So a goal whose watched job finished sits parked on
++# an already-satisfied barrier with nobody left to notice, which is a total stall
++# wearing the costume of a designed wait.
++
++
++def test_resumes_a_goal_parked_on_a_dead_pid(home, sent, monkeypatch):
++    """The watched process is gone, so the barrier can never release in-process."""
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_pid=4242,          # not a live pid on this box
++        waiting_since=time.time() - 600,
++        waiting_reason="the index_pass2 job",
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stale_barrier_goals"] == 1
++    assert report["resumed"] == 1
++    assert len(_resume_sends(sent)) == 2
++    cand = [c for c in report["candidates"] if c["stall_class"] == "stale-barrier"][0]
++    assert "pid 4242" in cand["why_stale"]
++
++
++def test_resumes_a_goal_whose_barrier_session_process_is_dead(home, sent, monkeypatch):
++    """⛔ THE MEASURED CASE. process_registry persists nothing, so a foreign
++    process asking `is_session_waiting("proc_0a1b2c3d4e5f")` gets False whether
++    the session is live or not — which is why the session id alone can never be
++    the staleness test. The recorded pid HINT is what makes it provable."""
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_session="proc_0a1b2c3d4e5f",
++        waiting_session_pid=4242,     # dead
++        waiting_since=time.time() - 600,
++        waiting_reason=(
++            "the final v8 cut and the ranking pass depend on the running "
++            "index_pass2 job"
++        ),
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stale_barrier_goals"] == 1
++    assert report["resumed"] == 1
++
++
++def test_a_session_barrier_with_a_live_pid_hint_is_left_alone(home, sent, monkeypatch):
++    """The job really is still running. Resuming would clear the barrier and put
++    the agent straight back onto the thing it is waiting for."""
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_session="proc_0a1b2c3d4e5f",
++        waiting_session_pid=os.getpid(),
++        waiting_since=time.time(),
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stale_barrier_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_resumes_a_goal_parked_past_the_barrier_age_ceiling(home, sent, monkeypatch):
++    """A live-but-endless job must not park a goal forever. The age ceiling is
++    the same one GoalManager.is_waiting() applies, so the two cannot disagree."""
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_session="proc_endless",
++        waiting_session_pid=os.getpid(),      # STILL ALIVE
++        waiting_since=time.time() - 7200,     # but parked for two hours
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stale_barrier_goals"] == 1
++    cand = [c for c in report["candidates"] if c["stall_class"] == "stale-barrier"][0]
++    assert "age ceiling" in cand["why_stale"]
++
++
++def test_a_stale_barrier_does_not_race_the_in_process_clear(home, sent, monkeypatch):
++    """A goal that took a turn moments ago is being driven; its own is_waiting()
++    is about to release the barrier without any help from here."""
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_pid=4242,
++        waiting_since=time.time() - 600,
++        last_turn_at=time.time() - 5,
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["stale_barrier_goals"] == 0
++    assert _resume_sends(sent) == []
++    # ...and the grace window is configurable, so the same row resumes once the
++    # turn is old enough to have been the one that parked it.
++    assert sup.sweep(settle=0.0, barrier_grace_seconds=1.0)["stale_barrier_goals"] == 1
++
++
++def test_a_stale_barrier_with_a_spent_budget_is_not_a_stall(home, sent, monkeypatch):
++    _seed(home, {STALLED_SID: _active(
++        waiting_on_pid=4242, waiting_since=time.time() - 600,
++        turns_used=400, max_turns=400,
++    )})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["stale_barrier_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_a_stale_barrier_on_a_paused_goal_is_not_this_class(home, sent, monkeypatch):
++    """⛔ A human pause and a `blocked` verdict still outrank a dead barrier.
++    This class is only ever about goals that say `active`."""
++    goals = sup._import_goals()
++    for reason in ("user-interrupted (Ctrl+C)",
++                   goals.blocked_paused_reason("needs your ArchiveHub login")):
++        _h = home.parent / f"h-{abs(hash(reason))}"
++        _h.mkdir(parents=True, exist_ok=True)
++        monkeypatch.setenv("HERMES_HOME", str(_h))
++        _seed(_h, {STALLED_SID: _active(
++            status="paused", paused_reason=reason,
++            waiting_on_pid=4242, waiting_since=time.time() - 600,
++        )})
++        _healthy(monkeypatch)
++        _one_session(monkeypatch, ids=(STALLED_SID,))
++        report = sup.sweep(settle=0.0)
++        assert report["stale_barrier_goals"] == 0, reason
++        assert report["resumed"] == 0, reason
++    assert _resume_sends(sent) == []
++
++
++def test_the_idle_proof_still_guards_a_stale_barrier_resume(home, sent, monkeypatch):
++    """The third class reuses every downstream refusal unchanged: an unexpired
++    turn lease means a turn is RUNNING, and keystrokes would interrupt it."""
++    _seed(
++        home,
++        {STALLED_SID: _active(waiting_on_pid=4242, waiting_since=time.time() - 600)},
++        lease=(STALLED_SID, "turn", time.time(), time.time() + 300),
++    )
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stale_barrier_goals"] == 1     # detected
++    assert report["resumed"] == 0                 # but never typed into
++    assert _resume_sends(sent) == []
+diff --git a/tools/goal_resume_supervisor.py b/tools/goal_resume_supervisor.py
+index 81fba49..e1e06b9 100644
+--- a/tools/goal_resume_supervisor.py
++++ b/tools/goal_resume_supervisor.py
+@@ -22,7 +22,12 @@ WHAT IT WILL DO, and nothing else:
+       – ``active`` with turns left, no wait barrier, and no goal turn for
+         ``--stall-seconds`` (``stalled_active_goals``) — the class that cost
+         Andre session 20260819_144700_aaaaaa, whose record said ``active`` at
+-        turn 3/400 while the pane sat idle [bd-dre-df78a]
++        turn 3/400 while the pane sat idle [bd-dre-df78a], or
++      – ``active`` and PARKED on a wait barrier that can no longer release it
++        (``stale_barrier_goals`` + ``goals.barrier_looks_dead``) — the watched
++        process is gone, or the barrier is past its age ceiling. The release is
++        lazy and runs only from the post-turn hook, so a parked goal fires no
++        turn and nothing notices its job finished [bd-dre-n0vpl.4]
+   • when the judge route answers a real completion right now
+   • and the owning session is LIVE and IDLE
+   • send exactly the seven characters of ``/goal resume`` plus Enter into that
+@@ -33,7 +38,12 @@ WHAT IT MUST NEVER DO:
+     budget, by a judge PARSE failure, or by a ``blocked`` verdict that needs a
+     human decision (``goals.is_blocked_pause``). Those need a decision or a
+     change no retry can make. Anything it does not positively recognise as one
+-    of the two stall classes is left alone.
++    of the three stall classes is left alone.
++  • resume a goal that is genuinely WAITING. A park whose barrier still holds —
++    and a session barrier whose deadness cannot be proven from outside the
++    holding process — is left alone. ``/goal resume`` clears the wait barrier, so
++    resuming a real wait would put the agent straight back onto the thing it is
++    waiting for.
+   • type into a pane mid-turn. Keystrokes during a turn interrupt it — losing
+     exactly the work this is supposed to protect. Idleness must be proven, not
+     assumed (see ``session_is_idle``): no unexpired turn lease AND a pane whose
+@@ -85,6 +95,14 @@ DEFAULT_PROBE_TIMEOUT_S = 25.0        # judge-route health probe
+ # tolerated before it counts as stalled rather than slow.
+ DEFAULT_STALL_SECONDS = 1200.0        # 20 min of no goal turn = stalled
+ 
++# ⛔ THE THIRD STALL CLASS: PARKED ON A BARRIER THAT CANNOT RELEASE IT
++# [bd-dre-n0vpl.4]. See ``stale_barrier_goals``. Much shorter than the stall
++# threshold above, because there is nothing to wait FOR: the barrier is already
++# provably satisfied, and the only reason for any grace at all is to avoid racing
++# the in-process lazy clear in ``GoalManager.is_waiting()`` when a turn is
++# actively running.
++DEFAULT_BARRIER_GRACE_S = 120.0
++
+ # Composer placeholders and spinner text that mean "this session is doing
+ # something" (cli.py::_get_placeholder, and the streaming wait line). Presence of
+ # ANY of these on the visible pane blocks a send even if the lease looks clear.
+@@ -297,7 +315,11 @@ def stalled_active_goals(
+                 LOG.debug("leave %s alone: turn budget is spent", label)
+                 continue
+ 
+-            # A parked goal is working as designed — never a stall.
++            # A parked goal is working as designed — never a stall. A parked goal
++            # whose barrier can no longer RELEASE it is a different animal and is
++            # handled by ``stale_barrier_goals`` below [bd-dre-n0vpl.4]; keeping the
++            # two classes apart is what stops this one silently resuming a goal
++            # that is waiting exactly as designed.
+             if data.get("waiting_on_pid") or data.get("waiting_on_session"):
+                 LOG.debug("leave %s alone: parked on a wait barrier", label)
+                 continue
+@@ -333,20 +355,146 @@ def stalled_active_goals(
+     return found
+ 
+ 
++def stale_barrier_goals(
++    goals_mod: Any, *, grace_seconds: float = DEFAULT_BARRIER_GRACE_S,
++    now: Optional[float] = None,
++) -> List[Dict[str, Any]]:
++    """Goals PARKED on a barrier that can no longer release them.
++
++    ⛔ THE THIRD STALL CLASS, and the hole the second one deliberately left
++    [bd-dre-n0vpl.4]. ``stalled_active_goals`` skips every parked goal, on the
++    correct reasoning that "its barrier will release it". That reasoning has one
++    hole: the barrier releases LAZILY, inside ``GoalManager.is_waiting()``, which
++    only runs from the post-turn hook — and a parked goal fires no turns. So a
++    goal whose watched job finished sits parked on a satisfied barrier with
++    nobody left to notice, which is a total stall wearing the costume of a
++    designed wait.
++
++    ⛔ The staleness test is ``goals.barrier_looks_dead``, imported rather than
++    re-implemented for the same reason ``is_transport_pause`` is: the loop and
++    the supervisor must agree on what a dead barrier is, or this either misses
++    real stalls or resumes a goal that is genuinely waiting. In particular it is
++    NOT ``process_registry.is_session_waiting`` — that registry is in-memory, so
++    a foreign process asking about a live session gets "unknown → not waiting"
++    and EVERY session barrier would read as dead (measured on
++    ``proc_0a1b2c3d4e5f`` while the architect session was holding it).
++
++    Every uncertainty still resolves to NOT a candidate:
++
++      • a barrier whose deadness cannot be proven from outside the holding
++        process (a session barrier with no pid hint, under the age ceiling) is
++        left alone;
++      • a goal whose budget is spent is finished, not stalled;
++      • a goal that took a turn within ``grace_seconds`` is left alone, so this
++        never races the in-process lazy clear that is about to fix it anyway;
++      • ``paused`` / ``done`` / ``cleared`` are not this class.
++    """
++    ts = time.time() if now is None else now
++    found: List[Dict[str, Any]] = []
++    for profile, db, home in state_dbs():
++        try:
++            con = _connect_ro(db)
++        except Exception as exc:
++            LOG.warning("skip %s (%s): cannot open state.db: %s", profile, db, exc)
++            continue
++        try:
++            rows = con.execute(
++                "SELECT key, value FROM state_meta WHERE key LIKE 'goal:%'"
++            ).fetchall()
++        except Exception as exc:
++            LOG.warning("skip %s: state_meta read failed: %s", profile, exc)
++            continue
++        finally:
++            try:
++                con.close()
++            except Exception:
++                pass
++        for key, value in rows:
++            session_id = str(key)[len("goal:"):]
++            try:
++                data = json.loads(value)
++            except Exception:
++                continue
++            if not isinstance(data, dict) or data.get("status") != "active":
++                continue
++            label = f"{profile}/{session_id}"
++
++            if not (
++                data.get("waiting_on_pid")
++                or data.get("waiting_on_session")
++                or _as_float(data.get("waiting_until"))
++            ):
++                continue  # not parked — stalled_active_goals owns this one
++
++            turns_used = _as_float(data.get("turns_used"))
++            max_turns = _as_float(data.get("max_turns"))
++            if max_turns > 0 and turns_used >= max_turns:
++                LOG.debug("leave %s alone: turn budget is spent", label)
++                continue
++
++            # Don't race the in-process lazy clear: a goal that took a turn
++            # moments ago is being driven, and its own is_waiting() will release
++            # the barrier without any help from here.
++            last_turn_at = _as_float(data.get("last_turn_at"))
++            if last_turn_at > 0 and (ts - last_turn_at) < grace_seconds:
++                LOG.debug("leave %s alone: it took a turn %.0fs ago",
++                          label, ts - last_turn_at)
++                continue
++
++            try:
++                dead, why = goals_mod.barrier_looks_dead(data, now=ts)
++            except Exception as exc:
++                LOG.warning("skip %s: barrier staleness check failed: %s", label, exc)
++                continue
++            if not dead:
++                LOG.debug("leave %s alone: its wait barrier still holds", label)
++                continue
++
++            found.append({
++                "profile": profile,
++                "db": str(db),
++                "profile_home": str(home),
++                "session_id": session_id,
++                "stall_class": "stale-barrier",
++                "paused_reason": (
++                    f"parked but the barrier cannot release it: {why} "
++                    f"({turns_used:.0f}/{max_turns:.0f} turns used)"
++                ),
++                "goal": str(data.get("goal") or "")[:160],
++                "turns_used": data.get("turns_used"),
++                "max_turns": data.get("max_turns"),
++                "barrier": (
++                    data.get("waiting_on_session")
++                    or data.get("waiting_on_pid")
++                    or data.get("waiting_until")
++                ),
++                "barrier_reason": str(data.get("waiting_reason") or "")[:160],
++                "why_stale": why,
++            })
++    return found
++
++
+ def resumable_goals(
+     goals_mod: Any, *, stall_seconds: float = DEFAULT_STALL_SECONDS,
++    barrier_grace_seconds: float = DEFAULT_BARRIER_GRACE_S,
+ ) -> List[Dict[str, Any]]:
+-    """Both stall classes, in one list, each tagged with its ``stall_class``.
++    """All three stall classes, in one list, each tagged with its ``stall_class``.
+ 
+     Everything downstream (rate limiting, route probe, pane ownership, the idle
+-    proof, the single ``/goal resume``) is identical for the two classes — only
+-    the detection differs — so the sweep does not branch on the class.
++    proof, the single ``/goal resume``) is identical for every class — only the
++    detection differs — so the sweep does not branch on the class.
+     """
+     out = list(paused_goals(goals_mod))
+     seen = {(c["profile"], c["session_id"]) for c in out}
+-    for c in stalled_active_goals(goals_mod, stall_seconds=stall_seconds):
+-        if (c["profile"], c["session_id"]) not in seen:
+-            out.append(c)
++    for producer in (
++        lambda: stalled_active_goals(goals_mod, stall_seconds=stall_seconds),
++        lambda: stale_barrier_goals(goals_mod, grace_seconds=barrier_grace_seconds),
++    ):
++        for c in producer():
++            ident = (c["profile"], c["session_id"])
++            if ident not in seen:
++                seen.add(ident)
++                out.append(c)
+     return out
+ 
+ 
+@@ -703,6 +851,7 @@ def sweep(
+     settle: float = DEFAULT_IDLE_SETTLE_S,
+     probe_timeout: float = DEFAULT_PROBE_TIMEOUT_S,
+     stall_seconds: float = DEFAULT_STALL_SECONDS,
++    barrier_grace_seconds: float = DEFAULT_BARRIER_GRACE_S,
+ ) -> Dict[str, Any]:
+     """One pass. Returns a JSON-able report of every goal considered."""
+     goals_mod = _import_goals()
+@@ -710,11 +859,16 @@ def sweep(
+         "at": time.time(), "dry_run": dry_run, "candidates": [], "resumed": 0,
+     }
+ 
+-    candidates = resumable_goals(goals_mod, stall_seconds=stall_seconds)
++    candidates = resumable_goals(
++        goals_mod, stall_seconds=stall_seconds,
++        barrier_grace_seconds=barrier_grace_seconds,
++    )
+     report["paused_transport_goals"] = sum(
+         1 for c in candidates if c.get("stall_class") == "transport-paused")
+     report["stalled_active_goals"] = sum(
+         1 for c in candidates if c.get("stall_class") == "stalled-active")
++    report["stale_barrier_goals"] = sum(
++        1 for c in candidates if c.get("stall_class") == "stale-barrier")
+ 
+     ledger = load_ledger()
+     dirty = False
+@@ -834,6 +988,12 @@ def main(argv: Optional[List[str]] = None) -> int:
+     ap.add_argument("--stall-seconds", type=float, default=DEFAULT_STALL_SECONDS,
+                     help="an ACTIVE goal with no turn for this long counts as "
+                          "stalled (default 1200 = 20 min)")
++    ap.add_argument("--barrier-grace-seconds", type=float,
++                    default=DEFAULT_BARRIER_GRACE_S,
++                    help="a goal PARKED on a provably-released barrier is resumed "
++                         "once it has taken no turn for this long (default 120); "
++                         "the grace only exists so this never races the "
++                         "in-process lazy barrier clear")
+     ap.add_argument("-v", "--verbose", action="store_true")
+     args = ap.parse_args(argv)
+ 
+@@ -854,6 +1014,7 @@ def main(argv: Optional[List[str]] = None) -> int:
+             dry_run=args.dry_run, min_interval=args.min_interval,
+             max_attempts=args.max_attempts, settle=args.settle,
+             probe_timeout=args.probe_timeout, stall_seconds=args.stall_seconds,
++            barrier_grace_seconds=args.barrier_grace_seconds,
+         )
+     except Exception as exc:
+         LOG.exception("sweep failed: %s", exc)
+-- 
+2.43.0

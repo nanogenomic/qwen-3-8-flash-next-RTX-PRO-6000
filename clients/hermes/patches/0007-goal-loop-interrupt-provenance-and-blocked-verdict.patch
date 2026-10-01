@@ -1,0 +1,1670 @@
+From 6a428aa1220b6a40ad12cd1c39c0c21efa8b08ae Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 18:19:07 -0400
+Subject: [PATCH] goal loop: interrupt provenance, a first-class blocked
+ verdict, and a resume that re-arms
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An autonomous goal loop stalled at turn 3 of 400 and stayed stalled. Four
+defects, none of them the one the symptom pointed at.
+
+MEASURED, NOT ASSUMED. The judge returned ZERO `pause` verdicts in 244 logged
+calls (157 continue / 68 defer / 14 wait / 5 done) -- its verdict contract has
+no `pause` at all, so no mid-flight pause can ever have come from a judge
+verdict. The stalled row read paused_reason="user-interrupted (Ctrl+C)" while
+last_verdict="continue". The discriminator against a healthy session is not
+goal text: the stall happened moments after a continuation was injected, and
+nobody touched the keyboard.  [measured]
+
+1. A MACHINE INTERRUPT IS NOT THE HUMAN'S SIGNAL.
+   `_last_turn_interrupted` was True for every interrupt, including a
+   provider-stall circuit breaker and a stream abort on a background thread.
+   Both pause paths labelled those "user-interrupted (Ctrl+C)" -- the one
+   class an auto-resume supervisor is forbidden to touch -- so a transient
+   became a permanent silent stall with 397 turns unspent. Interrupts now
+   carry PROVENANCE: only the four seams a person drives (Ctrl+C, ESC, a
+   message typed mid-turn, a voice interjection) set it, and only those may
+   pause. A machine interrupt keeps the goal ACTIVE, re-arms the
+   continuation, consumes no turn, and does not spend a judge call on an
+   "Operation interrupted" stub. Signal handlers stay machine-provenance
+   deliberately.
+
+2. THE JUDGE WAS INSTRUCTED TO REPORT "BLOCKED" AS DONE.
+   The system prompt said: "The response explains the goal is unachievable /
+   blocked / needs user input (treat this as DONE with reason describing the
+   block)". All five measured `done` verdicts are that shape. That is the
+   retired-at-54-of-400 failure: a multi-part goal closed under a tick over
+   work that had not happened. The instruction is gone; breadth is now
+   explicitly named as never a reason to stop; and `blocked` is a first-class
+   verdict that PAUSES with the human decision named and the remaining budget
+   stated, carrying a marker no machine may auto-resume.
+
+   A deterministic net sits UNDER the prompt and reclassifies a `done` whose
+   own reason describes a block, because a language model is not a parser.
+   The net is built from the five verbatim verdicts, not from invented ones:
+   the exact phrasings are what it has to catch.
+
+3. `/goal resume` DID NOT RESUME.
+   resume() only flipped the status. Continuations are enqueued by a POST-TURN
+   hook and a slash command never runs a turn, so the supervisor found the
+   paused goal, proved the pane idle, sent `/goal resume` -- and the goal sat
+   active and idle. Resume now re-arms the loop, deferring to any queued human
+   message.
+
+4. THE SUPERVISOR GAINS THE STALL CLASS IT WAS BLIND TO.
+   Every check was keyed on status == "paused", so an `active` goal that had
+   silently dropped its continuation -- the exact shape of this stall -- was
+   invisible. stalled_active_goals() catches active + turns left + no barrier
+   + no turn for --stall-seconds (20 min default). Every uncertainty resolves
+   to NOT a candidate: a parked goal, a spent budget and a missing
+   last_turn_at are all left alone. The idle proof (turn lease + busy markers
+   + byte-identical pane) and the rate limit apply unchanged to both classes,
+   so it still cannot type into a live turn.
+
+84 new or updated tests, including a regression test built from the stalled
+session's verbatim judge verdict asserting it does NOT pause. Nothing in this
+patch reaches a running process; it takes effect at the next relaunch.
+
+BASE: the tree left by patch 0006 (see BASELINE.md).
+
+PUBLISHED FORM. The regression corpus in
+tests/hermes_cli/test_goal_judge_never_stops_midflight.py is five production
+judge verdicts, and three of them named a third-party platform and a blocked
+commercial submission. Paraphrasing them would destroy their value -- the
+exact phrasings ARE the evidence the classifier has to catch -- so they are
+SUBSTITUTED with structurally equivalent synthetic strings: the same shape,
+the same trigger words ("blocked pending", "still pending", "upload-ready",
+"login from the owner"), invented subject matter, and an invented platform
+name. The two that carried no third-party subject are verbatim. The
+classifier's own patterns are unchanged, and the test still passes, which is
+the check that the substitution preserved what mattered. Also substituted:
+one session id, in six places; an internal pane reference; and nothing else.
+
+---
+ cli.py                                             |  130 ++++++++-
+ hermes_cli/cli_commands_mixin.py                   |   66 ++++-
+ hermes_cli/goals.py                                |  191 ++++++++++++-
+ tests/cli/test_cli_goal_interrupt.py               |  197 ++++++++++++++
+ tests/cli/test_cli_loop_tick_interrupt.py          |   73 +++++
+ .../test_goal_judge_never_stops_midflight.py       |  291 ++++++++++++++++++++
+ tests/tools/test_goal_resume_supervisor.py         |  139 ++++++++++
+ tools/goal_resume_supervisor.py                    |  169 +++++++++++-
+ 8 files changed, 1219 insertions(+), 37 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index bdc9e5d..90d1bf9 100644
+--- a/cli.py
++++ b/cli.py
+@@ -5688,6 +5688,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         # don't auto-queue another continuation on top of a user-cancelled
+         # turn (which would make Ctrl+C feel like it did nothing).
+         self._last_turn_interrupted = False
++        # ⛔ INTERRUPT PROVENANCE [bd-dre-df78a]. `_last_turn_interrupted` is
++        # True for EVERY interrupt, including ones no human asked for: the
++        # provider-stall breaker (chat_completion_helpers.
++        # _record_interrupted_provider_wait), a `stream_interrupt_abort` on a
++        # bg-review thread, a SIGTERM/SIGHUP, a lost cron claim, a cancelled
++        # delegation. The goal/loop pause paths used to treat all of them as
++        # "user-interrupted (Ctrl+C)", which mislabels a transient as Andre's
++        # deliberate stop — and a human pause is exactly the class
++        # hermes-goal-resume-supervisor must never auto-resume, so the session
++        # stalled silently until someone noticed. Measured on session
++        # 20260819_144700_aaaaaa (the peer pane): paused at turn 3/400 with
++        # paused_reason "user-interrupted (Ctrl+C)" while last_verdict was
++        # "continue" and the pane kept running turns for another 50 minutes.
++        # This flag is set ONLY at a seam a human actually drives.
++        self._human_interrupt_requested = False
+         # When stdout/PTY raises EIO (broken pipe after a stream-stall
+         # interrupt), freeze further UI paints so we don't spin the main
+         # thread at hundreds of escape-sequence writes/sec (#81521).
+@@ -13821,6 +13836,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             except Exception:
+                 pass
+ 
++    def _mark_human_interrupt(self, source: str) -> None:
++        """Record that a HUMAN, not the machine, interrupted the running turn.
++
++        ⛔ [bd-dre-df78a] The only thing that may make a goal or /loop pause as
++        "user-interrupted (Ctrl+C)". Call it at a seam a person actually drives
++        — the Ctrl+C keybinding, the ESC keybinding, a message typed while the
++        agent is running, a voice interjection — and NOWHERE else.
++
++        Deliberately NOT called from the SIGTERM/SIGHUP handlers or the
++        shutdown path: those end the process, so pausing the goal is moot, and
++        labelling them human would hand the resume supervisor a pause it is
++        forbidden to touch. Never raises — it runs inside key handlers.
++        """
++        try:
++            self._human_interrupt_requested = True
++            logging.debug("human interrupt recorded (source=%s)", source)
++        except Exception:
++            pass
++
++    def _turn_was_human_interrupted(self) -> bool:
++        """True only for an interrupted turn a human actually asked to stop.
++
++        A machine interrupt (provider stall, stream abort, signal) leaves
++        ``_human_interrupt_requested`` False, so the goal loop keeps the goal
++        ACTIVE and re-arms instead of pausing [bd-dre-df78a].
++        """
++        return bool(
++            getattr(self, "_last_turn_interrupted", False)
++            and getattr(self, "_human_interrupt_requested", False)
++        )
++
+     def _maybe_complete_loop_tick_after_turn(self) -> None:
+         """Post-turn hook: evaluate a finished /loop wakeup turn.
+ 
+@@ -13836,9 +13882,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         if state is None or not state.awaiting_response:
+             return
+ 
+-        # A user-interrupted wakeup turn pauses the loop (recoverable via
++        # A HUMAN-interrupted wakeup turn pauses the loop (recoverable via
+         # /loop resume) — same contract as the goal loop's Ctrl+C handling.
+-        if getattr(self, "_last_turn_interrupted", False):
++        # A MACHINE interrupt (provider stall, stream abort) must not: it
++        # would stop a recurring loop on a transient [bd-dre-df78a].
++        if self._turn_was_human_interrupted():
+             try:
+                 mgr.pause(reason="user-interrupted (Ctrl+C)")
+             except Exception:
+@@ -13848,6 +13896,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 f"Use /loop resume to continue, or /loop stop to end it.{_RST}"
+             )
+             return
++        if getattr(self, "_last_turn_interrupted", False):
++            # Complete the tick so the loop is not wedged on
++            # awaiting_response, and let the normal schedule fire the next
++            # one. The loop stays running.
++            logging.info(
++                "loop tick: wakeup turn was interrupted by the machine, not "
++                "the user — the loop stays armed"
++            )
++            try:
++                mgr.complete_tick("")
++            except Exception:
++                pass
++            _cprint(
++                f"  {_DIM}↻ Loop still armed — the wakeup turn was cut short "
++                f"by the provider, not by you.{_RST}"
++            )
++            return
+ 
+         last_response = ""
+         try:
+@@ -14010,12 +14075,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         except Exception:
+             pass
+ 
+-        # If the turn was user-interrupted (Ctrl+C), auto-pause the goal
+-        # and bail. The judge call would almost always return "continue"
+-        # on the partial output and immediately re-queue another turn,
+-        # which is exactly what the user cancelled. Pausing (rather than
+-        # silently skipping) is the observable, recoverable behavior.
+-        if getattr(self, "_last_turn_interrupted", False):
++        # If a HUMAN interrupted the turn (Ctrl+C / ESC / typed message /
++        # voice), auto-pause the goal and bail. The judge call would almost
++        # always return "continue" on the partial output and immediately
++        # re-queue another turn, which is exactly what the user cancelled.
++        # Pausing (rather than silently skipping) is the observable,
++        # recoverable behavior.
++        if self._turn_was_human_interrupted():
+             try:
+                 mgr.pause(reason="user-interrupted (Ctrl+C)")
+             except Exception as exc:
+@@ -14026,6 +14092,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             )
+             return
+ 
++        # ⛔ A MACHINE INTERRUPT IS NOT ANDRE'S SIGNAL [bd-dre-df78a].
++        #
++        # The turn was interrupted, but nobody asked for it: a wedged provider
++        # tripped the stale-stream breaker, a bg-review thread's stream was
++        # aborted, a delegation was cancelled. The old code paused here as
++        # "user-interrupted (Ctrl+C)" — the one pause class the resume
++        # supervisor is forbidden to auto-resume — so a transient became a
++        # permanent silent stall with turns still on the budget.
++        #
++        # Keep the goal ACTIVE and re-arm the continuation directly. No judge
++        # call (the partial output is an "Operation interrupted" stub, so
++        # judging it is a wasted aux call) and no turn consumed — the turn
++        # produced no work to evaluate.
++        if getattr(self, "_last_turn_interrupted", False):
++            try:
++                prompt = mgr.next_continuation_prompt()
++            except Exception as exc:
++                logging.debug("goal re-arm after machine interrupt failed: %s", exc)
++                prompt = None
++            if prompt:
++                try:
++                    self._pending_input.put(_AutonomousPrompt(prompt, "goal"))
++                except Exception as exc:
++                    logging.debug("goal re-arm enqueue failed: %s", exc)
++            logging.info(
++                "goal loop: turn was interrupted by the machine, not the user "
++                "— goal stays active and the continuation is re-armed "
++                "(session=%s)", getattr(self, "session_id", "?"),
++            )
++            _cprint(
++                f"  {_DIM}↻ Goal continuing — the turn was cut short by the "
++                f"provider, not by you.{_RST}"
++            )
++            return
++
+         # Extract the agent's final response for this turn.
+         last_response = ""
+         try:
+@@ -16225,6 +16326,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     try:
+                         if self.agent is not None and getattr(self, "_agent_running", False):
+                             _cprint(f"\n{_DIM}🎤 Voice interjection — interrupting…{_RST}")
++                            # A person spoke — human provenance [bd-dre-df78a].
++                            self._mark_human_interrupt("voice-barge-in")
+                             self.agent.interrupt()
+                     except Exception as e:
+                         logger.debug("voice interjection interrupt failed: %s", e)
+@@ -17276,6 +17379,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         # this to True. Early returns (credential refresh failure, etc.)
+         # leave it False, which is correct — those aren't user interrupts.
+         self._last_turn_interrupted = False
++        # Provenance resets with it: a human Ctrl+C on turn N must not make
++        # turn N+1's machine interrupt look deliberate [bd-dre-df78a].
++        self._human_interrupt_requested = False
+ 
+         # Refresh provider credentials if needed (handles key rotation transparently)
+         if not self._ensure_runtime_credentials():
+@@ -17733,6 +17839,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                             # Signal TTS to stop on interrupt
+                             if stop_event is not None:
+                                 stop_event.set()
++                            # The human typed while the agent was running —
++                            # human provenance [bd-dre-df78a].
++                            self._mark_human_interrupt("typed-message")
+                             self.agent.interrupt(interrupt_msg)
+                             # Clear any active overlay states the interrupted agent
+                             # left behind.  approval/clarify/sudo/secret prompts gate
+@@ -18740,6 +18849,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         # See constructor note. Mirrored here for the run() path that skips
+         # the earlier __init__ branch.
+         self._last_turn_interrupted = False
++        self._human_interrupt_requested = False
+         self._should_exit = False
+         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
+ 
+@@ -19591,6 +19701,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 
+                 self._last_ctrl_c_time = now
+                 print("\n⚡ Interrupting agent... (press Ctrl+C again to force exit)")
++                # A real human keystroke — the one interrupt that may pause a
++                # standing goal [bd-dre-df78a].
++                self._mark_human_interrupt("ctrl-c")
+                 request_hard_interrupt(self.agent)
+             # If there's text or images, clear them (like bash).
+             # If everything is already empty, exit.
+@@ -19669,6 +19782,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+ 
+             if self._agent_running and self.agent:
+                 print("\n⚡ Interrupting agent...")
++                self._mark_human_interrupt("escape")
+                 request_hard_interrupt(self.agent)
+             elif event.app.current_buffer.text or self._attached_images:
+                 event.app.current_buffer.reset()
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 0da7f5d..9515844 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -2714,6 +2714,44 @@ class CLICommandsMixin:
+             f"any memory/skill updates will be reported when done."
+         )
+ 
++    def _kick_goal_after_resume(self, mgr) -> bool:
++        """Queue the first continuation turn for a just-resumed goal.
++
++        Returns True when a continuation was enqueued. See the call site in
++        ``/goal resume`` for why this is needed [bd-dre-df78a]: resume flips the
++        status, but only a POST-TURN hook enqueues continuations, and a slash
++        command never runs a turn — so without this the goal is "active" and
++        idle, which is the stall the resume was meant to end.
++
++        Never raises: a failure here degrades to the old "type continue"
++        behavior rather than breaking the command.
++        """
++        pending = getattr(self, "_pending_input", None)
++        if pending is None:
++            return False
++        try:
++            # Don't stack a continuation on top of work already queued — the
++            # user's own message goes first, and the post-turn hook will pick
++            # the goal up from there.
++            if not pending.empty():
++                return False
++            prompt = mgr.next_continuation_prompt()
++            if not prompt:
++                return False
++            try:
++                from cli import _AutonomousPrompt
++
++                payload = _AutonomousPrompt(prompt, "goal")
++            except Exception:
++                payload = prompt
++            pending.put(payload)
++            return True
++        except Exception as exc:
++            import logging
++
++            logging.debug("goal resume kick failed: %s", exc)
++            return False
++
+     def _handle_goal_command(self, cmd: str) -> None:
+         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""
+         from cli import _DIM, _RST, _cprint
+@@ -2765,10 +2803,30 @@ class CLICommandsMixin:
+                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
+             else:
+                 _cprint(f"  ▶ Goal resumed: {state.goal}")
+-                _cprint(
+-                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
+-                    f"is a no-op; type 'continue' to kick it off).{_RST}"
+-                )
++                # ⛔ RESUME MUST ACTUALLY RE-ARM THE LOOP [bd-dre-df78a].
++                #
++                # `mgr.resume()` only flips status to active. The continuation
++                # is enqueued by `_maybe_continue_goal_after_turn`, which runs
++                # POST-TURN — and a slash command is dispatched through
++                # process_command, which never runs a turn. So `/goal resume`
++                # used to leave the goal "active" with nothing queued, and the
++                # pane sat idle until a human typed something.
++                #
++                # That made hermes-goal-resume-supervisor a no-op backstop: it
++                # correctly found the paused goal, correctly waited for an idle
++                # pane, correctly sent `/goal resume` — and the goal still did
++                # not resume working. Enqueue the first continuation here so
++                # resume means resume, for both the human and the supervisor.
++                if self._kick_goal_after_resume(mgr):
++                    _cprint(
++                        f"  {_DIM}↻ Continuation queued — the loop is working "
++                        f"again.{_RST}"
++                    )
++                else:
++                    _cprint(
++                        f"  {_DIM}Send any message to kick it off (type "
++                        f"'continue').{_RST}"
++                    )
+             return
+ 
+         if lower in {"clear", "stop", "done"}:
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 74967ff..87fabce 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -239,12 +239,29 @@ JUDGE_SYSTEM_PROMPT = (
+     "You are a strict judge evaluating whether an autonomous agent has "
+     "achieved a user's stated goal. You receive the goal text, the agent's "
+     "most recent response, and — when present — a list of background "
+-    "processes the agent has running. Decide one of four verdicts.\n\n"
+-    "DONE — the goal is fully satisfied:\n"
+-    "- The response explicitly confirms the goal was completed, OR\n"
+-    "- The response clearly shows the final deliverable was produced, OR\n"
+-    "- The response explains the goal is unachievable / blocked / needs "
+-    "user input (treat this as DONE with reason describing the block).\n\n"
++    "processes the agent has running. Decide one of five verdicts.\n\n"
++    "⛔ THE MOST IMPORTANT RULE: a goal that is BROAD, MULTI-PART, LONG-RUNNING "
++    "or SIMPLY NOT FINISHED YET is the normal mid-flight state of an "
++    "autonomous loop. It is NEVER a reason to stop. If work remains and the "
++    "agent can take a step, the verdict is CONTINUE. Do not stop a goal "
++    "because it is large.\n\n"
++    "DONE — the goal is FULLY satisfied. Every part of it. The response shows "
++    "concrete evidence the final deliverable exists (a command result, a file "
++    "excerpt, an output line) — not a claim, not a summary of intent, and not "
++    "progress toward it. If ANY part of a multi-part goal remains unfinished, "
++    "the verdict is NOT done.\n"
++    "⛔ 'Blocked', 'waiting on', 'pending', 'upload-ready', 'as far as I can "
++    "go', 'no executable lanes' and 'ready to submit' are NOT done. A goal the "
++    "agent cannot currently finish is BLOCKED, DEFER or WAIT — never DONE. "
++    "Never return DONE in the same sentence as 'but … is blocked'.\n\n"
++    "BLOCKED — the goal is NOT complete and the WHOLE of it is gated on "
++    "something only a HUMAN can supply: a credential or login the agent does "
++    "not have, an approval or spend decision, access to a system it cannot "
++    "reach, or a choice the user must make. Not async work that will finish on "
++    "its own (that is WAIT), and not a block on one item while other work "
++    "remains (that is DEFER). Name the decision the human must make in "
++    "``reason``. This stops the loop and asks the user — so use it only when "
++    "there is genuinely nothing else in the goal the agent could do.\n\n"
+     "WAIT — the goal is NOT done, and the ENTIRE goal is gated on async work: "
+     "nothing else in it can move. Choose this ONLY when there is no other part "
+     "of the goal to work on. If ANY other work remains, choose DEFER instead — "
+@@ -279,9 +296,11 @@ JUDGE_SYSTEM_PROMPT = (
+     "item is off-limits, and keeps it working on the rest. Prefer DEFER over "
+     "WAIT whenever any other work exists.\n\n"
+     "CONTINUE — not done, and there is a concrete next step the agent can "
+-    "take right now. This is the default when in doubt.\n\n"
++    "take right now. This is the default when in doubt, and it is the correct "
++    "verdict for the overwhelming majority of turns in a long goal.\n\n"
+     "Reply ONLY with a single JSON object on one line. Shapes:\n"
+     '{"verdict": "done", "reason": "<one sentence>"}\n'
++    '{"verdict": "blocked", "reason": "<the decision the human must make>"}\n'
+     '{"verdict": "continue", "reason": "<one sentence>"}\n'
+     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
+     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
+@@ -308,7 +327,8 @@ JUDGE_USER_PROMPT_TEMPLATE = (
+     "Agent's most recent response:\n{response}\n\n"
+     "{background_block}"
+     "Current time: {current_time}\n\n"
+-    "Is the goal satisfied — done, continue, or wait?"
++    "Is the goal satisfied — done, blocked, continue, wait, or defer? "
++    "Remember: unfinished is not blocked, and broad is not done."
+ )
+ 
+ # Used when the user has added /subgoal criteria. The judge must
+@@ -352,11 +372,15 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
+     "process to satisfy the Verification criterion (e.g. CI is the "
+     "verification and it's still running), return WAIT on that process "
+     "instead of re-poking — re-poking now would be pure busy-work.\n"
+-    "- If the response explains the work is blocked / unachievable / needs "
+-    "user input (e.g. the stated Stop condition was hit), treat it as DONE "
+-    "with the reason describing the block.\n"
++    "- If the WHOLE goal is gated on something only a human can supply (a "
++    "credential, an approval, a decision — e.g. the stated Stop condition was "
++    "hit), return BLOCKED naming that decision. ⛔ Do NOT return DONE for it: "
++    "work the agent could not finish is not work it completed.\n"
++    "- A broad, multi-part or unfinished contract is the normal mid-flight "
++    "state — CONTINUE, never DONE and never a stop.\n"
+     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
+-    "Is the goal satisfied per its completion contract — done, continue, or wait?"
++    "Is the goal satisfied per its completion contract — done, blocked, "
++    "continue, wait, or defer?"
+ )
+ 
+ 
+@@ -974,6 +998,27 @@ def transport_paused_reason(transport_failures: int, unjudged: int) -> str:
+     )
+ 
+ 
++# ⛔ THE MARKER FOR A PAUSE THAT NEEDS A HUMAN DECISION [bd-dre-df78a].
++#
++# A `blocked` verdict means the WHOLE goal is gated on something only a person
++# can supply — a login, an approval, a spend decision. It is emphatically NOT
++# auto-resumable (retrying cannot produce a credential), and it is NOT `done`
++# either: the work is unfinished. Before this marker existed the judge was
++# instructed to report exactly this case as DONE, which ended goals with a "✓
++# Goal achieved" over work that had not happened.
++BLOCKED_PAUSE_MARKER = "goal-blocked-needs-human-decision"
++
++
++def blocked_paused_reason(reason: str) -> str:
++    """The ``paused_reason`` for a needs-a-human pause, marker first."""
++    return f"{BLOCKED_PAUSE_MARKER}: {reason}"
++
++
++def is_blocked_pause(paused_reason: Optional[str]) -> bool:
++    """True when this pause is waiting on a human decision."""
++    return BLOCKED_PAUSE_MARKER in (paused_reason or "").strip().lower()
++
++
+ def is_transport_pause(paused_reason: Optional[str]) -> bool:
+     """True when this pause was caused by an unreachable judge ROUTE.
+ 
+@@ -1601,11 +1646,76 @@ def _control_plane_priority():
+         yield
+ 
+ 
++# ⛔ THE DETERMINISTIC NET UNDER THE JUDGE PROMPT [bd-dre-df78a].
++#
++# Built from the five `done` verdicts actually measured in
++# ~/.hermes/profiles/architect/logs on 2026-09-29/30, every one of which
++# declared a multi-part goal complete while its own reason said the work was
++# blocked or still open. The prompt no longer instructs that, but a language
++# model is not a parser, so the reclassification is enforced in code.
++
++#: Phrases that mean "the agent could not finish", in a reason claiming DONE.
++_BLOCK_REASON_PATTERNS = (
++    r"\bis blocked\b", r"\bare blocked\b", r"\bblocked on\b",
++    r"\bblocked pending\b", r"\bblocked by\b", r"\bstill blocked\b",
++    r"\bneeds? (?:user|human|owner|andre)\b",
++    r"\brequires? (?:user|human|owner|andre)\b",
++    r"\bawaiting (?:user|human|owner|approval|a decision|login|credentials?)\b",
++    r"\bcannot (?:proceed|complete|finish|submit|upload)\b",
++    r"\bunable to (?:proceed|complete|finish|submit|upload)\b",
++    r"\bremains? open\b", r"\bstill open\b",
++    r"\bnot (?:yet )?(?:fully )?(?:complete|completed|satisfied|finished)\b",
++    r"\bis not complete\b", r"\bstill pending\b", r"\bstill running\b",
++    r"\bpending (?:login|approval|credentials?|a decision|owner|user)\b",
++    r"\bno executable lanes\b",
++)
++
++#: Phrases that mean the block is GONE — these must not trip the net.
++_BLOCK_NEGATION_PATTERNS = (
++    r"\bunblocked\b", r"\bno longer blocked\b", r"\bnothing is blocked\b",
++    r"\bnot blocked\b", r"\bnever blocked\b", r"\bwas blocked\b.{0,40}\bnow\b",
++)
++
++#: A contrastive completion claim — "X is complete, BUT Y is still pending".
++_BLOCK_CONTRAST_WORDS = (
++    "pending", "blocked", "still", "remains", "remaining", "needed",
++    "cannot", "awaiting", "not yet", "outstanding", "unfinished",
++)
++
++
++def _reason_describes_a_block(reason: Optional[str]) -> bool:
++    """True when a judge reason claiming DONE actually describes a BLOCK.
++
++    Conservative in the direction that matters: a false negative merely leaves
++    the judge's own verdict standing (today's behavior), while a false positive
++    turns a real completion into a request for a human decision. So the
++    negation patterns are checked first and win.
++    """
++    text = (reason or "").strip().lower()
++    if not text:
++        return False
++    for pat in _BLOCK_NEGATION_PATTERNS:
++        if re.search(pat, text):
++            return False
++    for pat in _BLOCK_REASON_PATTERNS:
++        if re.search(pat, text):
++            return True
++    # "… is complete, BUT the final upload is still pending" — the contrastive
++    # shape three of the five measured verdicts used.
++    if " but " in text or " however" in text or " although " in text:
++        tail = re.split(r" but | however| although ", text, maxsplit=1)[-1]
++        if any(w in tail for w in _BLOCK_CONTRAST_WORDS):
++            return True
++    return False
++
++
+ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
+     """Parse the judge's reply. Fail-open on unusable output.
+ 
+     Returns ``(verdict, reason, parse_failed, wait_directive)`` where:
+-      - ``verdict`` is ``"done"``, ``"continue"``, ``"wait"``, or ``"defer"``.
++      - ``verdict`` is ``"done"``, ``"blocked"``, ``"continue"``, ``"wait"``, or
++        ``"defer"``. A ``"done"`` whose reason actually describes a block is
++        reclassified to ``"blocked"`` (see ``_reason_describes_a_block``).
+       - ``parse_failed`` is True when the judge returned output that couldn't
+         be interpreted as the expected JSON verdict (empty body, prose,
+         malformed JSON). Callers use it to auto-pause after N consecutive
+@@ -1671,9 +1781,28 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str,
+             done = bool(done_val)
+         verdict = "done" if done else "continue"
+ 
+-    if verdict not in {"done", "continue", "wait", "defer"}:
++    if verdict not in {"done", "continue", "wait", "defer", "blocked"}:
+         verdict = "continue"
+ 
++    # ⛔ BLOCKED ≠ DONE, EVEN WHEN THE JUDGE SAYS DONE [bd-dre-df78a].
++    #
++    # The prompt used to instruct "treat blocked as DONE", and every one of the
++    # five `done` verdicts measured in ~/.hermes/profiles/architect/logs was
++    # that shape — e.g. "all locally feasible index/shard artifacts are ready,
++    # BUT final contest submission is blocked", "blocked on external
++    # gates/owner decisions". The prompt no longer says it, but the judge is a
++    # language model, not a parser: this is the deterministic net under it.
++    # A `done` whose own reason says the work is blocked/pending is reclassified
++    # as `blocked`, which stops the loop HONESTLY (asking the human for the
++    # named decision) instead of reporting "✓ Goal achieved" over unfinished
++    # work.
++    if verdict == "done" and _reason_describes_a_block(reason):
++        logger.warning(
++            "goal judge: reclassifying done→blocked — the reason describes a "
++            "block, not a completion: %s", _truncate(reason, 200),
++        )
++        verdict = "blocked"
++
+     if verdict not in {"wait", "defer"}:
+         return verdict, reason, False, None
+ 
+@@ -3149,6 +3278,33 @@ class GoalManager:
+                     ),
+                 }
+ 
++        # ⛔ BLOCKED — the whole goal needs a human decision [bd-dre-df78a].
++        #
++        # Pause rather than complete: the work is NOT finished, so reporting it
++        # as done would silently retire an unfinished goal (the `done`-at-54/400
++        # failure). Pause rather than continue: re-poking cannot conjure a
++        # credential or an approval, so continuing would burn the budget on
++        # turns that cannot progress. The marker keeps the resume supervisor
++        # off it — a machine must not answer a question addressed to a human.
++        if verdict == "blocked":
++            state.status = "paused"
++            state.paused_reason = blocked_paused_reason(reason)
++            state.blocked_on = []
++            save_goal(self.session_id, state)
++            return {
++                "status": "paused",
++                "should_continue": False,
++                "continuation_prompt": None,
++                "verdict": "blocked",
++                "reason": reason,
++                "message": (
++                    f"⏸ Goal paused — it needs YOUR decision, and "
++                    f"{state.max_turns - state.turns_used} turns are still on "
++                    f"the budget: {reason} "
++                    f"Answer it, then /goal resume."
++                ),
++            }
++
+         if verdict == "done":
+             state.status = "done"
+             state.blocked_on = []
+@@ -3529,4 +3685,11 @@ __all__ = [
+     "migrate_goal_to_session",
+     "judge_goal",
+     "run_kanban_goal_loop",
++    # Pause classification — what a machine may and may not auto-resume.
++    "TRANSPORT_PAUSE_MARKER",
++    "transport_paused_reason",
++    "is_transport_pause",
++    "BLOCKED_PAUSE_MARKER",
++    "blocked_paused_reason",
++    "is_blocked_pause",
+ ]
+diff --git a/tests/cli/test_cli_goal_interrupt.py b/tests/cli/test_cli_goal_interrupt.py
+index 37ee84c..ee3293b 100644
+--- a/tests/cli/test_cli_goal_interrupt.py
++++ b/tests/cli/test_cli_goal_interrupt.py
+@@ -48,6 +48,9 @@ def _make_cli_with_goal(session_id: str, goal_text: str = "build a thing"):
+     # State the hook + helpers touch directly.
+     cli._pending_input = queue.Queue()
+     cli._last_turn_interrupted = False
++    # Interrupt PROVENANCE [bd-dre-df78a]: only a human interrupt may pause a
++    # goal. Default False = the machine did it.
++    cli._human_interrupt_requested = False
+     cli.conversation_history = []
+     # `_get_goal_manager()` reads `self.session_id` directly, not
+     # `self.agent.session_id`. Match the production lookup.
+@@ -73,17 +76,135 @@ class TestInterruptAutoPause:
+         sid = f"sid-resume-{uuid.uuid4().hex}"
+         cli, mgr = _make_cli_with_goal(sid)
+         cli._last_turn_interrupted = True
++        cli._human_interrupt_requested = True       # a real Ctrl+C
+         cli.conversation_history = [
+             {"role": "assistant", "content": "partial"},
+         ]
+         with patch("hermes_cli.goals.judge_goal"):
+             cli._maybe_continue_goal_after_turn()
+         assert mgr.state.status == "paused"
++        assert mgr.state.paused_reason == "user-interrupted (Ctrl+C)"
+ 
+         mgr.resume()
+         assert mgr.state.status == "active"
+ 
+ 
++class TestMachineInterruptDoesNotPause:
++    """⛔ bd-dre-df78a — the defect that stalled the peer pane.
++
++    ``_last_turn_interrupted`` is True for every interrupt, including ones no
++    human asked for: the provider-stall breaker, a ``stream_interrupt_abort`` on
++    a bg-review thread, a SIGTERM. Pausing on those labelled the transient
++    "user-interrupted (Ctrl+C)" — the one pause class
++    hermes-goal-resume-supervisor may never auto-resume — so an autonomous
++    session stopped silently with its whole turn budget unspent.
++    """
++
++    def test_machine_interrupt_keeps_the_goal_active(self, hermes_home):
++        sid = f"sid-machine-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        cli._last_turn_interrupted = True
++        cli._human_interrupt_requested = False      # nobody pressed anything
++        cli.conversation_history = [
++            {"role": "assistant", "content": "Operation interrupted: ..."},
++        ]
++
++        # The judge must not even be consulted — there is no work to evaluate.
++        with patch("hermes_cli.goals.judge_goal") as judge:
++            cli._maybe_continue_goal_after_turn()
++        judge.assert_not_called()
++
++        assert mgr.state.status == "active"
++        assert mgr.state.paused_reason is None
++
++    def test_machine_interrupt_re_arms_the_continuation(self, hermes_home):
++        """Staying 'active' is not enough — something must be QUEUED, or the
++        pane goes idle forever with an active goal (the exact shape of 226:
++        status active, turns 3/400, no turn for 50 minutes)."""
++        sid = f"sid-rearm-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        cli._last_turn_interrupted = True
++        cli._human_interrupt_requested = False
++        cli.conversation_history = [
++            {"role": "assistant", "content": "Operation interrupted: ..."},
++        ]
++
++        with patch("hermes_cli.goals.judge_goal"):
++            cli._maybe_continue_goal_after_turn()
++
++        assert not cli._pending_input.empty(), (
++            "a machine-interrupted turn must re-arm the goal continuation"
++        )
++        assert "Continuing toward your standing goal" in cli._pending_input.get_nowait()
++
++    def test_machine_interrupt_consumes_no_turn(self, hermes_home):
++        """The interrupted turn produced no work, so it must not be billed
++        against the budget — otherwise a flapping provider burns 400 turns."""
++        sid = f"sid-noturn-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        before = mgr.state.turns_used
++        cli._last_turn_interrupted = True
++        cli._human_interrupt_requested = False
++        cli.conversation_history = [
++            {"role": "assistant", "content": "Operation interrupted: ..."},
++        ]
++        with patch("hermes_cli.goals.judge_goal"):
++            cli._maybe_continue_goal_after_turn()
++        assert mgr.state.turns_used == before
++
++
++class TestInterruptProvenanceSeams:
++    """Only a human seam may set the provenance flag."""
++
++    def test_mark_human_interrupt_sets_the_flag(self):
++        from cli import HermesCLI
++
++        cli = HermesCLI.__new__(HermesCLI)
++        cli._human_interrupt_requested = False
++        cli._mark_human_interrupt("ctrl-c")
++        assert cli._human_interrupt_requested is True
++
++    def test_turn_was_human_interrupted_needs_both_flags(self):
++        from cli import HermesCLI
++
++        cli = HermesCLI.__new__(HermesCLI)
++        for interrupted, human, expected in (
++            (False, False, False),
++            (True, False, False),      # machine interrupt — must NOT pause
++            (False, True, False),      # stale provenance, clean turn
++            (True, True, True),        # a real Ctrl+C
++        ):
++            cli._last_turn_interrupted = interrupted
++            cli._human_interrupt_requested = human
++            assert cli._turn_was_human_interrupted() is expected
++
++    def test_the_human_seams_mark_provenance(self):
++        """Every ``request_hard_interrupt``/``agent.interrupt`` call that a
++        PERSON drives must be preceded by ``_mark_human_interrupt``, and the
++        SIGNAL handlers must not be — labelling a SIGTERM as human would hand
++        the resume supervisor a pause it is forbidden to touch."""
++        import inspect
++        import cli as cli_mod
++
++        src = inspect.getsource(cli_mod)
++        assert src.count("_mark_human_interrupt(") >= 5, (
++            "expected the helper plus the four human seams (ctrl-c, escape, "
++            "typed-message, voice-barge-in)"
++        )
++        for seam in ("ctrl-c", "escape", "typed-message", "voice-barge-in"):
++            assert f'_mark_human_interrupt("{seam}")' in src, (
++                f"human interrupt seam {seam!r} does not record provenance"
++            )
++        # The signal handlers hard-interrupt via `received signal {signum}` —
++        # that must remain machine-provenance.
++        sig_idx = src.find('request_hard_interrupt(\n                        _signal_agent')
++        if sig_idx > 0:
++            window = src[max(0, sig_idx - 600):sig_idx]
++            assert "_mark_human_interrupt" not in window, (
++                "a SIGTERM/SIGHUP must not be recorded as a human interrupt"
++            )
++
++
+ 
+ 
+ class TestHealthyTurnStillRuns:
+@@ -151,3 +272,79 @@ class TestInterruptFlagLifecycle:
+             "runs — otherwise a prior turn's interrupt state leaks into the "
+             "next turn's goal hook decision."
+         )
++
++    def test_chat_resets_provenance_at_entry(self, hermes_home):
++        """The provenance flag must reset with it [bd-dre-df78a] — a human
++        Ctrl+C on turn N must not make turn N+1's provider stall look
++        deliberate."""
++        from cli import HermesCLI
++        import inspect
++
++        src = inspect.getsource(HermesCLI.chat)
++        head = src.split("if not self._ensure_runtime_credentials", 1)[0]
++        assert "self._human_interrupt_requested = False" in head, (
++            "chat() must reset _human_interrupt_requested alongside "
++            "_last_turn_interrupted, or human provenance leaks across turns."
++        )
++
++
++class TestResumeActuallyReArms:
++    """⛔ bd-dre-df78a — `/goal resume` used to be a no-op backstop.
++
++    ``GoalManager.resume()`` only flips the status to active. Continuations are
++    enqueued by ``_maybe_continue_goal_after_turn``, which runs POST-TURN — and a
++    slash command is dispatched through ``process_command``, which never runs a
++    turn. So the goal came back "active" with nothing queued and the pane stayed
++    idle. That made hermes-goal-resume-supervisor useless: it found the paused
++    goal, waited for an idle pane, sent ``/goal resume`` — and nothing resumed.
++    """
++
++    def test_kick_enqueues_the_continuation(self, hermes_home):
++        sid = f"sid-kick-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        mgr.pause(reason="user-paused")
++        mgr.resume()
++
++        assert cli._kick_goal_after_resume(mgr) is True
++        assert not cli._pending_input.empty()
++        assert "Continuing toward your standing goal" in cli._pending_input.get_nowait()
++
++    def test_kick_defers_to_a_queued_user_message(self, hermes_home):
++        """The human's own message goes first; the post-turn hook picks the goal
++        up from there."""
++        sid = f"sid-kick-defer-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        cli._pending_input.put("do this other thing first")
++
++        assert cli._kick_goal_after_resume(mgr) is False
++        assert cli._pending_input.get_nowait() == "do this other thing first"
++        assert cli._pending_input.empty()
++
++    def test_kick_is_a_no_op_for_a_non_active_goal(self, hermes_home):
++        sid = f"sid-kick-paused-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        mgr.pause(reason="user-paused")
++
++        assert cli._kick_goal_after_resume(mgr) is False
++        assert cli._pending_input.empty()
++
++    def test_kick_never_raises(self, hermes_home):
++        """A failure here must degrade to the old 'type continue' behavior, not
++        break the command."""
++        sid = f"sid-kick-raise-{uuid.uuid4().hex}"
++        cli, mgr = _make_cli_with_goal(sid)
++        broken = MagicMock()
++        broken.next_continuation_prompt.side_effect = RuntimeError("boom")
++        assert cli._kick_goal_after_resume(broken) is False
++
++    def test_resume_command_kicks_the_loop(self):
++        """The `/goal resume` handler must call the kick — otherwise the
++        supervisor's send still does nothing."""
++        import inspect
++        from hermes_cli.cli_commands_mixin import CLICommandsMixin
++
++        src = inspect.getsource(CLICommandsMixin._handle_goal_command)
++        resume_block = src.split('if lower == "resume":', 1)[1].split("if lower in {", 1)[0]
++        assert "_kick_goal_after_resume" in resume_block, (
++            "/goal resume must re-arm the continuation, not just flip status"
++        )
+diff --git a/tests/cli/test_cli_loop_tick_interrupt.py b/tests/cli/test_cli_loop_tick_interrupt.py
+new file mode 100644
+index 0000000..ae7972f
+--- /dev/null
++++ b/tests/cli/test_cli_loop_tick_interrupt.py
+@@ -0,0 +1,73 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""A /loop tick must not stop the loop on a MACHINE interrupt [bd-dre-df78a].
++
++Same defect as the goal loop, same fix: ``_last_turn_interrupted`` is True for a
++provider stall or a stream abort as well as for a real Ctrl+C, and pausing a
++recurring loop on a transient silently ends it.
++"""
++
++from __future__ import annotations
++
++import queue
++import uuid
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    yield home
++
++
++def _cli_with_loop(sid: str):
++    from cli import HermesCLI
++    from hermes_cli.loops import LoopManager, save_loop
++
++    cli = HermesCLI.__new__(HermesCLI)
++    cli._pending_input = queue.Queue()
++    cli._last_turn_interrupted = False
++    cli._human_interrupt_requested = False
++    cli.conversation_history = []
++    cli.session_id = sid
++    cli.agent = MagicMock()
++    cli.agent.session_id = sid
++
++    mgr = LoopManager(session_id=sid)
++    mgr.set("check the deploy", interval_seconds=300)
++    # Put the loop in the state fire_tick() leaves behind: a wakeup turn is
++    # out and the post-turn hook is what completes it. Set directly rather than
++    # calling fire_tick(), which no-ops until the interval is actually due.
++    mgr.state.awaiting_response = True
++    save_loop(sid, mgr.state)
++    assert mgr.state.awaiting_response is True
++    cli._loop_manager = mgr
++    return cli, mgr
++
++
++def test_human_interrupt_pauses_the_loop(hermes_home):
++    cli, mgr = _cli_with_loop(f"loop-human-{uuid.uuid4().hex}")
++    cli._last_turn_interrupted = True
++    cli._human_interrupt_requested = True
++    with patch.object(cli, "_get_loop_manager", return_value=mgr):
++        cli._maybe_complete_loop_tick_after_turn()
++    assert mgr.state.status == "paused"
++
++
++def test_machine_interrupt_keeps_the_loop_armed(hermes_home):
++    cli, mgr = _cli_with_loop(f"loop-machine-{uuid.uuid4().hex}")
++    cli._last_turn_interrupted = True
++    cli._human_interrupt_requested = False
++    with patch.object(cli, "_get_loop_manager", return_value=mgr):
++        cli._maybe_complete_loop_tick_after_turn()
++    assert mgr.state.status == "active", (
++        "a provider stall must not stop a recurring loop"
++    )
++    assert mgr.state.awaiting_response is False, (
++        "the tick must be completed so the loop is not wedged on awaiting_response"
++    )
+diff --git a/tests/hermes_cli/test_goal_judge_never_stops_midflight.py b/tests/hermes_cli/test_goal_judge_never_stops_midflight.py
+new file mode 100644
+index 0000000..88bd56c
+--- /dev/null
++++ b/tests/hermes_cli/test_goal_judge_never_stops_midflight.py
+@@ -0,0 +1,291 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""The judge may stop a goal for three reasons, and no others [bd-dre-df78a].
++
++⛔ THE PROBLEM THIS EXISTS FOR. Andre, 2026-09-30: session 20260819_144700_aaaaaa
++(the peer pane) kept stalling at turn 3 of 400. A judge that cannot tell "not finished
++yet" from "should stop" costs hours of idle GPU.
++
++Two defects, in opposite directions, both measured on this box:
++
++1. **Mid-flight progress must never stop a goal.** The verdicts logged for that
++   session were ``continue``; the *pause* came from the CLI's interrupt path
++   (see ``tests/cli/test_cli_goal_interrupt.py``). The judge side of the
++   contract still has to hold: a broad, unfinished, multi-part goal is the
++   NORMAL mid-flight state and the verdict for it is ``continue``.
++
++2. **"Blocked" must never be reported as "done".** ``JUDGE_SYSTEM_PROMPT`` used
++   to instruct exactly that — *"The response explains the goal is unachievable /
++   blocked / needs user input (treat this as DONE…)"* — and all five ``done``
++   verdicts in ~/.hermes/profiles/architect/logs were that shape. That is the
++   ``done``-at-54/400 failure: a multi-part goal retired with a "✓ Goal
++   achieved" over work that had not happened.
++
++The reason strings below are the REAL ones from that log, not invented.
++"""
++
++from __future__ import annotations
++
++import json
++import uuid
++from pathlib import Path
++
++import pytest
++
++
++# ──────────────────────────────────────────────────────────────────────
++# The verbatim judge output measured on this box
++# ──────────────────────────────────────────────────────────────────────
++
++#: the peer pane's recorded verdict at the moment it stalled. A `continue` whose
++#: reason narrates an unfinished broad goal. This must NOT stop anything.
++REASON_226 = (
++    "The agent has made progress and is not idle, but the broad goal of "
++    "completing all training implementations and full specs is not yet fully "
++    "satisfied."
++)
++
++#: The five `done` verdicts from ~/.hermes/profiles/architect/logs (2026-09-29
++#: 19:52 / 23:44, 2026-09-30 00:17 / 05:59, 2026-09-26 04:23). Every one of them
++#: declares completion while its own words describe an unfinished block.
++MEASURED_FALSE_DONES = [
++    "The agent reports that all locally feasible index/shard artifacts are "
++    "ready, but final contest submission is blocked pending an owner "
++    "decision.",
++    "The local index/shard and submission-draft work is complete, but the final "
++    "ArchiveHub upload needed to obtain contest results is still pending.",
++    "The agent reports the submission is upload-ready but final contest "
++    "upload is blocked pending ArchiveHub login from the owner.",
++    "The agent reports no executable lanes or watchers and is blocked on "
++    "external gates/owner decisions, so no immediate work remains.",
++    "The agent explicitly confirms the goal remains open by design and reports "
++    "GOAL.md banking/updates, satisfying the requirement.",
++]
++
++#: Genuine completions — these must stay `done`.
++REAL_DONES = [
++    "All 412 tests pass (pytest output shown) and the binary was built and "
++    "installed to /usr/local/bin/hermes.",
++    "The migration ran to completion; the verification query returns 0 rows as "
++    "the contract requires.",
++    "Every requested figure was written to disk and the checksums match.",
++    "The refactor landed, the build is green, and nothing is blocked.",
++]
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    """Isolated HERMES_HOME — these tests must never touch production state."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    from hermes_cli import goals
++
++    goals._DB_CACHE.clear()
++    yield home
++    goals._DB_CACHE.clear()
++
++
++def _judge_raw(verdict: str, reason: str) -> str:
++    return json.dumps({"verdict": verdict, "reason": reason})
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 1. Mid-flight progress never stops a goal
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestBroadUnfinishedGoalKeepsWorking:
++
++    def test_226_verdict_does_not_pause_the_goal(self, hermes_home):
++        """⛔ THE REGRESSION TEST FOR the peer pane.
++
++        Its verbatim recorded verdict, fed through the real parser and the real
++        state machine. The goal must come out ACTIVE with a continuation queued.
++        """
++        from hermes_cli.goals import GoalManager
++
++        mgr = GoalManager(session_id=f"sid-226-{uuid.uuid4().hex}",
++                          default_max_turns=400)
++        mgr.set(
++            "continue with all training implementations and full specs, "
++            "integrating feedback from astra or specialized calls as necessary"
++        )
++
++        verdict, reason, parse_failed, directive = _parse(
++            _judge_raw("continue", REASON_226))
++        assert verdict == "continue"
++        assert parse_failed is False
++
++        decision = _evaluate(mgr, verdict, reason, directive)
++        assert decision["status"] == "active", (
++            "a broad, unfinished goal is the normal mid-flight state — it must "
++            "never be paused"
++        )
++        assert decision["should_continue"] is True
++        assert decision["continuation_prompt"]
++        assert mgr.state.status == "active"
++        assert mgr.state.paused_reason is None
++
++    def test_the_prompt_forbids_stopping_for_breadth(self):
++        from hermes_cli.goals import JUDGE_SYSTEM_PROMPT
++
++        low = JUDGE_SYSTEM_PROMPT.lower()
++        assert "never a reason to stop" in low, (
++            "the judge prompt must state outright that a broad/unfinished goal "
++            "is not a reason to stop"
++        )
++        assert "do not stop a goal because it is large" in low
++
++    def test_no_pause_verdict_exists(self):
++        """The judge has no way to say 'pause'. Confirms the measured 0/244:
++        a mid-flight pause can never have come from a judge verdict."""
++        from hermes_cli.goals import _parse_judge_response
++
++        verdict, _, _, _ = _parse_judge_response(
++            _judge_raw("pause", "the goal is broad and not yet finished"))
++        assert verdict == "continue", (
++            "an unknown verdict must degrade to continue, never to a stop"
++        )
++
++
++# ──────────────────────────────────────────────────────────────────────
++# 2. Blocked is not done
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestBlockedIsNotDone:
++
++    def test_the_prompt_no_longer_instructs_blocked_as_done(self):
++        """The root cause: the prompt TOLD the judge to do this."""
++        from hermes_cli.goals import (
++            JUDGE_SYSTEM_PROMPT,
++            JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE,
++        )
++
++        for text in (JUDGE_SYSTEM_PROMPT,
++                     JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE):
++            low = text.lower()
++            assert "treat this as done" not in low
++            assert "treat it as done" not in low
++        assert "blocked" in JUDGE_SYSTEM_PROMPT.lower()
++
++    @pytest.mark.parametrize("reason", MEASURED_FALSE_DONES)
++    def test_measured_false_dones_reclassify_to_blocked(self, reason):
++        from hermes_cli.goals import _parse_judge_response
++
++        verdict, out_reason, parse_failed, _ = _parse_judge_response(
++            _judge_raw("done", reason))
++        assert verdict == "blocked", (
++            f"a done whose reason describes a block must not complete the "
++            f"goal: {reason!r}"
++        )
++        assert parse_failed is False
++        assert out_reason == reason, "the reason must survive verbatim"
++
++    @pytest.mark.parametrize("reason", REAL_DONES)
++    def test_genuine_completions_stay_done(self, reason):
++        from hermes_cli.goals import _parse_judge_response
++
++        verdict, _, _, _ = _parse_judge_response(_judge_raw("done", reason))
++        assert verdict == "done", (
++            f"a real completion must not be downgraded: {reason!r}"
++        )
++
++    def test_blocked_pauses_rather_than_completing(self, hermes_home):
++        """A multi-part goal blocked on a human decision must PAUSE (turns
++        still on the budget, the decision named) — not report success."""
++        from hermes_cli.goals import GoalManager, is_blocked_pause
++
++        mgr = GoalManager(session_id=f"sid-blocked-{uuid.uuid4().hex}",
++                          default_max_turns=400)
++        mgr.set("finish the index rebuild and submit it to the contest")
++
++        verdict, reason, _, directive = _parse(
++            _judge_raw("done", MEASURED_FALSE_DONES[2]))
++        assert verdict == "blocked"
++
++        decision = _evaluate(mgr, verdict, reason, directive)
++        assert decision["status"] == "paused"
++        assert decision["verdict"] == "blocked"
++        assert mgr.state.status == "paused"
++        assert is_blocked_pause(mgr.state.paused_reason), (
++            "a needs-a-human pause must carry the marker so the resume "
++            "supervisor leaves it alone"
++        )
++        assert "turns are still on" in decision["message"], (
++            "the message must make clear the budget was not the reason"
++        )
++        assert "Goal achieved" not in decision["message"]
++
++    def test_a_blocked_pause_is_not_auto_resumable(self):
++        """A machine must never answer a question addressed to a human."""
++        from hermes_cli.goals import (
++            blocked_paused_reason, is_blocked_pause, is_transport_pause,
++        )
++
++        reason = blocked_paused_reason("needs the ArchiveHub login")
++        assert is_blocked_pause(reason) is True
++        assert is_transport_pause(reason) is False, (
++            "a blocked pause must not look like a transport pause, or the "
++            "supervisor would resume it"
++        )
++
++
++class TestBlockReasonClassifier:
++    """The deterministic net under a non-deterministic judge."""
++
++    @pytest.mark.parametrize("reason", [
++        "the upload is blocked on an owner decision",
++        "cannot proceed without the ArchiveHub credentials",
++        "awaiting approval from the owner",
++        "the goal remains open by design",
++        "work is complete but the final upload is still pending",
++        "everything is ready, however the submission remains outstanding",
++        "not yet fully satisfied",
++        "the agent reports no executable lanes",
++    ])
++    def test_block_language_is_detected(self, reason):
++        from hermes_cli.goals import _reason_describes_a_block
++
++        assert _reason_describes_a_block(reason) is True
++
++    @pytest.mark.parametrize("reason", [
++        "all tests pass and the deliverable is on disk",
++        "the migration completed; nothing is blocked",
++        "the dependency was unblocked and the build is green",
++        "the final report was written to /tmp/out.md",
++        "",
++        None,
++    ])
++    def test_completion_language_is_not_flagged(self, reason):
++        from hermes_cli.goals import _reason_describes_a_block
++
++        assert _reason_describes_a_block(reason) is False
++
++
++# ──────────────────────────────────────────────────────────────────────
++# helpers
++# ──────────────────────────────────────────────────────────────────────
++
++
++def _parse(raw: str):
++    from hermes_cli.goals import _parse_judge_response
++
++    return _parse_judge_response(raw)
++
++
++def _evaluate(mgr, verdict, reason, directive):
++    """Drive the real ``evaluate_after_turn`` with a stubbed judge call.
++
++    Patches ``judge_goal`` (the network boundary) and nothing else, so the
++    verdict → state transition under test is entirely production code.
++    """
++    from unittest.mock import patch
++
++    with patch(
++        "hermes_cli.goals.judge_goal",
++        return_value=(verdict, reason, False, directive, False),
++    ):
++        return mgr.evaluate_after_turn("did some work this turn",
++                                       user_initiated=True)
+diff --git a/tests/tools/test_goal_resume_supervisor.py b/tests/tools/test_goal_resume_supervisor.py
+index 47a8e18..efc19dd 100644
+--- a/tests/tools/test_goal_resume_supervisor.py
++++ b/tests/tools/test_goal_resume_supervisor.py
+@@ -376,3 +376,142 @@ def test_transport_classifier_is_the_loop_s_own(monkeypatch):
+     assert goals.is_transport_pause(TRANSPORT_REASON) is True
+     assert goals.is_transport_pause(LEGACY_REASON) is True
+     assert goals.is_transport_pause("user-paused") is False
++
++
++# ─────────────────────────────── the second stall class [bd-dre-df78a]
++#
++# A goal does not have to be PAUSED to have stopped. Session
++# 20260819_144700_aaaaaa's record said `active` at turn 3/400 while its pane sat
++# idle for ~50 minutes: every check here was keyed on status == "paused", so
++# nothing noticed. `stalled_active_goals` is the detector for that.
++
++STALLED_SID = "20260819_144700_aaaaaa"
++
++
++def _active(**over):
++    """An ACTIVE goal row, stalled by default (last turn 40 min ago)."""
++    base = {
++        "goal": "continue with all training implementations and full specs",
++        "status": "active", "turns_used": 3, "max_turns": 400,
++        "paused_reason": None, "last_turn_at": time.time() - 2400,
++        "last_verdict": "continue", "waiting_on_pid": None,
++        "waiting_on_session": None, "waiting_until": 0.0,
++        "consecutive_transport_failures": 0, "unjudged_turns": 0,
++        "consecutive_parse_failures": 0,
++    }
++    base.update(over)
++    return json.dumps(base)
++
++
++def test_resumes_a_stalled_active_goal(home, sent, monkeypatch):
++    """The 226 shape: active, turns left, no barrier, no turn in 40 minutes."""
++    _seed(home, {STALLED_SID: _active()})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stalled_active_goals"] == 1
++    assert report["resumed"] == 1
++    # One resume is two send-keys: the literal text, then Enter.
++    assert len(_resume_sends(sent)) == 2
++
++
++def test_a_fresh_active_goal_is_left_alone(home, sent, monkeypatch):
++    """A goal that took a turn a minute ago is working, not stalled."""
++    _seed(home, {STALLED_SID: _active(last_turn_at=time.time() - 60)})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["stalled_active_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_a_goal_with_no_last_turn_at_is_left_alone(home, sent, monkeypatch):
++    """A missing timestamp is UNKNOWN age, not infinite age. Reading epoch as
++    'infinitely stale' would make every freshly-set goal a candidate."""
++    for value in (None, 0, 0.0, "", "not-a-number"):
++        _h = home.parent / f"h-{value!r}"
++        _h.mkdir(parents=True, exist_ok=True)
++        monkeypatch.setenv("HERMES_HOME", str(_h))
++        _seed(_h, {STALLED_SID: _active(last_turn_at=value)})
++        _healthy(monkeypatch)
++        _one_session(monkeypatch, ids=(STALLED_SID,))
++        assert sup.sweep(settle=0.0)["stalled_active_goals"] == 0, value
++    assert _resume_sends(sent) == []
++
++
++@pytest.mark.parametrize("parked", [
++    {"waiting_on_pid": 4242},
++    {"waiting_on_session": "20260930_030303_cccccc"},
++    {"waiting_until": time.time() + 3600},
++])
++def test_a_parked_goal_is_not_stalled(home, sent, monkeypatch, parked):
++    """A wait barrier means the loop is waiting exactly as designed, and the
++    barrier will release it. Typing into it would cancel a legitimate park."""
++    _seed(home, {STALLED_SID: _active(**parked)})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["stalled_active_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_a_spent_budget_is_not_a_stall(home, sent, monkeypatch):
++    """An exhausted budget is a finished goal; resuming would hand out turns
++    the user never asked for."""
++    _seed(home, {STALLED_SID: _active(turns_used=400, max_turns=400)})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["stalled_active_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_a_done_goal_is_never_a_stall(home, sent, monkeypatch):
++    _seed(home, {STALLED_SID: _active(status="done")})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["stalled_active_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_a_stalled_goal_is_still_not_typed_into_mid_turn(home, sent, monkeypatch):
++    """The idle proof applies to BOTH stall classes — a held turn lease blocks
++    the send even for a goal that looks stalled by timestamp."""
++    _seed(home, {STALLED_SID: _active()},
++          lease=(STALLED_SID, "turn-holder", time.time(), time.time() + 600))
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    report = sup.sweep(settle=0.0)
++    assert report["resumed"] == 0
++    assert _resume_sends(sent) == []
++    assert any(c["action"] == "deferred" for c in report["candidates"])
++
++
++def test_a_stalled_goal_respects_the_rate_limit(home, sent, monkeypatch):
++    """One resume per session per --min-interval, same as the transport class."""
++    _seed(home, {STALLED_SID: _active()})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0)["resumed"] == 1
++    assert sup.sweep(settle=0.0)["resumed"] == 0
++    assert len(_resume_sends(sent)) == 2      # text + Enter, sent exactly once
++
++
++def test_a_blocked_pause_is_never_resumed(home, sent, monkeypatch):
++    """⛔ A `blocked` verdict is a question addressed to a HUMAN. No machine may
++    answer it, so the supervisor must not touch that pause."""
++    goals = sup._import_goals()
++    reason = goals.blocked_paused_reason("needs the ArchiveHub login from you")
++    _seed(home, {SID: _goal(status="paused", paused_reason=reason)})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch)
++    report = sup.sweep(settle=0.0)
++    assert report["paused_transport_goals"] == 0
++    assert report["stalled_active_goals"] == 0
++    assert _resume_sends(sent) == []
++
++
++def test_stall_threshold_is_configurable(home, sent, monkeypatch):
++    _seed(home, {STALLED_SID: _active(last_turn_at=time.time() - 300)})
++    _healthy(monkeypatch)
++    _one_session(monkeypatch, ids=(STALLED_SID,))
++    assert sup.sweep(settle=0.0, stall_seconds=1200)["stalled_active_goals"] == 0
++    assert sup.sweep(settle=0.0, stall_seconds=120)["stalled_active_goals"] == 1
+diff --git a/tools/goal_resume_supervisor.py b/tools/goal_resume_supervisor.py
+index 8d61df5..81fba49 100644
+--- a/tools/goal_resume_supervisor.py
++++ b/tools/goal_resume_supervisor.py
+@@ -16,8 +16,13 @@ route comes back, and the goal should simply carry on.
+ 
+ WHAT IT WILL DO, and nothing else:
+   • read every profile's ``state.db`` (``state_meta`` key ``goal:<session_id>``)
+-  • for a goal that is ``paused`` with a TRANSPORT-shaped ``paused_reason``
+-    (``goals.is_transport_pause`` — the marker, or the pre-marker text)
++  • for a goal in either STALL CLASS:
++      – ``paused`` with a TRANSPORT-shaped ``paused_reason``
++        (``goals.is_transport_pause`` — the marker, or the pre-marker text), or
++      – ``active`` with turns left, no wait barrier, and no goal turn for
++        ``--stall-seconds`` (``stalled_active_goals``) — the class that cost
++        Andre session 20260819_144700_aaaaaa, whose record said ``active`` at
++        turn 3/400 while the pane sat idle [bd-dre-df78a]
+   • when the judge route answers a real completion right now
+   • and the owning session is LIVE and IDLE
+   • send exactly the seven characters of ``/goal resume`` plus Enter into that
+@@ -25,9 +30,10 @@ WHAT IT WILL DO, and nothing else:
+ 
+ WHAT IT MUST NEVER DO:
+   • resume a goal paused by a human, by a real ``done``, by an exhausted turn
+-    budget, or by a judge PARSE failure. Those need a decision or a change no
+-    retry can make. Anything it does not positively recognise as transport is
+-    left alone.
++    budget, by a judge PARSE failure, or by a ``blocked`` verdict that needs a
++    human decision (``goals.is_blocked_pause``). Those need a decision or a
++    change no retry can make. Anything it does not positively recognise as one
++    of the two stall classes is left alone.
+   • type into a pane mid-turn. Keystrokes during a turn interrupt it — losing
+     exactly the work this is supposed to protect. Idleness must be proven, not
+     assumed (see ``session_is_idle``): no unexpired turn lease AND a pane whose
+@@ -65,6 +71,20 @@ DEFAULT_MAX_ATTEMPTS = 5              # then stop trying that session
+ DEFAULT_IDLE_SETTLE_S = 3.0           # gap between the two pane captures
+ DEFAULT_PROBE_TIMEOUT_S = 25.0        # judge-route health probe
+ 
++# ⛔ THE SECOND STALL CLASS: ACTIVE BUT NOT WORKING [bd-dre-df78a].
++#
++# A goal does not have to be PAUSED to have stopped. Measured on session
++# 20260819_144700_aaaaaa: the continuation hook returned without enqueueing
++# anything, so the goal's own record said ``active`` with 397 turns left while
++# the pane sat idle for the better part of an hour. Every check this supervisor
++# had was looking at ``status == "paused"``, so nothing noticed.
++#
++# The threshold is deliberately generous. A real turn on this box runs for many
++# minutes (a 137 s provider stall is routine), and the idle proof below is what
++# actually protects a running turn — this only decides how long a SILENT pane is
++# tolerated before it counts as stalled rather than slow.
++DEFAULT_STALL_SECONDS = 1200.0        # 20 min of no goal turn = stalled
++
+ # Composer placeholders and spinner text that mean "this session is doing
+ # something" (cli.py::_get_placeholder, and the streaming wait line). Presence of
+ # ANY of these on the visible pane blocks a send even if the lease looks clear.
+@@ -201,6 +221,7 @@ def paused_goals(goals_mod: Any) -> List[Dict[str, Any]]:
+                 "db": str(db),
+                 "profile_home": str(home),
+                 "session_id": session_id,
++                "stall_class": "transport-paused",
+                 "paused_reason": reason,
+                 "goal": str(data.get("goal") or "")[:160],
+                 "turns_used": data.get("turns_used"),
+@@ -211,6 +232,124 @@ def paused_goals(goals_mod: Any) -> List[Dict[str, Any]]:
+     return found
+ 
+ 
++def _as_float(value: Any) -> float:
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return 0.0
++
++
++def stalled_active_goals(
++    goals_mod: Any, *, stall_seconds: float = DEFAULT_STALL_SECONDS,
++    now: Optional[float] = None,
++) -> List[Dict[str, Any]]:
++    """Every goal that says ``active`` but has not taken a turn in ages.
++
++    The second stall class [bd-dre-df78a]. An ``active`` goal with turns left is
++    supposed to be working; when its last turn is older than ``stall_seconds``
++    the loop has silently dropped the continuation and no human is coming.
++
++    Every uncertainty resolves to NOT a candidate, matching
++    :func:`session_is_idle`:
++
++      • a goal legitimately PARKED on a barrier (``/goal wait``, a judge
++        ``wait``, a ``defer`` that escalated) is not stalled — it is waiting
++        exactly as designed, and its barrier will release it.
++      • a goal with no usable ``last_turn_at`` is not judged at all. A missing
++        timestamp is unknown age, not old age — and reading it as "epoch, so
++        infinitely stale" would make every fresh goal a candidate.
++      • a goal whose budget is spent is not stalled, it is finished; resuming it
++        would hand out a budget the user did not ask for.
++    """
++    ts = time.time() if now is None else now
++    found: List[Dict[str, Any]] = []
++    for profile, db, home in state_dbs():
++        try:
++            con = _connect_ro(db)
++        except Exception as exc:
++            LOG.warning("skip %s (%s): cannot open state.db: %s", profile, db, exc)
++            continue
++        try:
++            rows = con.execute(
++                "SELECT key, value FROM state_meta WHERE key LIKE 'goal:%'"
++            ).fetchall()
++        except Exception as exc:
++            LOG.warning("skip %s: state_meta read failed: %s", profile, exc)
++            continue
++        finally:
++            try:
++                con.close()
++            except Exception:
++                pass
++        for key, value in rows:
++            session_id = str(key)[len("goal:"):]
++            try:
++                data = json.loads(value)
++            except Exception:
++                continue
++            if not isinstance(data, dict) or data.get("status") != "active":
++                continue
++            label = f"{profile}/{session_id}"
++
++            turns_used = _as_float(data.get("turns_used"))
++            max_turns = _as_float(data.get("max_turns"))
++            if max_turns > 0 and turns_used >= max_turns:
++                LOG.debug("leave %s alone: turn budget is spent", label)
++                continue
++
++            # A parked goal is working as designed — never a stall.
++            if data.get("waiting_on_pid") or data.get("waiting_on_session"):
++                LOG.debug("leave %s alone: parked on a wait barrier", label)
++                continue
++            if _as_float(data.get("waiting_until")) > ts:
++                LOG.debug("leave %s alone: wait barrier has not expired", label)
++                continue
++
++            last_turn_at = _as_float(data.get("last_turn_at"))
++            if last_turn_at <= 0:
++                LOG.debug("leave %s alone: no usable last_turn_at", label)
++                continue
++            idle_for = ts - last_turn_at
++            if idle_for < stall_seconds:
++                continue
++
++            found.append({
++                "profile": profile,
++                "db": str(db),
++                "profile_home": str(home),
++                "session_id": session_id,
++                "stall_class": "stalled-active",
++                "paused_reason": (
++                    f"active but no goal turn for {idle_for / 60.0:.0f} min "
++                    f"({turns_used:.0f}/{max_turns:.0f} turns used) — the "
++                    f"continuation was dropped"
++                ),
++                "goal": str(data.get("goal") or "")[:160],
++                "turns_used": data.get("turns_used"),
++                "max_turns": data.get("max_turns"),
++                "idle_seconds": round(idle_for, 1),
++                "last_verdict": data.get("last_verdict"),
++            })
++    return found
++
++
++def resumable_goals(
++    goals_mod: Any, *, stall_seconds: float = DEFAULT_STALL_SECONDS,
++) -> List[Dict[str, Any]]:
++    """Both stall classes, in one list, each tagged with its ``stall_class``.
++
++    Everything downstream (rate limiting, route probe, pane ownership, the idle
++    proof, the single ``/goal resume``) is identical for the two classes — only
++    the detection differs — so the sweep does not branch on the class.
++    """
++    out = list(paused_goals(goals_mod))
++    seen = {(c["profile"], c["session_id"]) for c in out}
++    for c in stalled_active_goals(goals_mod, stall_seconds=stall_seconds):
++        if (c["profile"], c["session_id"]) not in seen:
++            out.append(c)
++    return out
++
++
+ # ───────────────────────────────────────────────────────── session → tmux pane
+ 
+ 
+@@ -563,6 +702,7 @@ def sweep(
+     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+     settle: float = DEFAULT_IDLE_SETTLE_S,
+     probe_timeout: float = DEFAULT_PROBE_TIMEOUT_S,
++    stall_seconds: float = DEFAULT_STALL_SECONDS,
+ ) -> Dict[str, Any]:
+     """One pass. Returns a JSON-able report of every goal considered."""
+     goals_mod = _import_goals()
+@@ -570,8 +710,11 @@ def sweep(
+         "at": time.time(), "dry_run": dry_run, "candidates": [], "resumed": 0,
+     }
+ 
+-    candidates = paused_goals(goals_mod)
+-    report["paused_transport_goals"] = len(candidates)
++    candidates = resumable_goals(goals_mod, stall_seconds=stall_seconds)
++    report["paused_transport_goals"] = sum(
++        1 for c in candidates if c.get("stall_class") == "transport-paused")
++    report["stalled_active_goals"] = sum(
++        1 for c in candidates if c.get("stall_class") == "stalled-active")
+ 
+     ledger = load_ledger()
+     dirty = False
+@@ -586,10 +729,10 @@ def sweep(
+     for key in [k for k in ledger if k not in still]:
+         ledger.pop(key, None)
+         dirty = True
+-        LOG.info("cleared ledger for %s (no longer paused for transport)", key)
++        LOG.info("cleared ledger for %s (goal is working again)", key)
+ 
+     if not candidates:
+-        LOG.info("no goal is paused for a transport reason — nothing to do")
++        LOG.info("no goal is paused for transport and none is stalled — nothing to do")
+         if dirty:
+             save_ledger(ledger)
+         return report
+@@ -604,7 +747,8 @@ def sweep(
+ 
+     for c in candidates:
+         key = f"{c['profile']}/{c['session_id']}"
+-        LOG.info("candidate %s: %r", key, c["paused_reason"])
++        LOG.info("candidate %s [%s]: %r", key,
++                 c.get("stall_class", "?"), c["paused_reason"])
+ 
+         ok, why = rate_limit_check(
+             ledger, key, min_interval=min_interval, max_attempts=max_attempts)
+@@ -687,6 +831,9 @@ def main(argv: Optional[List[str]] = None) -> int:
+                     help="seconds between the two pane captures used to prove idleness")
+     ap.add_argument("--probe-timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_S,
+                     help="judge-route probe deadline, seconds")
++    ap.add_argument("--stall-seconds", type=float, default=DEFAULT_STALL_SECONDS,
++                    help="an ACTIVE goal with no turn for this long counts as "
++                         "stalled (default 1200 = 20 min)")
+     ap.add_argument("-v", "--verbose", action="store_true")
+     args = ap.parse_args(argv)
+ 
+@@ -706,7 +853,7 @@ def main(argv: Optional[List[str]] = None) -> int:
+         report = sweep(
+             dry_run=args.dry_run, min_interval=args.min_interval,
+             max_attempts=args.max_attempts, settle=args.settle,
+-            probe_timeout=args.probe_timeout,
++            probe_timeout=args.probe_timeout, stall_seconds=args.stall_seconds,
+         )
+     except Exception as exc:
+         LOG.exception("sweep failed: %s", exc)
+-- 
+2.43.0

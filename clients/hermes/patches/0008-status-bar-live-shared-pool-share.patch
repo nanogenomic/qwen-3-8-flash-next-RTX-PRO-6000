@@ -1,0 +1,1757 @@
+From 3e1599f14e360f45512d9ad98222a0ab3e86c86c Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 18:25:50 -0400
+Subject: [PATCH] status bar: the ctx denominator is the live shared-pool
+ share, not the static profile window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two main sessions on one 451,264-token shared KV pool rendered
+"ctx 175K/393.2K" and "ctx 234K/393.2K" -- the static profile context_length,
+786,432 tokens of claimed window between them -- while the broker was
+granting each of them 196,608. Nothing on either bar said they were sharing
+anything.  [measured]
+
+This is the same class of defect as patch 0001, one layer down. 0001 fixed a
+figure that was read from the shared backend and labelled as though it were
+the session's own. Here the figure is the session's own and the DENOMINATOR is
+the lie: a percentage against a window the session will never be allowed to
+fill.
+
+A new module reads the document the pool broker publishes (share-bounded since
+patch 0003) and turns it into what the bar divides by:
+
+  ctx 40K/196.6K  | [##........] 20% | 2 mains, 451.3K pool
+  ctx 40K/401.4K  | [#.........] 10% | 1 main,  451.3K pool
+  ctx 175K/393.2K | [####......] 44% | 2 mains, 451.3K pool, share 196.6K (over)
+
+The ceiling is the GRANT when the grant can be adopted without forcing a
+compaction -- the same footprint test the compressor applies -- and otherwise
+the window the session genuinely holds. So a grandfathered session is shown
+honestly rather than pegged, and no window is lowered anywhere by a display.
+A revocable loan is labelled on both sides.
+
+DISPLAY ONLY, and the tests enforce it. It never writes, never probes the
+backend, and never calls get_allowance(), which may refresh over the network
+on the UI thread. 64 us per repaint: one stat() plus a parse, and only when
+the broker has rewritten the file.  [measured] It degrades to the static
+configured window when the document is absent, stale (>90 s, matching the
+broker's own VRAM-sample age ceiling), or published by a peer old enough that
+its ceilings are not share-bounded.
+
+A frozen compressor in the test fixture turns any write from the display path
+into a failure, and the ceiling tests drive the broker's real
+derive_window_ceilings() for the 1/2/3-main splits, the loan pair, and a
+1,310,720-token pool -- so the display cannot drift from the thing it
+displays.
+
+BASE: the tree left by patch 0007 (see BASELINE.md).
+
+PUBLISHED FORM. A private backend address becomes 127.0.0.1, two live
+process ids become synthetic ones, and an internal pane reference is
+generalised.
+
+---
+ cli.py                                      |  122 +++++
+ hermes_cli/pool_share.py                    |  441 +++++++++++++++++++
+ tests/cli/test_cli_status_bar_pool_share.py |  638 +++++++++++++++++++++++++++
+ tests/hermes_cli/test_pool_share.py         |  422 ++++++++++++++++++
+ 4 files changed, 1609 insertions(+), 14 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index 90d1bf9..f15c176 100644
+--- a/cli.py
++++ b/cli.py
+@@ -6500,6 +6500,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             ),
+             "context_tokens": 0,
+             "context_length": None,
++            # ⛔ THE CEILING IS NOT THE CONFIG. context_length is the window this
++            # session is running at right now; context_ceiling is what it may
++            # actually occupy, which on the shared GPU0 pool is the broker's
++            # live per-session grant. They differ whenever a peer main is up.
++            # See hermes_cli.pool_share. None = no live share -> fall back to
++            # context_length, which is exactly the pre-2026-09-30 behaviour.
++            "context_ceiling": None,
++            "pool_share": None,
+             "context_percent": None,
+             "session_input_tokens": 0,
+             "session_output_tokens": 0,
+@@ -6753,8 +6761,48 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+             snapshot["context_tokens"] = context_tokens
+             snapshot["context_length"] = context_length or None
+             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
+-            if context_length:
+-                snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
++
++            # ── the SHARED pool's live grant, not the static profile ───────
++            # ⛔ READ-ONLY, AND IT MUST STAY THAT WAY. This runs on the UI
++            # thread on every repaint. hermes_cli.pool_share does one stat()
++            # plus (only when the broker has rewritten it) one small json
++            # parse; it never calls pool_broker.get_allowance(), which may
++            # refresh over the network. It cannot write, cannot shrink a live
++            # session and cannot provoke a compaction -- it produces text.
++            # Any failure leaves context_ceiling None and the bar renders
++            # exactly as it did before this existed.
++            ceiling = context_length
++            try:
++                from hermes_cli import pool_share as _pool_share
++
++                view = _pool_share.get_lane_share(
++                    window=context_length,
++                    prompt_tokens=context_tokens,
++                    max_tokens=int(getattr(compressor, "max_tokens", 0) or 0),
++                    threshold_percent=float(
++                        getattr(compressor, "_base_threshold_percent", 0.5) or 0.5
++                    ),
++                )
++                if view.get("present"):
++                    snapshot["pool_share"] = view
++                if view.get("usable") and view.get("ceiling"):
++                    ceiling = int(view["ceiling"])
++            except Exception:
++                pass
++            snapshot["context_ceiling"] = ceiling or None
++            if ceiling:
++                # Percent against the CEILING, so the gauge and the ``ctx``
++                # field never carry two different denominators on one row. At
++                # an adoptable grant this reads higher than it used to -- and
++                # truthfully so: a 159K prompt against a 196,608 grant really
++                # is 81% of the way to that grant's compaction trigger, where
++                # 41% of the unreachable 393,216 config said "plenty of room".
++                # In the over-share case the ceiling IS the held window, so the
++                # number is unchanged and the bar never pegs a session that is
++                # legitimately holding more than its share.
++                snapshot["context_percent"] = max(
++                    0, min(100, round((context_tokens / ceiling) * 100))
++                )
+ 
+         return snapshot
+ 
+@@ -7621,6 +7669,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         except Exception:
+             return ""
+ 
++    @staticmethod
++    def _status_bar_context_field(snapshot: Dict[str, Any]) -> str:
++        """``ctx <used>/<ceiling>`` — the ceiling this lane may ACTUALLY occupy.
++
++        ⛔ THE DENOMINATOR IS NOT THE PROFILE'S ``context_length``. On the shared
++        GPU0 KV pool it is the broker's live per-session grant, so a peer main
++        launching or exiting moves this number within a refresh. Before this,
++        two architect mains on one 451,264-token pool both rendered
++        ``/393.2K`` — the static profile config, 786,432 tokens of claimed
++        window between them, and no way to tell from the bar that they were
++        sharing anything at all. ``context_ceiling`` falls back to
++        ``context_length`` whenever there is no usable live share (document
++        absent, stale, or published by a pre-301b96a peer), which is the
++        pre-existing behaviour unchanged.
++        """
++        total = snapshot.get("context_ceiling") or snapshot.get("context_length")
++        if not total:
++            return "ctx --"
++        ctx_used = format_token_count_compact(snapshot["context_tokens"])
++        return f"ctx {ctx_used}/{_format_context_length(int(total))}"
++
++    @staticmethod
++    def _status_bar_share_field(snapshot: Dict[str, Any], width: int) -> tuple:
++        """``(style, text)`` for the pool-sharing field, or ``()``.
++
++        Separate from the ``ctx`` field because it answers a different question:
++        ``ctx`` says how much room this lane has, this field says who it is
++        dividing the pool with and whether anything unusual is true of the
++        split (holding more than the share, a revocable loan, a peer publishing
++        unbounded ceilings, a dead publisher). Empty whenever the broker
++        document is absent — an install with no shared pool spends no cells on
++        saying so.
++        """
++        try:
++            from hermes_cli import pool_share as _pool_share
++
++            view = snapshot.get("pool_share")
++            text = _pool_share.share_segment(view, width=int(width or 0))
++            if not text:
++                return ()
++            return (_pool_share.segment_style(view), text)
++        except Exception:
++            return ()
++
+     @classmethod
+     def _status_bar_delegation_fields(cls, snapshot: Dict[str, Any]) -> list:
+         """Return the delegation lane as ``(keep_rank, text)``, or ``[]``.
+@@ -7960,12 +8052,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     parts.append("⚠ YOLO")
+                 return self._right_align_status_title(" · ".join(parts), session_title, width)
+ 
+-            if snapshot["context_length"]:
+-                ctx_total = _format_context_length(snapshot["context_length"])
+-                ctx_used = format_token_count_compact(snapshot["context_tokens"])
+-                context_label = f"ctx {ctx_used}/{ctx_total}"  # this session, not the shared pool
+-            else:
+-                context_label = "ctx --"
++            context_label = self._status_bar_context_field(snapshot)
+ 
+             compressions = snapshot.get("compressions", 0)
+             # Second lane (delegation model). Built first so the architect
+@@ -7980,6 +8067,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                 else f"⚕ {snapshot['model_short']}"
+             )
+             parts = [main_label, context_label, percent_label]
++            share_field = self._status_bar_share_field(snapshot, width)
++            if share_field:
++                parts.append(share_field[1])
+             if battery_label:
+                 parts.insert(0, battery_label)
+             if compressions:
+@@ -8191,12 +8281,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                         frags.append(("class:status-bar-yolo", overflow_narrow))
+                     frags.append(("class:status-bar", " "))
+                 else:
+-                    if snapshot["context_length"]:
+-                        ctx_total = _format_context_length(snapshot["context_length"])
+-                        ctx_used = format_token_count_compact(snapshot["context_tokens"])
+-                        context_label = f"ctx {ctx_used}/{ctx_total}"  # this session, not the shared pool
+-                    else:
+-                        context_label = "ctx --"
++                    context_label = self._status_bar_context_field(snapshot)
+ 
+                     bar_style = self._status_bar_context_style(percent)
+                     compressions = snapshot.get("compressions", 0)
+@@ -8220,6 +8305,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                         ("class:status-bar-dim", " "),
+                         (bar_style, percent_label),
+                     ]
++                    # ── who this lane is sharing the KV pool with ───────────
++                    # Placed right after the gauge it explains: the ctx
++                    # denominator above is a SHARE, and a denominator that
++                    # halves when a peer main launches has to be legible as
++                    # sharing rather than as the bar losing its mind.
++                    share_field = self._status_bar_share_field(snapshot, width)
++                    if share_field:
++                        frags.append(("class:status-bar-dim", " │ "))
++                        frags.append(share_field)
+                     if compressions:
+                         frags.append(("class:status-bar-dim", " │ "))
+                         frags.append((self._compression_count_style(compressions), f"🗜 {compressions}"))
+diff --git a/hermes_cli/pool_share.py b/hermes_cli/pool_share.py
+new file mode 100644
+index 0000000..3a498ee
+--- /dev/null
++++ b/hermes_cli/pool_share.py
+@@ -0,0 +1,441 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""DISPLAY-ONLY view of the shared GPU0 KV pool, for the CLI status bar.
++
++⛔ WHY THIS EXISTS.  ``agent/pool_broker.py`` publishes a per-session,
++share-bounded window grant about every 5 s — ``sessions[<pid>].main_window`` and
++``main_grow_max``, bounded against the LIVE ``max_total_num_tokens`` since
++``301b96a`` [bd-dre-x3n0x].  The status bar never read it.  Its ``ctx`` field
++divided by the *static profile* ``context_length`` instead, so two architect
++mains sharing one 451,264-token pool both rendered ``ctx 159K/393.2K`` and
++``ctx 224K/393.2K`` — 786,432 tokens of claimed window against a 451,264-token
++pool, with nothing on screen saying they were sharing it or that the broker's
++real grant was 196,608 each.  Andre, 2026-09-30: *"shouldn't they dynamically
++adjust each other including in the hermes GUI?"* [bd-dre-hxxze]
++
++⛔ WHAT THIS MODULE MAY NOT DO.  It is a READER.  It never writes the document,
++never probes the backend or the router, never calls
++``pool_broker.get_allowance()`` (which may refresh over the network and would
++stall a repaint on the UI thread), and it never touches a live agent's
++geometry.  Nothing here can lower a window, raise one, or trigger a compaction:
++the only thing it produces is text.  Andre, 2026-09-30: *"i like long context
++and our speeds are still good"* — the point is honest sharing and visibility,
++never a smaller window.
++
++⛔ WHAT IT SHOWS.  Three separate facts, which the old single number conflated:
++
++  * **the ceiling this lane may actually occupy right now** — the broker's grant
++    when the grant can be adopted without forcing a compaction, otherwise the
++    window the session is genuinely holding (see :func:`lane_share`);
++  * **the pool it comes out of** and **how many mains are dividing it**, so a
++    denominator that halves when a peer launches is legible rather than
++    mysterious;
++  * **over-share**, when this session holds more than its share.  That is a
++    REAL, legitimate state — the broker calls it *grandfathered* and only a
++    relaunch clears it — so it is displayed honestly rather than treated as an
++    error, and it never provokes a shrink from the display path.
++
++Degradation, in the order the cases actually happen:
++
++  * **document absent** (broker disabled, a non-GPU0 backend, a fresh install) →
++    ``present=False``; the bar keeps the static behaviour exactly.
++  * **document stale** → ``fresh=False``.  The threshold is
++    ``DISPLAY_MAX_AGE_S`` = 90 s, the same age the broker allows its serving-host VRAM
++    sample (``pool_broker.VRAM_SAMPLE_MAX_AGE_S``); the document itself is
++    rewritten every ~5 s, so 90 s means the publisher is gone, not merely busy.
++  * **document written by an OLDER peer** whose ceilings are not share-bounded
++    (Andre's two sessions published exactly this until 301b96a landed) →
++    ``bounded=False``.  A grant above the pool ceiling, or grants that sum above
++    it, is not a grant: it is the pre-fix unbounded number, and quoting it as
++    "your share" would be a worse lie than the static config was.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++from pathlib import Path
++from typing import Any, Dict, Optional, Tuple
++
++#: A document older than this is not shown as the live share.  Matches
++#: ``pool_broker.VRAM_SAMPLE_MAX_AGE_S`` — the precedent in this codebase for
++#: "a sample this old is not evidence about now" — and is 18x the broker's own
++#: ~5 s publish interval, so it only trips when the publisher has actually died.
++DISPLAY_MAX_AGE_S = float(os.environ.get("HERMES_POOL_DISPLAY_MAX_AGE_S", "90"))
++
++#: Parsed-document cache, keyed on the file's identity rather than on a clock:
++#: ``(path, mtime_ns, size)``.  The status bar repaints on a timer and every
++#: repaint asks for this view, so the parse must not repeat — but a TTL would
++#: also make a freshly-written document invisible for up to the TTL, which is
++#: exactly the "show it changing" behaviour this module exists to provide.  A
++#: stat() per repaint costs microseconds; a json parse of a ~4 KB document is
++#: only paid when the broker has actually rewritten it.
++_cache: Dict[str, Any] = {"key": None, "doc": None}
++_cache_lock = threading.Lock()
++
++
++def invalidate() -> None:
++    """Drop the parsed-document cache (tests; never needed in production)."""
++    with _cache_lock:
++        _cache["key"] = None
++        _cache["doc"] = None
++
++
++def document_path() -> Optional[Path]:
++    """Where the broker publishes, resolved the way the broker resolves it.
++
++    Deliberately routed through ``pool_broker._allowance_path()`` rather than
++    rebuilt here: the test suite's isolation fixture repoints that one function
++    at a per-test tempdir, and a second copy of the path logic would walk
++    straight past the guard and read (or, in a future edit, write) live
++    production state.
++    """
++    try:
++        from agent import pool_broker as pb
++
++        return Path(pb._allowance_path())
++    except Exception:
++        return None
++
++
++def read_document(path: Optional[Path] = None,
++                  now: Optional[float] = None) -> Tuple[Optional[dict], float]:
++    """``(document, age_seconds)``; ``(None, inf)`` when unreadable.
++
++    Pure read.  No lock is taken on the file: the broker writes it atomically
++    (temp file + rename), so a reader either sees the whole previous document or
++    the whole new one, and a torn parse degrades to ``(None, inf)`` anyway.
++    """
++    import json
++    import time
++
++    now = time.time() if now is None else now
++    try:
++        p = Path(path) if path is not None else document_path()
++        if p is None:
++            return None, float("inf")
++        st = p.stat()
++        key = (str(p), st.st_mtime_ns, st.st_size)
++        with _cache_lock:
++            if _cache["key"] == key:
++                doc = _cache["doc"]
++                if doc is None:
++                    return None, float("inf")
++                return doc, max(0.0, now - float(doc.get("updated") or 0.0))
++        doc = json.loads(p.read_text(encoding="utf-8"))
++        if not isinstance(doc, dict):
++            doc = None
++        with _cache_lock:
++            _cache["key"], _cache["doc"] = key, doc
++        if doc is None:
++            return None, float("inf")
++        return doc, max(0.0, now - float(doc.get("updated") or 0.0))
++    except Exception:
++        return None, float("inf")
++
++
++def _grant_of(entry: object) -> int:
++    """The window a session entry says its lane may occupy, in tokens.
++
++    ``max`` of the two published ceilings on purpose.  ``pool_policy`` lets
++    ``main_grow_max`` sit BELOW ``main_window`` — that is how "hold what you
++    have but stop growing" is expressed — so the smaller of the pair is a growth
++    stop, not a statement that the lane may not run at the window it was
++    granted.
++    """
++    if not isinstance(entry, dict):
++        return 0
++    try:
++        return max(int(entry.get("main_window") or 0),
++                   int(entry.get("main_grow_max") or 0))
++    except Exception:
++        return 0
++
++
++def _trigger_for(window: int, max_tokens: int, threshold_percent: float) -> int:
++    """Compaction trigger for ``window``, via the broker's own arithmetic.
++
++    ``pool_broker.footprint`` is the single definition of this in the codebase
++    (a faithful port of ``ContextCompressor._compute_threshold_tokens``).
++    Calling it keeps the display's "could this grant be adopted right now?" test
++    identical to the one ``ContextCompressor._maybe_pool_adopt_share`` applies
++    when it actually adopts — so the bar can never promise a ceiling the
++    compressor would refuse, or refuse one it is about to take.  0 on any
++    failure, which reads as "not adoptable" and keeps the held window.
++    """
++    try:
++        from agent import pool_broker as pb
++
++        return int(pb.footprint(int(window), int(max_tokens or 0),
++                                float(threshold_percent or 0.5)))
++    except Exception:
++        return 0
++
++
++def lane_share(doc: Optional[dict], *, pid: Optional[int] = None,
++               window: int = 0, prompt_tokens: int = 0, max_tokens: int = 0,
++               threshold_percent: float = 0.5, age_s: float = 0.0,
++               max_age_s: Optional[float] = None) -> Dict[str, Any]:
++    """Turn the published document into the numbers the bar renders.
++
++    ``window`` is this session's LIVE window (``ContextCompressor.context_length``),
++    not the profile's configured one — it already moves when the compressor grows
++    or adopts, and it is the only local truth about what the session holds.
++
++    The returned ``ceiling`` is what the bar should divide by, chosen by the one
++    test that decides whether the grant is real for this session right now:
++
++      * ``grant >= window`` — the grant is headroom the compressor will grow
++        into, so the grant is the ceiling;
++      * ``grant < window`` but the grant's trigger is still above the resident
++        prompt — the compressor will settle onto the grant without compacting
++        anything, so the grant is the ceiling;
++      * ``grant < window`` and the grant's trigger is already below the resident
++        prompt — the grant CANNOT be applied without forcing a compaction the
++        broker did not ask for, so the session keeps the window it holds.  That
++        is ``over_share``: honest, expected, cleared only by a relaunch, and
++        explicitly never a reason for the display to shrink anything.
++
++    Never raises.  Every field is present on every path.
++    """
++    limit = DISPLAY_MAX_AGE_S if max_age_s is None else float(max_age_s)
++    window = max(0, int(window or 0))
++    view: Dict[str, Any] = {
++        "present": False,
++        "fresh": False,
++        "stale": False,
++        "age_s": float(age_s),
++        "max_age_s": limit,
++        "pool": None,
++        "n_mains": None,
++        "peers": None,
++        "grant": None,
++        "bounded": False,
++        "usable": False,
++        "ceiling": window or None,
++        "ceiling_source": "window",
++        "over_share": False,
++        "over_tokens": 0,
++        "loan": "",
++        "reason": "",
++    }
++    try:
++        if not isinstance(doc, dict) or not doc:
++            return view
++        view["present"] = True
++        if age_s > limit:
++            view["stale"] = True
++            return view
++        view["fresh"] = True
++
++        # The LIVE pool, read from the document every repaint. A concurrent
++        # effort may raise it to ~1.31M via host-RAM KV offload; nothing here
++        # needs editing for that -- the number simply changes.
++        ceiling_tokens = 0
++        for key in ("ceiling", "pool"):
++            try:
++                ceiling_tokens = int(doc.get(key) or 0)
++            except Exception:
++                ceiling_tokens = 0
++            if ceiling_tokens > 0:
++                break
++        view["pool"] = ceiling_tokens or None
++        try:
++            n_mains = int(doc.get("n_mains") or 0)
++        except Exception:
++            n_mains = 0
++        sessions = doc.get("sessions")
++        if not isinstance(sessions, dict):
++            sessions = {}
++        if not n_mains:
++            n_mains = len(sessions)
++        view["n_mains"] = n_mains or None
++        view["peers"] = max(0, n_mains - 1) if n_mains else None
++
++        me = str(int(pid if pid is not None else os.getpid()))
++        mine = sessions.get(me)
++        grant = _grant_of(mine)
++        if isinstance(mine, dict):
++            # The broker's own sentence about why this grant is what it is.
++            # Not rendered on the bar (no room) -- carried for /pool-style
++            # detail and for a log line that has to explain a denominator.
++            view["reason"] = str(mine.get("reason") or "")
++        if not grant:
++            return view                      # not a main on this pool
++        view["grant"] = grant
++
++        # ⛔ OLD PEER, UNBOUNDED CEILINGS. Before 301b96a the broker handed every
++        # main the whole pool (main_window == main_grow_max == pool), which is
++        # what Andre's two sessions were publishing minutes before this shipped.
++        # Such a number is not a share and must not be quoted as one: a grant
++        # above the pool, or grants that sum above it, means whoever refreshed
++        # the document last is running pre-fix policy.
++        #
++        # The test is ``sum > ceiling``, not ``sum >= ceiling``, on purpose. A
++        # LONE main legitimately gets the whole pool — the current policy hands
++        # it exactly ``ceiling`` at a 1,310,720 pool — and one main cannot
++        # starve anyone, which is why the 2026-09-30 deadlock needed two. So
++        # grants that sum TO the ceiling are a valid split; only a sum above it
++        # is the oversubscription that wedged the pool.
++        grants = [_grant_of(v) for v in sessions.values()]
++        granted_sum = sum(g for g in grants if g > 0)
++        if ceiling_tokens and (grant > ceiling_tokens or granted_sum > ceiling_tokens):
++            return view                      # bounded stays False
++        view["bounded"] = True
++        view["usable"] = True
++
++        # Asymmetric grants mean the broker lent part of an idle main's share to
++        # a busy one -- revocable, and worth saying so the denominator moving
++        # back down later is not a surprise.
++        others = [g for k, g in zip(sessions.keys(), grants) if k != me and g > 0]
++        if others:
++            if grant > max(others):
++                view["loan"] = "borrow"
++            elif grant < min(others):
++                view["loan"] = "lend"
++
++        if not window or grant >= window:
++            view["ceiling"] = grant
++            view["ceiling_source"] = "grant"
++        elif _trigger_for(grant, max_tokens, threshold_percent) > int(prompt_tokens or 0):
++            # Adoptable now: lowering the window would not force a compaction,
++            # so the grant is what this lane may actually occupy.
++            view["ceiling"] = grant
++            view["ceiling_source"] = "grant"
++        else:
++            # Holding more than the share. Keep the held window as the ceiling
++            # -- it is what the session really has, and the broker will not take
++            # it back -- and flag the over-share so the bar can say both.
++            view["ceiling"] = window
++            view["ceiling_source"] = "window"
++            view["over_share"] = True
++            view["over_tokens"] = max(0, window - grant)
++        return view
++    except Exception:
++        return view
++
++
++def get_lane_share(*, pid: Optional[int] = None, window: int = 0,
++                   prompt_tokens: int = 0, max_tokens: int = 0,
++                   threshold_percent: float = 0.5,
++                   path: Optional[Path] = None) -> Dict[str, Any]:
++    """:func:`lane_share` against the document on disk.  Never raises, never
++    blocks on the network, safe to call from a repaint."""
++    doc, age = read_document(path)
++    return lane_share(doc, pid=pid, window=window, prompt_tokens=prompt_tokens,
++                      max_tokens=max_tokens, threshold_percent=threshold_percent,
++                      age_s=age)
++
++
++# --------------------------------------------------------------------- render
++def _compact(tokens: int) -> str:
++    """``451264`` → ``451.3K``.  Shares the banner's formatter so the share
++    field and the ``ctx`` field it sits next to can never disagree about how a
++    token count is spelled."""
++    try:
++        from hermes_cli.banner import _format_context_length
++
++        return _format_context_length(int(tokens))
++    except Exception:
++        return str(int(tokens))
++
++
++def _age_label(age_s: float) -> str:
++    try:
++        age = int(max(0.0, float(age_s)))
++    except Exception:
++        return "?"
++    if age < 90:
++        return f"{age}s"
++    if age < 5400:
++        return f"{age // 60}m"
++    return f"{age // 3600}h"
++
++
++#: Minimum pane width that gets the spelled-out share field.  Both Hermes panes
++#: on this host are 220-224 columns.  Measured at 160: the architect row is 154
++#: cells with the field, so it fits with the bar's usual complement of counters.
++WIDE_MIN_WIDTH = 160
++
++#: Between this and :data:`WIDE_MIN_WIDTH`, only a MARKER state earns cells —
++#: over-share, a loan, unbounded ceilings, a dead publisher.  The ``ctx``
++#: denominator already carries the live grant, which is the part that was
++#: actually wrong, and it costs nothing.  Below this the field is dropped
++#: entirely: measured at 120 the architect row is already 110 cells, so a
++#: 22-cell field would push the tail (``↯ tok/s``, the turn timer) off the edge,
++#: and trading two live counters for a static one is the trade the two-row
++#: layout was built to stop making.
++MARKER_MIN_WIDTH = 140
++
++
++def share_segment(view: Optional[Dict[str, Any]], *, width: int = 224) -> str:
++    """One compact status-bar field for the sharing state, or ``""``.
++
++    ``⇄`` is the only glyph added.  U+21C4 is East-Asian-Width *Neutral* and
++    ``get_cwidth`` scores it 1 — the same class and score as ``⇉`` (U+21C9),
++    which was measured against this TUI's terminal in
++    ``tests/cli/test_cli_status_bar_column_drift``.  That agreement is not
++    cosmetic: prompt_toolkit repaints the bar differentially, so one cell of
++    disagreement between its column model and the terminal's splices two frames
++    together (see ``cli._strip_presentation_selectors``).  ``▲`` and ``⚠`` are
++    both already in the measured set.
++    """
++    if not isinstance(view, dict) or not view.get("present"):
++        return ""
++    cells = int(width or 0)
++    if cells < MARKER_MIN_WIDTH:
++        return ""
++    wide = cells >= WIDE_MIN_WIDTH
++    if view.get("stale"):
++        # Say the pool read-out is old rather than quoting old numbers as now.
++        return f"⇄ pool stale {_age_label(view.get('age_s') or 0)} ⚠"
++
++    if not view.get("grant"):
++        # This process is not a main on the shared pool (a subagent, a lane on
++        # another backend, a session the broker has not seen yet). It has no
++        # share, so it spends no cells claiming one -- and must not imply that
++        # the ceiling the bar is showing came from the pool.
++        return ""
++
++    pool = view.get("pool")
++    n_mains = view.get("n_mains")
++    marks = []
++    if not view.get("bounded"):
++        # An older peer is publishing ceilings that are not share-bounded, so
++        # there is no trustworthy share to name -- only the pool and the peers.
++        marks.append("no share cap ⚠")
++    else:
++        if view.get("over_share") and view.get("grant"):
++            marks.append(f"share {_compact(int(view['grant']))} ▲")
++        loan = view.get("loan")
++        if loan == "borrow":
++            marks.append("+loan")
++        elif loan == "lend":
++            marks.append("-loan")
++
++    if not wide:
++        # Markers only; the denominator carries the rest.
++        return ("⇄ " + " · ".join(marks)) if marks else ""
++
++    parts = []
++    if n_mains:
++        parts.append(f"{int(n_mains)} main" + ("" if int(n_mains) == 1 else "s"))
++    if pool:
++        parts.append(f"{_compact(int(pool))} pool")
++    parts.extend(marks)
++    return ("⇄ " + " · ".join(parts)) if parts else ""
++
++
++def segment_style(view: Optional[Dict[str, Any]]) -> str:
++    """prompt_toolkit style class for :func:`share_segment`.
++
++    Orange (``status-bar-bad``) for the two states a reader should notice —
++    holding more than the share, and a peer publishing unbounded ceilings — and
++    dim for ordinary sharing.  Deliberately NOT the red YOLO class: neither
++    state is an error, and neither is anything the operator must act on.
++    """
++    if isinstance(view, dict) and (
++        view.get("stale") or view.get("over_share") or (
++            view.get("grant") and not view.get("bounded"))
++    ):
++        return "class:status-bar-bad"
++    return "class:status-bar-dim"
+diff --git a/tests/cli/test_cli_status_bar_pool_share.py b/tests/cli/test_cli_status_bar_pool_share.py
+new file mode 100644
+index 0000000..cdbbbce
+--- /dev/null
++++ b/tests/cli/test_cli_status_bar_pool_share.py
+@@ -0,0 +1,638 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""The status bar's ``ctx`` denominator is the LIVE pool share. [bd-dre-hxxze]
++
++Measured before this shipped, on Andre's two architect panes right after a
++relaunch::
++
++    ⚕ opus-4.7 (architect) │ ctx 175K/393.2K │ [████░░░░░░] 44% │ 🗜 2 │ …
++    ⚕ opus-4.7 (architect) │ ctx 234K/393.2K │ [██████░░░░] 60% │ 🗜 2 │ …
++
++393.2K each — the static profile ``context_length`` — against a 451,264-token
++shared KV pool, while the broker was granting each of them 196,608.  Nothing on
++either bar said they were sharing anything.  Andre: *"shouldn't they dynamically
++adjust each other including in the hermes GUI?"*
++
++After::
++
++    ⚕ opus-4.7 (architect) │ ctx 175K/393.2K │ [████░░░░░░] 44% │ ⇄ 2 mains · 451.3K pool · share 196.6K ▲ │ 🗜 2 │ …
++
++and for a session whose prompt still fits under its share, the denominator
++itself becomes the grant::
++
++    ⚕ opus-4.7 (architect) │ ctx 40K/196.6K │ [██░░░░░░░░] 20% │ ⇄ 2 mains · 451.3K pool │ 🗜 2 │ …
++
++⛔ THE DISPLAY PATH MAY NOT TOUCH THE AGENT.  ``TestNoDisplayPathSideEffects``
++renders through a compressor that turns any attribute WRITE, and any call to a
++compaction entry point, into a test failure — because the one thing this feature
++must never do is make a bar repaint shrink a live session.  Andre: *"i like long
++context and our speeds are still good."*
++"""
++
++import json
++import os
++import time
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++import agent.pool_broker as pb
++from cli import HermesCLI
++from hermes_cli import pool_share as ps
++
++WIDTH = 220                  # the peer pane:1.1, Andre's architect pane
++LIVE_POOL = 451_264
++BIG_POOL = 1_310_720
++CONFIGURED = 393_216         # profiles/architect context_length
++MAIN_MT = 8_192
++ARCHITECT_PCT = 0.85
++
++LANE = {
++    "model": "qwen38-27b-agent", "role": "agent", "up": True,
++    "kv_used": 384_960, "kv_total": LIVE_POOL, "percent": 85,
++    "streams": 4, "slots": 4, "queued": 2,
++    "total_tps": 182.4, "stream_tps": 45.6,
++}
++
++
++# ---------------------------------------------------------------------------
++# Fixtures
++# ---------------------------------------------------------------------------
++
++class _FrozenCompressor:
++    """A compressor the display path can only READ.
++
++    Any attribute write, and any call to a compaction or window-moving entry
++    point, raises. That is the invariant under test: a status-bar repaint reads
++    the broker's grant and renders text, and it must be structurally incapable
++    of applying it.
++    """
++
++    _FORBIDDEN = (
++        "should_compress", "should_compress_info", "compress",
++        "compress_conversation", "_maybe_pool_grow", "_maybe_pool_adopt_share",
++        "_maybe_governor_autoraise", "_pool_heartbeat",
++    )
++
++    def __init__(self, **fields):
++        object.__setattr__(self, "_fields", dict(fields))
++
++    def __getattr__(self, name):
++        fields = object.__getattribute__(self, "_fields")
++        if name in fields:
++            return fields[name]
++        if name in _FrozenCompressor._FORBIDDEN:
++            raise AssertionError(f"the display path called {name}()")
++        raise AttributeError(name)
++
++    def __setattr__(self, name, value):          # pragma: no cover - a failure
++        raise AssertionError(f"the display path wrote {name!r}")
++
++
++def _cli(*, prompt=174_615, window=CONFIGURED, compressions=2, frozen=False):
++    cli = HermesCLI.__new__(HermesCLI)
++    cli.model = "opus-4.7"
++    cli.session_start = datetime.now() - timedelta(hours=12, minutes=21)
++    cli.conversation_history = []
++    cli.config = {"delegation": {"model": "qwen38-27b-agent",
++                                 "base_url": "http://127.0.0.1:30001/v1"}}
++    cli._status_bar_visible = True
++    cli._status_bar_suppressed_after_resize = False
++    cli._model_picker_state = None
++    cli._prompt_start_time = None
++    cli._prompt_duration = 83.0
++    cli._last_turn_finished_at = None
++    cli._battery_visible = False
++    cli._focus_view_enabled = False
++    cli._prompt_stash = SimpleNamespace(indicator=lambda: "")
++    cli._background_tasks = {}
++    fields = dict(last_prompt_tokens=prompt, context_length=window,
++                  compression_count=compressions, max_tokens=MAIN_MT,
++                  _base_threshold_percent=ARCHITECT_PCT)
++    compressor = _FrozenCompressor(**fields) if frozen else SimpleNamespace(**fields)
++    cli.agent = SimpleNamespace(
++        model="opus-4.7", provider=None, base_url="http://127.0.0.1:30001/v1",
++        session_input_tokens=0, session_output_tokens=0,
++        session_cache_read_tokens=0, session_cache_write_tokens=0,
++        session_prompt_tokens=0, session_completion_tokens=0,
++        session_total_tokens=0, session_api_calls=0,
++        context_compressor=compressor,
++    )
++    return cli
++
++
++def _sessions(grants):
++    return {
++        str(pid): {"main_window": g, "main_grow_max": g, "child_streams": 1,
++                   "child_window_max": 64_000, "child_grow_max": 73_728,
++                   "priority_main": 100, "priority_child": 0,
++                   "reason": f"rule-v1: {len(grants)} main(s), main cap {g:,}"}
++        for pid, g in grants.items()
++    }
++
++
++def _publish(grants, *, pool=LIVE_POOL, age_s=0.0):
++    """Write a broker document into the PER-TEST run dir.
++
++    ``tests/conftest.py``'s ``_isolate_gpu0_pool_and_overflow_state`` repoints
++    ``pool_broker``'s run dir at a tempdir and re-checks it before and after
++    every test, so this can never reach live production state.
++    """
++    path = pb._allowance_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    doc = {"version": 3, "updated": time.time() - age_s, "pool": pool,
++           "ceiling": pool, "n_mains": len(grants), "main_window_floor": 64_000,
++           "policy": "rule-v1", "sessions": _sessions(grants)}
++    path.write_text(json.dumps(doc), encoding="utf-8")
++    ps.invalidate()
++    return path
++
++
++def _unpublish():
++    path = pb._allowance_path()
++    if path.exists():
++        path.unlink()
++    ps.invalidate()
++
++
++@pytest.fixture(autouse=True)
++def _clean_share_cache():
++    ps.invalidate()
++    yield
++    ps.invalidate()
++
++
++def _patches(width, *, lane=LANE, title=""):
++    return (
++        patch("hermes_cli.delegation_lane.get_lane_snapshot", return_value=lane),
++        patch("hermes_cli.delegation_lane.get_model_role", return_value="architect"),
++        patch.object(HermesCLI, "_get_tui_terminal_width",
++                     staticmethod(lambda *a, **k: width)),
++        patch.object(HermesCLI, "_is_session_yolo_active", lambda self: False),
++        patch.object(HermesCLI, "_get_goal_manager", lambda self: None),
++        patch.object(HermesCLI, "_get_status_bar_session_title", lambda self: title),
++        patch.object(HermesCLI, "_status_bar_output_tps", lambda self: "45.9 tok/s"),
++        patch.object(HermesCLI, "_status_bar_activity_fields", lambda self: []),
++    )
++
++
++def _rows(cli=None, *, width=WIDTH, lane=LANE, title="", **kw):
++    cli = cli if cli is not None else _cli(**kw)
++    started = _patches(width, lane=lane, title=title)
++    for p in started:
++        p.start()
++    try:
++        frags = cli._get_status_bar_fragments()
++    finally:
++        for p in reversed(started):
++            p.stop()
++    return "".join(text for _, text in frags).split("\n")
++
++
++def _fragments(cli=None, *, width=WIDTH, **kw):
++    cli = cli if cli is not None else _cli(**kw)
++    started = _patches(width)
++    for p in started:
++        p.start()
++    try:
++        return cli._get_status_bar_fragments()
++    finally:
++        for p in reversed(started):
++            p.stop()
++
++
++# ---------------------------------------------------------------------------
++# The denominator
++# ---------------------------------------------------------------------------
++
++class TestCtxDenominatorIsTheLiveShare:
++    def test_before__no_document_keeps_the_static_config(self):
++        """The pre-change bar, reproduced: no broker document, no sharing field,
++        the profile's configured window as the denominator."""
++        _unpublish()
++        row = _rows(prompt=174_615)[0]
++        assert "ctx 175K/393.2K" in row
++        assert "44%" in row
++        assert "⇄" not in row
++
++    def test_after__the_grant_becomes_the_denominator(self):
++        """A session whose prompt still fits under its share: the share IS what
++        it may occupy, so that is what the bar divides by."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/196.6K" in row
++        assert "⇄ 2 mains · 451.3K pool" in row
++
++    def test_after__a_lone_main_shows_the_big_grant(self):
++        _publish({os.getpid(): 401_408})
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/401.4K" in row
++        assert "⇄ 1 main · 451.3K pool" in row
++
++    def test_the_percent_and_the_denominator_never_disagree(self):
++        """One row, one denominator. 40K against a 196,608 grant is 20%, not the
++        8% that 393,216 would have implied."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/196.6K" in row and " 20%" in row
++
++    def test_a_pool_raised_to_13m_needs_no_edit_here(self):
++        """The host-RAM KV offload effort raises max_total_num_tokens; the bar
++        reads the live pool off the document and follows it."""
++        _publish({os.getpid(): 1_212_416}, pool=BIG_POOL)
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/1.2M" in row
++        assert "1.3M pool" in row
++
++
++# ---------------------------------------------------------------------------
++# It changes as peers come and go
++# ---------------------------------------------------------------------------
++
++class TestTracksPeers:
++    def test_the_denominator_follows_1_to_2_to_3_mains(self):
++        me = os.getpid()
++        seen = []
++        for grants in ({me: 401_408},
++                       {me: 196_608, me + 1: 196_608},
++                       {me: 131_072, me + 1: 131_072, me + 2: 131_072}):
++            _publish(grants)
++            row = _rows(prompt=40_000)[0]
++            seen.append(row.split("ctx ")[1].split(" ")[0])
++        assert seen == ["40K/401.4K", "40K/196.6K", "40K/131.1K"]
++
++    def test_the_peer_count_in_the_field_follows_too(self):
++        me = os.getpid()
++        _publish({me: 401_408})
++        assert "⇄ 1 main · 451.3K pool" in _rows(prompt=40_000)[0]
++        _publish({me: 131_072, me + 1: 131_072, me + 2: 131_072})
++        assert "⇄ 3 mains · 451.3K pool" in _rows(prompt=40_000)[0]
++
++    def test_a_peer_exiting_gives_the_room_back(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        assert "ctx 40K/196.6K" in _rows(prompt=40_000)[0]
++        _publish({me: 401_408})
++        assert "ctx 40K/401.4K" in _rows(prompt=40_000)[0]
++
++    def test_a_granted_loan_is_visible_on_both_sides(self):
++        """The asymmetric split the broker makes when one main is busy and the
++        other idle: 270,336 / 131,072, revocable."""
++        me, peer = os.getpid(), os.getpid() + 1
++        _publish({me: 270_336, peer: 131_072})
++        assert "+loan" in _rows(prompt=40_000, window=270_336)[0]
++        _publish({me: 131_072, peer: 270_336})
++        row = _rows(prompt=40_000, window=131_072)[0]
++        assert "-loan" in row and "ctx 40K/131.1K" in row
++
++    def test_a_revoked_loan_drops_the_marker(self):
++        me, peer = os.getpid(), os.getpid() + 1
++        _publish({me: 270_336, peer: 131_072})
++        assert "loan" in _rows(prompt=40_000, window=270_336)[0]
++        _publish({me: 196_608, peer: 196_608})
++        assert "loan" not in _rows(prompt=40_000, window=270_336)[0]
++
++
++# ---------------------------------------------------------------------------
++# Over-share
++# ---------------------------------------------------------------------------
++
++class TestOverShareRendersHonestly:
++    def test_the_held_window_stays_the_denominator_and_the_share_is_named(self):
++        """Andre's live session: grant 196,608, holding a 393,216 window with a
++        174,615-token prompt. Adopting the grant would force a compaction, so
++        the bar shows the window it really has AND the share it is above."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        row = _rows(prompt=174_615)[0]
++        assert "ctx 175K/393.2K" in row
++        assert "⇄ 2 mains · 451.3K pool · share 196.6K ▲" in row
++
++    def test_the_gauge_does_not_peg_a_legitimately_over_share_session(self):
++        """Over-share is not "about to compact". Pegging the bar at 100% red
++        would read as an instruction to compact a session that is at 44% of the
++        window it actually holds."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        row = _rows(prompt=174_615)[0]
++        assert " 44%" in row and "100%" not in row
++
++    def test_the_marker_earns_the_attention_colour_not_the_alarm_colour(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        styles = {style for style, text in _fragments(prompt=174_615)
++                  if "share 196.6K" in text}
++        assert styles == {"class:status-bar-bad"}
++
++    def test_an_ordinary_share_stays_dim(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        styles = {style for style, text in _fragments(prompt=40_000)
++                  if text.startswith("⇄")}
++        assert styles == {"class:status-bar-dim"}
++
++
++# ---------------------------------------------------------------------------
++# Degradation
++# ---------------------------------------------------------------------------
++
++class TestDegradesSafely:
++    def test_no_document_renders_the_pre_change_bar(self):
++        _unpublish()
++        rows = _rows(prompt=174_615)
++        assert "ctx 175K/393.2K" in rows[0] and "⇄" not in rows[0]
++        assert len(rows) == 2                      # the delegation lane is intact
++
++    def test_a_stale_document_falls_back_and_says_so(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608}, age_s=300.0)
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/393.2K" in row              # the static config, as before
++        assert "⇄ pool stale 5m ⚠" in row
++
++    def test_an_unbounded_document_from_an_old_peer_falls_back(self):
++        """Andre's sessions published main_window == main_grow_max == the whole
++        pool for BOTH mains until 301b96a. Two grants of 451,264 on a 451,264
++        pool is not a share, so it is refused as the denominator and named."""
++        me = os.getpid()
++        _publish({me: LIVE_POOL, me + 1: LIVE_POOL})
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/393.2K" in row
++        assert "no share cap ⚠" in row
++
++    def test_a_truncated_document_cannot_take_the_bar_down(self):
++        path = pb._allowance_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text('{"version": 3, "sessions": {', encoding="utf-8")
++        ps.invalidate()
++        rows = _rows(prompt=174_615)
++        assert "ctx 175K/393.2K" in rows[0] and "⇄" not in rows[0]
++
++    def test_an_unreadable_document_cannot_take_the_bar_down(self):
++        _publish({os.getpid(): 196_608})
++        with patch.object(ps, "read_document",
++                          side_effect=OSError("permission denied")):
++            rows = _rows(prompt=174_615)
++        assert "ctx 175K/393.2K" in rows[0]
++
++    def test_a_process_that_is_not_a_main_gets_no_share_field(self):
++        _publish({os.getpid() + 9: 401_408})
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/393.2K" in row and "⇄" not in row
++
++    def test_a_session_with_no_window_yet_shows_the_grant(self):
++        """Before the first response the compressor can report no window. The
++        grant is then the only thing known about what this lane may occupy, so
++        it is what the bar shows."""
++        _publish({os.getpid(): 196_608})
++        assert "ctx 0/196.6K" in _rows(_cli(prompt=0, window=0))[0]
++
++    def test_no_window_and_no_document_still_renders_ctx_dashes(self):
++        _unpublish()
++        assert "ctx --" in _rows(_cli(prompt=0, window=0))[0]
++
++    def test_the_one_line_fallback_carries_the_share_too(self):
++        """_build_status_bar_text is the exception path for the fragments
++        builder; a degraded path is not a licence to go back to lying."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        cli = _cli(prompt=40_000)
++        started = _patches(WIDTH)
++        for p in started:
++            p.start()
++        try:
++            text = cli._build_status_bar_text(WIDTH)
++        finally:
++            for p in reversed(started):
++                p.stop()
++        assert "ctx 40K/196.6K" in text and "⇄ 2 mains · 451.3K pool" in text
++
++
++# ---------------------------------------------------------------------------
++# Layout
++# ---------------------------------------------------------------------------
++
++class TestLayout:
++    @pytest.mark.parametrize("width", [76, 80, 100, 120, 160, 200, 220, 224, 300])
++    def test_no_row_overflows_the_pane(self, width):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for prompt in (40_000, 174_615):
++            for row in _rows(prompt=prompt, width=width, title="binder-campaign"):
++                assert HermesCLI._status_bar_display_width(row) <= width, (
++                    width, prompt, row)
++
++    def test_middle_widths_spend_no_cells_on_an_ordinary_share(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        row = _rows(prompt=40_000, width=140)[0]
++        assert "⇄" not in row
++        assert "ctx 40K/196.6K" in row              # the fix itself costs nothing
++
++    def test_middle_widths_still_show_a_marker_state(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        assert "⇄ share 196.6K ▲" in _rows(prompt=174_615, width=140)[0]
++
++    @pytest.mark.parametrize("width", [76, 100, 120, 139])
++    def test_a_pane_too_narrow_for_the_tail_keeps_its_live_counters(self, width):
++        """Below 140 the row has no cells to spare, so the field is dropped
++        rather than pushing ``↯ tok/s`` and the turn timer off the edge -- the
++        exact trade the two-row layout exists to stop making. The denominator
++        fix still lands, because it costs nothing."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for prompt in (40_000, 174_615):
++            row = _rows(prompt=prompt, width=width)[0]
++            assert "⇄" not in row, (width, prompt, row)
++        assert "ctx 40K/196.6K" in _rows(prompt=40_000, width=width)[0]
++
++    def test_the_tiers_that_show_no_context_field_are_untouched(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for width in (40, 51, 60, 75):
++            rows = _rows(prompt=40_000, width=width)
++            assert len(rows) == 1 and "⇄" not in rows[0]
++
++    def test_the_delegation_lane_keeps_its_own_row(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        rows = _rows(prompt=40_000)
++        assert len(rows) == 2
++        assert "⇄ 2 mains" in rows[0]              # the share is the main lane's
++        assert "⇄" not in rows[1]
++
++    def test_no_emoji_presentation_selector_reaches_the_terminal(self):
++        """A U+FE0F would make the terminal's columns drift from
++        prompt_toolkit's model and splice two frames together."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for prompt in (40_000, 174_615):
++            for row in _rows(prompt=prompt):
++                assert "️" not in row
++
++
++# ---------------------------------------------------------------------------
++# Driven by the REAL broker policy, not by hand-written grants
++# ---------------------------------------------------------------------------
++
++#: Geometries taken from the live host: ``need`` is the UNSCALED measured demand
++#: ``pool_broker`` collects per main (pid 900003 at 199,191 and pid 900004 at
++#: 258,700 on 2026-09-30), plus the asymmetric pair that produces a loan — one
++#: main busy at a 433,782-token prompt beside an idle one at 40,000.
++REAL_NEEDS = {
++    "one main": [199_191],
++    "two mains": [199_191, 258_700],
++    "three mains": [199_191, 258_700, 60_000],
++    "busy beside idle": [433_782, 40_000],
++}
++
++
++def _derive(needs, pool=LIVE_POOL):
++    """Per-pid grants from ``pool_broker.derive_window_ceilings`` itself.
++
++    Pure arithmetic in the broker — no I/O, no globals beyond the geometry
++    constants — so the display can be driven by the real policy rather than by
++    grants a test author made up. THIS pid is always the first main.
++    """
++    usable = pool - int(pool * pb.CACHE_RESERVE_FRAC)
++    pids = [os.getpid()] + [os.getpid() + 1 + i for i in range(len(needs) - 1)]
++    mains = [{"pid": p, "max_tokens": MAIN_MT, "need": n}
++             for p, n in zip(pids, needs)]
++    caps, _child, detail = pb.derive_window_ceilings(
++        usable, mains, 1, pb.CHILD_MAX_TOKENS_DEFAULT, ARCHITECT_PCT, pool)
++    assert detail["feasible"], detail
++    return caps
++
++
++class TestAgainstTheRealBrokerPolicy:
++    def test_the_measured_451k_splits_reach_the_bar(self):
++        """The four splits the broker actually produces on this host's pool."""
++        expected = {
++            "one main": "401.4K",
++            "two mains": "196.6K",
++            "three mains": "131.1K",
++            "busy beside idle": "270.3K",
++        }
++        for label, needs in REAL_NEEDS.items():
++            _publish(_derive(needs))
++            row = _rows(prompt=40_000)[0]
++            assert f"ctx 40K/{expected[label]}" in row, (label, row)
++            n = len(needs)
++            assert f"⇄ {n} main{'' if n == 1 else 's'} · 451.3K pool" in row, label
++
++    def test_the_lane_guarantee_is_what_three_mains_see(self):
++        """GUARANTEED_LANE_WINDOW is also the equal share at three mains, which
++        is the largest N this pool can host at a usable window."""
++        caps = _derive(REAL_NEEDS["three mains"])
++        assert set(caps.values()) == {pb.GUARANTEED_LANE_WINDOW}
++        _publish(caps)
++        assert "ctx 40K/131.1K" in _rows(prompt=40_000)[0]
++
++    def test_the_loan_the_broker_actually_grants_is_labelled(self):
++        caps = _derive(REAL_NEEDS["busy beside idle"])
++        assert sorted(caps.values()) == [131_072, 270_336]
++        _publish(caps)
++        assert "+loan" in _rows(prompt=40_000, window=270_336)[0]
++
++    def test_a_13m_pool_adapts_with_no_edit_to_the_display(self):
++        """The host-RAM KV offload effort raises max_total_num_tokens. Every
++        number the bar shows is read from the document, so nothing here changes:
++        the same policy at 1,310,720 simply grants more."""
++        caps = _derive(REAL_NEEDS["two mains"], pool=BIG_POOL)
++        mine = caps[os.getpid()]
++        assert mine > 512_000, caps            # far above anything hard-coded
++        _publish(caps, pool=BIG_POOL)
++        row = _rows(prompt=40_000)[0]
++        assert f"/{_compact(mine)}" in row
++        assert "⇄ 2 mains · 1.3M pool" in row
++
++    def test_a_lone_main_granted_the_whole_pool_is_not_read_as_unbounded(self):
++        """At 1,310,720 the real policy hands a lone main the entire pool. One
++        main cannot starve anyone, so grants that SUM to the ceiling are a
++        legitimate split -- only a sum ABOVE it is the pre-301b96a bug."""
++        caps = _derive(REAL_NEEDS["one main"], pool=BIG_POOL)
++        assert caps[os.getpid()] == BIG_POOL
++        _publish(caps, pool=BIG_POOL)
++        row = _rows(prompt=40_000)[0]
++        assert "ctx 40K/1.3M" in row and "no share cap" not in row
++
++
++def _compact(tokens):
++    from hermes_cli.banner import _format_context_length
++
++    return _format_context_length(tokens)
++
++
++# ---------------------------------------------------------------------------
++# ⛔ The display path may not touch the agent, the broker, or the GPU
++# ---------------------------------------------------------------------------
++
++class TestNoDisplayPathSideEffects:
++    def test_repainting_never_writes_the_compressor(self):
++        """The whole point. A bar repaint reads the broker's grant and renders
++        text; it must be structurally incapable of applying it to a live
++        session. _FrozenCompressor turns any write, and any call to a compaction
++        entry point, into a failure."""
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for prompt, window in ((40_000, CONFIGURED),      # adoptable grant
++                               (174_615, CONFIGURED),     # over share
++                               (300_000, CONFIGURED)):    # over trigger
++            cli = _cli(prompt=prompt, window=window, frozen=True)
++            for _ in range(25):                            # many repaints
++                _rows(cli)
++            assert cli.agent.context_compressor.context_length == window
++
++    def test_repainting_never_rewrites_the_broker_document(self):
++        me = os.getpid()
++        path = _publish({me: 196_608, me + 1: 196_608})
++        before = path.stat().st_mtime_ns
++        for _ in range(10):
++            _rows(prompt=174_615)
++        assert path.stat().st_mtime_ns == before
++
++    def test_repainting_never_publishes_a_heartbeat_or_a_growth_claim(self):
++        me = os.getpid()
++        _publish({me: 196_608, me + 1: 196_608})
++        for name in ("publish_heartbeat", "claim_growth", "refresh",
++                     "get_allowance", "_get_json"):
++            def _boom(*a, _n=name, **k):           # pragma: no cover
++                raise AssertionError(f"the display path called pool_broker.{_n}()")
++            patch.object(pb, name, _boom).start()
++        try:
++            rows = _rows(prompt=174_615)
++        finally:
++            patch.stopall()
++        assert "share 196.6K ▲" in rows[0]
++
++    def test_repainting_is_cheap_enough_for_the_repaint_timer(self):
++        """One stat() per repaint, one READ per broker rewrite. The bar repaints
++        on a timer, so re-reading and re-parsing the document every frame would
++        be a UI-thread cost paid many times a second — and a TTL cache would
++        instead make a freshly published grant invisible for the length of the
++        TTL, which is the behaviour this feature exists to provide."""
++        from pathlib import Path
++
++        me = os.getpid()
++        path = _publish({me: 196_608, me + 1: 196_608})
++        reads = {"n": 0}
++        real_read = Path.read_text
++
++        def counted(self, *a, **k):
++            if self == path:
++                reads["n"] += 1
++            return real_read(self, *a, **k)
++
++        with patch.object(Path, "read_text", counted):
++            for _ in range(20):
++                _rows(prompt=174_615)
++            assert reads["n"] == 1, reads          # 20 repaints, one read
++
++            _publish({me: 401_408})                # broker rewrites the document
++            rows = _rows(prompt=174_615)
++        assert reads["n"] == 2, reads
++        assert "1 main" in rows[0]
+diff --git a/tests/hermes_cli/test_pool_share.py b/tests/hermes_cli/test_pool_share.py
+new file mode 100644
+index 0000000..fb8b421
+--- /dev/null
++++ b/tests/hermes_cli/test_pool_share.py
+@@ -0,0 +1,422 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""The status bar's view of the SHARED GPU0 KV pool. [bd-dre-hxxze]
++
++Measured symptom this covers: two architect mains on one 451,264-token pool both
++rendered ``ctx …/393.2K`` — the static profile ``context_length`` — while the
++broker was granting each of them 196,608.  786,432 tokens of claimed window
++against a 451,264-token pool, and nothing on the bar said they were sharing it.
++
++``hermes_cli.pool_share`` is the reader that closes that gap.  It is DISPLAY
++ONLY: it never writes the broker document, never probes the backend, never calls
++``pool_broker.get_allowance()`` (which may refresh over the network), and cannot
++shrink a live session or trigger a compaction.  These tests pin the three things
++that have to hold for that to stay true and useful:
++
++* the ceiling it reports follows the LIVE grant as peers come and go;
++* every degraded document — absent, stale, or written by a pre-301b96a peer that
++  still publishes unbounded ceilings — falls back to the session's own window
++  rather than quoting a number that is not a share; and
++* the pool total is read from the document, so raising the pool (the ~1.31M
++  host-RAM KV offload effort) needs no edit here.
++
++Production state is unreachable: ``tests/conftest.py``'s
++``_isolate_gpu0_pool_and_overflow_state`` repoints ``pool_broker``'s run dir at a
++per-test tempdir and re-checks it before and after every test, and this module
++resolves the document only through ``pool_broker._allowance_path()`` so it lands
++inside that isolation rather than beside it.
++"""
++
++import json
++import os
++import time
++
++import pytest
++
++import agent.pool_broker as pb
++from hermes_cli import pool_share as ps
++
++LIVE_POOL = 451_264          # the pool measured on this host, 2026-09-30
++BIG_POOL = 1_310_720         # the host-RAM KV offload target
++MAIN_MT = 8_192              # architect max_tokens
++ARCHITECT_PCT = 0.85         # architect compression.threshold since 2026-09-29
++CONFIGURED = 393_216         # profiles/architect context_length
++
++
++def _sessions(grants):
++    return {
++        str(pid): {
++            "main_window": g,
++            "main_grow_max": g,
++            "child_streams": 1,
++            "child_window_max": 64_000,
++            "child_grow_max": 73_728,
++            "priority_main": 100,
++            "priority_child": 0,
++            "reason": f"rule-v1: {len(grants)} main(s) sharing the pool, main cap {g:,}",
++        }
++        for pid, g in grants.items()
++    }
++
++
++def _doc(grants, *, pool=LIVE_POOL, updated=None, version=3):
++    """A document shaped exactly like the one the broker publishes."""
++    return {
++        "version": version,
++        "updated": time.time() if updated is None else updated,
++        "backend": "http://127.0.0.1:30001",
++        "policy": "rule-v1",
++        "pool": pool,
++        "ceiling": pool,
++        "n_mains": len(grants),
++        "main_window_floor": 64_000,
++        "sessions": _sessions(grants),
++    }
++
++
++def _view(doc, *, pid=None, window=CONFIGURED, prompt=40_000, age=0.0):
++    return ps.lane_share(
++        doc, pid=pid if pid is not None else os.getpid(), window=window,
++        prompt_tokens=prompt, max_tokens=MAIN_MT,
++        threshold_percent=ARCHITECT_PCT, age_s=age,
++    )
++
++
++@pytest.fixture(autouse=True)
++def _fresh_cache():
++    ps.invalidate()
++    yield
++    ps.invalidate()
++
++
++# ---------------------------------------------------------------------------
++# The live grant is the ceiling
++# ---------------------------------------------------------------------------
++
++class TestCeilingFollowsTheGrant:
++    def test_a_lone_main_gets_the_big_grant(self):
++        v = _view(_doc({os.getpid(): 401_408}))
++        assert (v["ceiling"], v["ceiling_source"]) == (401_408, "grant")
++        assert v["usable"] and v["bounded"] and not v["over_share"]
++        assert v["n_mains"] == 1 and v["peers"] == 0
++
++    def test_the_ceiling_halves_when_a_peer_main_launches(self):
++        """1 -> 2 -> 3 mains. The denominator is the share, so it moves."""
++        me = os.getpid()
++        seen = []
++        for grants in (
++            {me: 401_408},
++            {me: 196_608, me + 1: 196_608},
++            {me: 131_072, me + 1: 131_072, me + 2: 131_072},
++        ):
++            v = _view(_doc(grants))
++            seen.append((v["n_mains"], v["ceiling"]))
++        assert seen == [(1, 401_408), (2, 196_608), (3, 131_072)]
++
++    def test_the_ceiling_recovers_when_the_peer_exits(self):
++        me = os.getpid()
++        assert _view(_doc({me: 196_608, me + 1: 196_608}))["ceiling"] == 196_608
++        assert _view(_doc({me: 401_408}))["ceiling"] == 401_408
++
++    def test_a_grant_above_the_running_window_is_headroom(self):
++        """Grant >= window: the compressor will grow into it, so it IS the ceiling."""
++        v = _view(_doc({os.getpid(): 401_408}), window=196_608, prompt=100_000)
++        assert (v["ceiling"], v["ceiling_source"]) == (401_408, "grant")
++        assert not v["over_share"]
++
++    def test_the_pool_total_is_read_not_compiled_in(self):
++        """A ~1.31M pool needs no edit here -- the number comes off the document."""
++        v = _view(_doc({os.getpid(): 1_212_416}, pool=BIG_POOL), window=CONFIGURED,
++                  prompt=40_000)
++        assert v["pool"] == BIG_POOL
++        assert (v["ceiling"], v["ceiling_source"]) == (1_212_416, "grant")
++        assert "1.3M pool" in ps.share_segment(v)
++
++    def test_grow_max_below_window_still_reports_the_granted_window(self):
++        """``main_grow_max < main_window`` is "hold what you have, stop growing" --
++        a growth stop, not a statement that the granted window is unusable."""
++        doc = _doc({os.getpid(): 262_144})
++        doc["sessions"][str(os.getpid())]["main_grow_max"] = 196_608
++        v = _view(doc, window=196_608, prompt=40_000)
++        assert v["grant"] == 262_144
++
++
++# ---------------------------------------------------------------------------
++# Over-share is a real state, not an error
++# ---------------------------------------------------------------------------
++
++class TestOverShare:
++    def test_a_grandfathered_session_keeps_the_window_it_holds(self):
++        """The live case, 2026-09-30: grant 196,608, window 393,216, prompt
++        174,615.  footprint(196,608) = 160,153 < 174,615, so adopting the grant
++        would force a compaction the broker did not ask for.  Andre: a live
++        session's context is his call.  So the CEILING stays the held window and
++        the share is reported alongside it."""
++        v = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}),
++                  window=393_216, prompt=174_615)
++        assert (v["ceiling"], v["ceiling_source"]) == (393_216, "window")
++        assert v["over_share"] and v["grant"] == 196_608
++        assert v["over_tokens"] == 393_216 - 196_608
++        seg = ps.share_segment(v)
++        assert "share 196.6K ▲" in seg and "2 mains" in seg and "451.3K pool" in seg
++
++    def test_the_same_grant_is_adopted_while_the_prompt_still_fits(self):
++        """Same geometry, smaller prompt: the grant's trigger is still above it,
++        so settling onto the share compacts nothing and the share IS the ceiling.
++        This is the exact test ContextCompressor._maybe_pool_adopt_share applies."""
++        trigger = pb.footprint(196_608, MAIN_MT, ARCHITECT_PCT)
++        v = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}),
++                  window=393_216, prompt=trigger - 1)
++        assert (v["ceiling"], v["ceiling_source"]) == (196_608, "grant")
++        assert not v["over_share"]
++        assert "▲" not in ps.share_segment(v)
++
++    def test_over_share_never_asks_for_anything_to_shrink(self):
++        """The view is data. Nothing in it is a window to apply, and the only
++        ceiling it reports for an over-share session is the one already held."""
++        v = _view(_doc({os.getpid(): 131_072, os.getpid() + 1: 131_072,
++                        os.getpid() + 2: 131_072}),
++                  window=393_216, prompt=300_000)
++        assert v["ceiling"] == 393_216 >= v["grant"]
++
++
++# ---------------------------------------------------------------------------
++# Loans
++# ---------------------------------------------------------------------------
++
++class TestLoans:
++    def test_the_borrower_and_the_lender_are_named_differently(self):
++        """The asymmetric pair the broker produces when one main is busy at 433K
++        and the other idle at 40K: 270,336 / 131,072 via a revocable loan."""
++        me, peer = os.getpid(), os.getpid() + 1
++        borrow = _view(_doc({me: 270_336, peer: 131_072}), window=270_336,
++                       prompt=200_000)
++        assert borrow["loan"] == "borrow" and "+loan" in ps.share_segment(borrow)
++        lend = _view(_doc({peer: 270_336, me: 131_072}), window=131_072,
++                     prompt=40_000)
++        assert lend["loan"] == "lend" and "-loan" in ps.share_segment(lend)
++
++    def test_equal_grants_are_not_a_loan(self):
++        v = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}))
++        assert v["loan"] == "" and "loan" not in ps.share_segment(v)
++
++
++# ---------------------------------------------------------------------------
++# Degradation — every one of these has actually happened
++# ---------------------------------------------------------------------------
++
++class TestDegradesSafely:
++    def test_absent_document_falls_back_to_the_session_window(self):
++        v = _view(None)
++        assert not v["present"] and not v["usable"]
++        assert v["ceiling"] == CONFIGURED and v["ceiling_source"] == "window"
++        assert ps.share_segment(v) == ""
++
++    def test_empty_document_is_treated_as_absent(self):
++        assert ps.share_segment(_view({})) == ""
++
++    def test_a_stale_document_is_not_quoted_as_now(self):
++        """90 s, the same age pool_broker allows its serving-host VRAM sample. The
++        document is rewritten every ~5 s, so 90 s means the publisher is gone."""
++        v = _view(_doc({os.getpid(): 196_608}), age=120.0)
++        assert v["present"] and v["stale"] and not v["fresh"] and not v["usable"]
++        assert v["ceiling"] == CONFIGURED          # the static config, as before
++        assert ps.share_segment(v) == "⇄ pool stale 2m ⚠"
++        assert ps.segment_style(v) == "class:status-bar-bad"
++
++    def test_the_staleness_boundary_is_the_documented_one(self):
++        doc = _doc({os.getpid(): 196_608})
++        assert _view(doc, age=ps.DISPLAY_MAX_AGE_S)["fresh"] is True
++        assert _view(doc, age=ps.DISPLAY_MAX_AGE_S + 0.1)["fresh"] is False
++
++    def test_the_staleness_rule_is_the_codebases_existing_precedent(self):
++        """90 s, the age pool_broker already allows its serving-host VRAM sample. Pinned
++        so the two cannot silently diverge: "a sample this old is not evidence
++        about now" should mean one thing in this codebase."""
++        assert ps.DISPLAY_MAX_AGE_S == pb.VRAM_SAMPLE_MAX_AGE_S == 90.0
++
++    def test_a_document_with_no_timestamp_reads_as_stale(self):
++        doc = _doc({os.getpid(): 196_608})
++        doc.pop("updated")
++        v = ps.lane_share(doc, pid=os.getpid(), window=CONFIGURED,
++                          prompt_tokens=40_000, max_tokens=MAIN_MT,
++                          threshold_percent=ARCHITECT_PCT,
++                          age_s=time.time())          # what read_document computes
++        assert v["stale"] and not v["usable"] and v["ceiling"] == CONFIGURED
++
++    def test_an_old_peer_publishing_unbounded_ceilings_is_refused(self):
++        """Andre's two sessions published exactly this until 301b96a landed:
++        main_window == main_grow_max == the whole pool, for BOTH mains. Two
++        grants of 451,264 on a 451,264 pool is not a share -- quoting it as one
++        would be a worse lie than the static config was."""
++        me = os.getpid()
++        v = _view(_doc({me: LIVE_POOL, me + 1: LIVE_POOL}), window=CONFIGURED)
++        assert v["present"] and v["fresh"]
++        assert not v["bounded"] and not v["usable"]
++        assert v["ceiling"] == CONFIGURED and v["ceiling_source"] == "window"
++        seg = ps.share_segment(v)
++        assert "no share cap ⚠" in seg and "451.3K pool" in seg
++        assert ps.segment_style(v) == "class:status-bar-bad"
++
++    def test_a_single_grant_above_the_pool_is_also_refused(self):
++        v = _view(_doc({os.getpid(): 522_880}), window=CONFIGURED)
++        assert not v["usable"] and v["ceiling"] == CONFIGURED
++
++    def test_a_process_that_is_not_a_main_gets_no_share_field(self):
++        """A subagent, or a lane on another backend, has no entry in the
++        sessions map. It must not be told it has a share, and must not have the
++        pool's numbers implied as its ceiling."""
++        v = _view(_doc({os.getpid() + 7: 401_408}))
++        assert v["grant"] is None and not v["usable"]
++        assert v["ceiling"] == CONFIGURED
++        assert ps.share_segment(v) == ""
++
++    def test_a_document_from_an_older_schema_does_not_crash(self):
++        v = _view({"version": 1, "updated": time.time(), "pool": LIVE_POOL})
++        assert v["present"] and v["grant"] is None
++        assert v["ceiling"] == CONFIGURED
++
++    @pytest.mark.parametrize("doc", [
++        {"updated": "not-a-number", "sessions": {"1": {"main_window": "x"}}},
++        {"updated": time.time(), "pool": None, "sessions": []},
++        {"updated": time.time(), "pool": LIVE_POOL, "n_mains": "two",
++         "sessions": {"1": None}},
++        {"updated": time.time(), "sessions": {"1": {"main_window": [1, 2]}}},
++        "a string where a dict belongs",
++        42,
++    ])
++    def test_garbage_never_raises(self, doc):
++        v = ps.lane_share(doc, pid=1, window=CONFIGURED, prompt_tokens=10,
++                          max_tokens=MAIN_MT, threshold_percent=ARCHITECT_PCT)
++        assert v["ceiling"] in (CONFIGURED, None)
++        assert isinstance(ps.share_segment(v), str)
++
++    def test_a_zero_window_is_survivable(self):
++        """Before the first API response the compressor may report no window."""
++        v = _view(_doc({os.getpid(): 196_608}), window=0, prompt=0)
++        assert v["ceiling"] == 196_608
++
++
++# ---------------------------------------------------------------------------
++# On-disk reading and the cache
++# ---------------------------------------------------------------------------
++
++class TestReadsTheRealDocument:
++    def test_the_path_is_the_brokers_path_so_isolation_holds(self):
++        assert ps.document_path() == pb._allowance_path()
++        prod = pb._production_root()
++        resolved = ps.document_path().resolve()
++        assert not (resolved == prod or prod in resolved.parents)
++
++    def test_missing_file_reads_as_absent(self):
++        doc, age = ps.read_document()
++        assert doc is None and age == float("inf")
++
++    def test_a_rewritten_document_is_picked_up_without_invalidation(self):
++        """"Show it changing": the cache is keyed on the file's identity, not on
++        a clock, so a repaint after the broker rewrites sees the new grant
++        immediately rather than up to a TTL later."""
++        path = pb._allowance_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        me = os.getpid()
++
++        path.write_text(json.dumps(_doc({me: 401_408})), encoding="utf-8")
++        first = ps.get_lane_share(window=CONFIGURED, prompt_tokens=40_000,
++                                  max_tokens=MAIN_MT,
++                                  threshold_percent=ARCHITECT_PCT)
++        assert first["ceiling"] == 401_408 and first["n_mains"] == 1
++
++        path.write_text(json.dumps(_doc({me: 196_608, me + 1: 196_608})),
++                        encoding="utf-8")
++        second = ps.get_lane_share(window=CONFIGURED, prompt_tokens=40_000,
++                                   max_tokens=MAIN_MT,
++                                   threshold_percent=ARCHITECT_PCT)
++        assert second["ceiling"] == 196_608 and second["n_mains"] == 2
++
++    def test_an_unparseable_document_reads_as_absent(self):
++        path = pb._allowance_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text("{ truncated", encoding="utf-8")
++        doc, age = ps.read_document()
++        assert doc is None and age == float("inf")
++        assert ps.get_lane_share(window=CONFIGURED)["ceiling"] == CONFIGURED
++
++    def test_reading_never_probes_the_backend(self):
++        """get_allowance() may refresh over the network; a repaint must not."""
++        def _boom(*a, **k):                     # pragma: no cover
++            raise AssertionError("the display path must not probe the backend")
++
++        import unittest.mock as m
++        with m.patch.object(pb, "_get_json", _boom), \
++             m.patch.object(pb, "refresh", _boom), \
++             m.patch.object(pb, "get_allowance", _boom):
++            path = pb._allowance_path()
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(json.dumps(_doc({os.getpid(): 196_608})),
++                            encoding="utf-8")
++            assert ps.get_lane_share(window=CONFIGURED,
++                                     prompt_tokens=40_000)["grant"] == 196_608
++
++
++# ---------------------------------------------------------------------------
++# Rendering
++# ---------------------------------------------------------------------------
++
++class TestSegment:
++    def test_the_wide_form_names_the_peers_and_the_pool(self):
++        v = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}))
++        assert ps.share_segment(v, width=224) == "⇄ 2 mains · 451.3K pool"
++
++    def test_one_main_is_singular(self):
++        v = _view(_doc({os.getpid(): 401_408}))
++        assert ps.share_segment(v, width=224) == "⇄ 1 main · 451.3K pool"
++
++    def test_middle_widths_spend_cells_only_on_a_marker_state(self):
++        ordinary = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}))
++        assert ps.share_segment(ordinary, width=140) == ""
++        over = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}),
++                     window=393_216, prompt=300_000)
++        assert ps.share_segment(over, width=140) == "⇄ share 196.6K ▲"
++
++    def test_a_pane_too_narrow_for_the_tail_gets_no_field_at_all(self):
++        """Below 140 columns the architect row has no cells to spare, and the
++        ctx denominator already carries the live grant for free."""
++        over = _view(_doc({os.getpid(): 196_608, os.getpid() + 1: 196_608}),
++                     window=393_216, prompt=300_000)
++        for width in (0, 76, 100, 120, 139):
++            assert ps.share_segment(over, width=width) == "", width
++
++    def test_every_glyph_keeps_the_column_agreement_the_bar_depends_on(self):
++        """prompt_toolkit repaints the bar differentially, so one cell of
++        disagreement between its column model and the terminal's splices two
++        frames together. ⇄ (U+21C4) is East-Asian-Width Neutral and scores 1 --
++        the same class and score as ⇉ (U+21C9), measured against this TUI's
++        terminal in tests/cli/test_cli_status_bar_column_drift."""
++        import unicodedata
++
++        from prompt_toolkit.utils import get_cwidth
++
++        me = os.getpid()
++        texts = [
++            ps.share_segment(_view(_doc({me: 401_408}))),
++            ps.share_segment(_view(_doc({me: 196_608, me + 1: 196_608}),
++                                   window=393_216, prompt=300_000)),
++            ps.share_segment(_view(_doc({me: LIVE_POOL, me + 1: LIVE_POOL}))),
++            ps.share_segment(_view(_doc({me: 196_608}), age=200.0)),
++            ps.share_segment(_view(_doc({me: 270_336, me + 1: 131_072}))),
++        ]
++        for text in texts:
++            assert text
++            assert "️" not in text          # no emoji-presentation selector
++            for ch in text:
++                if ord(ch) < 128:
++                    continue
++                assert get_cwidth(ch) == 1, (ch, hex(ord(ch)))
++                assert unicodedata.east_asian_width(ch) in ("N", "A"), (
++                    ch, hex(ord(ch)))
++            assert get_cwidth(text) == len(text)
++
++    def test_age_labels_stay_short(self):
++        assert ps._age_label(45) == "45s"
++        assert ps._age_label(120) == "2m"
++        assert ps._age_label(7200) == "2h"
++        assert ps._age_label("nonsense") == "?"
+-- 
+2.43.0

@@ -1,0 +1,1108 @@
+From f8ae3f10d4204536bddd08f878e6b891f23a914d Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 30 Sep 2026 16:39:10 -0400
+Subject: [PATCH] auxiliary work yields to the interactive lanes instead of
+ competing with them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An agent framework makes two kinds of request to the same backend: the turn a
+human is waiting on, and auxiliary work -- titles, compression, a goal judge,
+a background review. On a dedicated endpoint the distinction does not matter.
+On a shared one it decides whether the interactive lane keeps its radix prefix
+cached or re-prefills it from scratch.
+
+Measured over 24 h on one profile: 6,069 requests to the shared backend, of
+which 682 (11.2%) were auxiliary. The interactive lanes spent 37.62M prompt
+tokens on radix-eviction re-prefill -- 8,549 s of prefill emitting no output
+token -- in the gaps where an auxiliary request was in flight, against 7.34M
+where none was. That is 143,596 versus 5,028 wasted tokens per call, so 83.7%
+of the mains' re-prefill waste is auxiliary-overlapped.  [measured]
+
+Two things the design comment in the auxiliary client assumed, and which were
+not true here:
+
+ 1. The profile pinned all 20 auxiliary tasks to the main model and base_url
+    byte-identically, so the "route auxiliary work to another card" branch
+    short-circuited on main_model == model and never looked. The other-card
+    route was never expressed in configuration.
+ 2. The largest auxiliary consumer never reached the auxiliary client at all.
+    A monitor loop shells out to a full one-shot CLI session every 240 s: 305
+    calls carrying 12.9M prompt tokens (mean 42,340 -- a fresh system prompt
+    per tick) for 222K output tokens, a 58:1 prefill-to-decode ratio. The CLI
+    classified that turn as INTERACTIVE, so it ran at the same request
+    priority as a turn a person typed.  [measured]
+
+Changes:
+
+  * the turn-priority decision is extracted into turn_request_priority(), and
+    a one-shot -q/-Q run is classified NORMAL rather than INTERACTIVE. The
+    file already asserted the fact this rests on, where it sets
+    HERMES_SINGLE_QUERY_SESSION: a -q run has no user waiting.
+  * background auxiliary tasks carry an explicit low priority, stamped through
+    the broker's documented transport hook rather than by editing the broker.
+    It is an ALLOW-list, not a deny-list: most auxiliary work sits ON the
+    turn's critical path, and demoting that would slow the lane it is meant to
+    protect. The goal judge is never demoted -- it rides the control-plane
+    lane at top priority.
+  * judge-shaped auxiliary prompts are bounded at _build_call_kwargs, the one
+    choke point every retry and fallback route rebuilds through. compression,
+    vision, web_extract, skills_hub, mcp, approval and the mixture-of-agents
+    tasks are exempt: their input IS the payload, and truncating compression
+    would silently discard the transcript the summary exists to preserve.
+  * a one-shot session keeps its instantly derived title and skips the model
+    call -- 258 calls a day on this profile, one per monitor tick, every one
+    naming a session no human will ever list.
+  * the background-review fork demotes itself. It replays a finished turn
+    through a full agent loop, so its requests leave on the main client path
+    where the auxiliary tag cannot reach them (1,716 calls, 55.4M prompt
+    tokens).  [measured]
+
+Squashed with the follow-up that fixes what the title change broke: returning
+early left colliding one-shot sessions nameless, because the instant-title
+write passes dedupe=False and writes nothing when the derived name is already
+taken -- and on a machine lane it is taken every time (the suffix counter had
+reached #905). The background stage is the only thing that picks a collision
+back up with a lineage scan, so the stage still runs, with skip_llm=True: same
+persistence, same collision recovery, no backend request.
+
+Squashed from fork commits f8ae3f1, 1b84f9e.
+
+BASE: the tree left by patch 0004 (see BASELINE.md).
+
+PUBLISHED FORM. A private backend address becomes 127.0.0.1 and an absolute
+fleet log path becomes <stack>/..., following the placeholder conventions in
+NOTICE and ops/README.md.
+
+---
+ agent/auxiliary_client.py               |  265 ++++++++++++++++++
+ agent/background_review.py              |   20 +
+ agent/title_generator.py                |   73 +++++
+ cli.py                                  |   59 +++-
+ tests/agent/test_aux_yields_to_mains.py |  465 +++++++++++++++++++++++++++++++
+ tests/agent/test_title_generator.py     |    4 
+ 6 files changed, 874 insertions(+), 12 deletions(-)
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index c0e189d..835d893 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -8693,6 +8693,260 @@ def _contains_profile_reasoning_fields(value: Any) -> bool:
+     return False
+ 
+ 
++# ── Background auxiliary work yields to the main lanes on GPU0 ───────────────
++# [bd-dre-x8kyt] Andre: "everything else aux should yield to mains", keeping the
++# goal judge prioritised.
++#
++# WHY A TAG IS NEEDED AT ALL. pool_broker.current_priority() decides priority by
++# WHO the call is for, not what it is: a main agent's auxiliary calls inherit the
++# TURN priority, so titling and curator work fired during a typed turn went out
++# at PRIORITY_INTERACTIVE (100) — tying with the very turn they were stealing
++# prefill from. That inheritance is right for aux the turn is BLOCKED on and
++# wrong for aux nothing is waiting on.
++#
++# WHY AN ALLOW-LIST, NOT A DENY-LIST. Most aux tasks sit on the turn's critical
++# path: the turn cannot finish without its compaction, cannot answer without its
++# vision pass, cannot run a command without its approval verdict, and the goal
++# judge is what keeps an autonomous loop alive (it runs at 100 on purpose via
++# pool_broker.control_plane_call — a USER REQUEST, never demote it). Demoting
++# those would slow the main lane down, which is the opposite of the point. So
++# only tasks with a PROVEN absence of a waiter are listed here; a task not named
++# keeps today's inherited priority. Adding a task to this set is a claim that
++# nothing blocks on it — check the call site before making it.
++#
++#   title_generation  forked to a daemon thread; title_generator.maybe_auto_title
++#                     is explicit that "nothing here is on the critical path"
++#   curator           skill consolidation, runs after the session
++#   monitor           background watcher
++#   background_review a review fork of a finished turn
++#   profile_describer cosmetic profile blurb
++_AUX_BACKGROUND_TASKS: frozenset = frozenset({
++    "title_generation",
++    "curator",
++    "monitor",
++    "background_review",
++    "profile_describer",
++})
++
++
++def _aux_background_priority() -> Optional[int]:
++    """Priority for aux nothing is waiting on, or None to leave the call untagged.
++
++    Defaults to pool_broker's NORMAL (0), which is strictly below an interactive
++    main turn (100) — that is the whole requirement. A value BELOW zero would
++    also yield to subagents; it is reachable through
++    ``HERMES_AUX_BACKGROUND_PRIORITY`` rather than hardcoded, because this
++    backend's acceptance of a negative priority has not been measured and a
++    rejected field fails the call outright.
++
++    ``HERMES_AUX_BACKGROUND_PRIORITY=off`` disables the tag entirely.
++    """
++    raw = (os.environ.get("HERMES_AUX_BACKGROUND_PRIORITY") or "").strip().lower()
++    if raw in {"off", "none", "disabled"}:
++        return None
++    if raw:
++        try:
++            return int(raw)
++        except ValueError:
++            logger.debug("bad HERMES_AUX_BACKGROUND_PRIORITY=%r; using the default", raw)
++    try:
++        from agent.pool_broker import PRIORITY_NORMAL
++        return int(PRIORITY_NORMAL)
++    except Exception:
++        return 0
++
++
++def _apply_aux_background_priority(
++    merged_extra: dict, task: Optional[str], base_url: Optional[str],
++) -> None:
++    """Tag a background aux call so SGLang schedules it behind the main lanes.
++
++    Mutates *merged_extra* in place. Never raises: a priority tag is an
++    optimisation, and an auxiliary call that fails to be deprioritised must
++    still be made.
++
++    ``priority`` set here is FINAL — pool_broker's PriorityTagTransport returns
++    the request unchanged when the body already carries the field
++    (``_tagged_request``: ``if ... "priority" in body: return None``), which is
++    the documented hook this uses instead of editing the broker.
++    """
++    try:
++        if not task or task not in _AUX_BACKGROUND_TASKS:
++            return
++        if "priority" in merged_extra:
++            return          # an explicit caller tag wins
++        from agent.pool_broker import gpu0_hosts
++        host = base_url_hostname(base_url or "")
++        if not host or host not in gpu0_hosts():
++            return          # priority is a GPU0-local scheduling concept
++        prio = _aux_background_priority()
++        if prio is None:
++            return
++        if not _aux_priority_safe():
++            return
++        merged_extra["priority"] = prio
++        logger.debug("auxiliary %s tagged priority=%s (background lane)", task, prio)
++    except Exception:
++        logger.debug("auxiliary priority tag skipped", exc_info=True)
++
++
++# ── Bounded aux context ─────────────────────────────────────────────────────
++# [bd-dre-x8kyt] "a judge doesn't need the full 300K transcript". Aux prompt size
++# is what actually costs the mains: GPU0's radix cache is one shared pool, so a
++# large aux prefix evicts the mains' resident prefixes and their next turn
++# re-prefills from the eviction point. Measured over 24 h: the mains wasted
++# 143,596 prompt tokens per call on re-prefill while an aux request was in flight
++# versus 5,028 when none was — 37.6 M wasted tokens, 8,549 s of prefill that
++# emits no output token.
++#
++# ⛔ EXEMPT BY DESIGN — do not "unify" these under one ceiling:
++#   compression   its input IS the transcript. Truncating it silently discards
++#                 conversation the summary was supposed to preserve. That is
++#                 data loss wearing a performance optimisation's clothes.
++#   vision / web_extract / skills_hub / mcp / approval / moa_*
++#                 the payload the task exists to read. A truncated approval
++#                 verdict or a half-read page is a WRONG answer, not a cheap one.
++#
++# Bounded tasks judge or describe something, so a bounded view still answers the
++# question they were asked. Ceilings are in CHARACTERS: a char budget cannot
++# itself cost a tokenizer pass, and title_generation already uses one
++# (MAX_TITLE_INPUT_CHARS). ~4 chars/token on this tokenizer, so 48,000 chars is
++# roughly 12 K tokens.
++_AUX_PROMPT_CHAR_CEILINGS: Dict[str, int] = {
++    "goal_judge": 48_000,
++    "monitor": 24_000,
++    "curator": 48_000,
++    "profile_describer": 12_000,
++    "triage_specifier": 24_000,
++    "kanban_decomposer": 24_000,
++    "memory_query_rewrite": 8_000,
++    "tts_audio_tags": 8_000,
++}
++
++# Never elide a message below this — a stub carries no information and turns a
++# bounded call into a wasted one.
++_AUX_ELISION_FLOOR = 1_500
++_AUX_ELISION_MARK = "\n\n… [{dropped:,} characters elided to keep this auxiliary call off the mains' prefill budget] …\n\n"
++
++
++def _aux_prompt_ceiling(task: Optional[str]) -> Optional[int]:
++    """Character ceiling for *task*'s prompt, or None to leave it alone.
++
++    ``auxiliary.<task>.max_prompt_chars`` overrides the built-in; ``0`` or a
++    negative value disables bounding for that task.
++    """
++    if not task:
++        return None
++    try:
++        configured = (_get_auxiliary_task_config(task) or {}).get("max_prompt_chars")
++    except Exception:
++        configured = None
++    if configured is not None:
++        try:
++            value = int(configured)
++        except (TypeError, ValueError):
++            logger.debug("bad auxiliary.%s.max_prompt_chars=%r", task, configured)
++        else:
++            return value if value > 0 else None
++    return _AUX_PROMPT_CHAR_CEILINGS.get(task)
++
++
++def _elide_middle(text: str, keep: int) -> str:
++    """Keep the head and tail of *text*, marking what was dropped.
++
++    The middle goes because both ends carry the signal: an aux prompt opens with
++    its instructions and closes with the thing it is actually being asked about.
++    """
++    if keep >= len(text):
++        return text
++    dropped = len(text) - keep
++    mark = _AUX_ELISION_MARK.format(dropped=dropped)
++    room = max(0, keep - len(mark))
++    head = room // 2
++    tail = room - head
++    return text[:head] + mark + (text[len(text) - tail:] if tail else "")
++
++
++def _bound_aux_prompt(messages: list, task: Optional[str]) -> list:
++    """Return *messages* trimmed to *task*'s character ceiling.
++
++    Returns the SAME list object when nothing needs trimming, so the common path
++    allocates nothing. Elides the largest non-system message first: the system
++    message is the stable shared prefix that we WANT resident in the radix cache,
++    and shortening it would defeat the purpose by changing the cache key.
++
++    Never raises — an auxiliary call must not fail because bounding it failed.
++    """
++    if not isinstance(messages, list) or not messages:
++        return messages
++    try:
++        # Inside the guard: the ceiling lookup reads config, and a config read is
++        # exactly the kind of thing that can fail on a half-written file.
++        ceiling = _aux_prompt_ceiling(task)
++        if not ceiling:
++            return messages
++        from agent.message_content import flatten_message_text
++
++        # Only plain-string content is safe to elide: a multimodal block list
++        # carries images, and slicing one would corrupt the payload.
++        sizes = []
++        total = 0
++        for idx, msg in enumerate(messages):
++            if not isinstance(msg, dict):
++                continue
++            content = msg.get("content")
++            length = len(content) if isinstance(content, str) else len(
++                flatten_message_text(content))
++            total += length
++            if isinstance(content, str) and msg.get("role") != "system":
++                sizes.append((length, idx))
++        if total <= ceiling:
++            return messages
++        over = total - ceiling
++        sizes.sort(reverse=True)
++        out = list(messages)
++        elided = 0
++        for length, idx in sizes:
++            if over <= 0:
++                break
++            room = length - _AUX_ELISION_FLOOR
++            if room <= 0:
++                continue
++            take = min(room, over)
++            new_len = length - take
++            out[idx] = dict(out[idx])
++            out[idx]["content"] = _elide_middle(out[idx]["content"], new_len)
++            over -= take
++            elided += take
++        if not elided:
++            return messages
++        logger.warning(
++            "auxiliary %s: prompt bounded %s -> ~%s chars (ceiling %s, %s elided); "
++            "raise auxiliary.%s.max_prompt_chars to widen it",
++            task, f"{total:,}", f"{total - elided:,}", f"{ceiling:,}",
++            f"{elided:,}", task,
++        )
++        return out
++    except Exception:
++        logger.debug("auxiliary prompt bounding skipped for %s", task, exc_info=True)
++        return messages
++
++
++def _aux_priority_safe() -> bool:
++    """Whether this backend will accept a ``priority`` field at all.
++
++    Mirrors pool_broker._priority_safe() through its public allowance rather
++    than reimplementing the flag logic. Fails CLOSED — an unknown backend gets
++    no tag, because ``--abort-on-priority-when-disabled`` turns an unwanted
++    field into a hard request failure.
++    """
++    try:
++        from agent.pool_broker import _priority_safe
++        return bool(_priority_safe())
++    except Exception:
++        return False
++
++
+ def _build_call_kwargs(
+     provider: str,
+     model: str,
+@@ -8707,6 +8961,10 @@ def _build_call_kwargs(
+     task: Optional[str] = None,
+ ) -> dict:
+     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
++    # Bound the prompt HERE rather than at the ~20 aux call sites: every retry
++    # and every fallback route rebuilds its kwargs through this function, so a
++    # ceiling applied here holds for all of them [bd-dre-x8kyt].
++    messages = _bound_aux_prompt(messages, task)
+     kwargs: Dict[str, Any] = {
+         "model": model,
+         "messages": messages,
+@@ -8895,6 +9153,13 @@ def _build_call_kwargs(
+                 sticky_key = None
+             if sticky_key:
+                 merged_extra["session_id"] = sticky_key
++    # Background aux yields to the main lanes on GPU0 [bd-dre-x8kyt]. Last, so it
++    # sees every other contribution to the body and can defer to an explicit
++    # caller-supplied priority.
++    _apply_aux_background_priority(
++        merged_extra, task,
++        base_url or (_current_custom_base_url() if provider == "custom" else ""),
++    )
+     if merged_extra:
+         kwargs["extra_body"] = merged_extra
+ 
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 7994146..68bc471 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1408,6 +1408,26 @@ def spawn_background_review_thread(
+         )
+ 
+     def _target() -> None:
++        # ⛔ THE REVIEW FORK YIELDS TO THE MAIN LANES [bd-dre-x8kyt].
++        # This fork replays a finished turn through a full agent loop, so its
++        # requests go out on the MAIN client path, not through auxiliary_client
++        # — the aux background-priority tag cannot reach them. Measured: 1,716
++        # review calls carrying 55.4 M prompt tokens (mean ~32 K, plus 260 M
++        # cache-read) on the same GPU0 card the live lanes prefill on.
++        #
++        # A bare thread starts with an EMPTY context on 3.11, so without this
++        # the fork inherits nothing and lands at NORMAL by default — which is
++        # already right today, but only by accident: it would silently become
++        # INTERACTIVE the moment this thread started inheriting its parent's
++        # context. Set it explicitly so the property is stated, not incidental.
++        # Nobody waits on a post-turn review, so it never outranks a live turn.
++        try:
++            from agent.pool_broker import PRIORITY_NORMAL, set_turn_priority
++
++            set_turn_priority(PRIORITY_NORMAL)
++        except Exception:
++            logger.debug("background review: priority demotion skipped",
++                         exc_info=True)
+         _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg)
+ 
+     return _target, prompt
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index 5323f8b..dd87c5c 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -19,6 +19,7 @@ same ``custom > ai > fallback`` precedence in its session importer.
+ 
+ import json
+ import logging
++import os
+ import re
+ import threading
+ from typing import Any, Callable, Optional
+@@ -536,6 +537,7 @@ def auto_title_session(
+     main_runtime: dict = None,
+     title_callback: Optional[TitleCallback] = None,
+     runtime_validator: Optional[RuntimeValidator] = None,
++    skip_llm: bool = False,
+ ) -> None:
+     """Generate and store the model title for a session.
+ 
+@@ -563,6 +565,7 @@ def auto_title_session(
+             main_runtime=main_runtime,
+             title_callback=title_callback,
+             runtime_validator=runtime_validator,
++            skip_llm=skip_llm,
+         )
+     except Exception as e:
+         # WARNING (not debug) so operators see it in agent.log; the message
+@@ -588,8 +591,18 @@ def _auto_title_session(
+     main_runtime: dict = None,
+     title_callback: Optional[TitleCallback] = None,
+     runtime_validator: Optional[RuntimeValidator] = None,
++    skip_llm: bool = False,
+ ) -> None:
+-    """Body of :func:`auto_title_session` — see its docstring."""
++    """Body of :func:`auto_title_session` — see its docstring.
++
++    ``skip_llm`` takes the derived-title branch without asking a model, which is
++    how a one-shot session still gets a NAME while spending no GPU0 request
++    [bd-dre-x8kyt]. It matters because ``apply_instant_title`` passes
++    ``dedupe=False`` and therefore writes NOTHING when the derived name is
++    already taken — and for a machine lane it is taken every time (the monitor's
++    collision counter had reached #905). This stage is what picks that collision
++    back up, so skipping it entirely would leave those sessions nameless.
++    """
+     if not session_db or not session_id:
+         return
+ 
+@@ -624,7 +637,7 @@ def _auto_title_session(
+     # recorded against this session (task='title_generation', #23270).
+     set_accounting_context(session_db, session_id)
+ 
+-    title = generate_title(
++    title = None if skip_llm else generate_title(
+         user_message,
+         failure_callback=failure_callback,
+         main_runtime=main_runtime,
+@@ -700,6 +713,35 @@ def _session_is_untitled(session_db, session_id: str) -> bool:
+         return False
+ 
+ 
++def _is_one_shot_session() -> bool:
++    """Whether this process is a ``hermes -q`` / ``-Q`` single-query run.
++
++    ``HERMES_SINGLE_QUERY_SESSION`` is set by cli.py for exactly that case.
++    Prefers the session-context lookup (a gateway-hosted session carries its own
++    environment) and falls back to ``os.environ``, which is what a plain CLI run
++    has. Fails OPEN — an unreadable marker must not disable titling for real
++    interactive sessions, so an error here means "not one-shot".
++
++    ``HERMES_TITLE_ONE_SHOT=1`` restores LLM titling for one-shot runs.
++    """
++    try:
++        if os.environ.get("HERMES_TITLE_ONE_SHOT", "").strip() == "1":
++            return False
++        value = ""
++        try:
++            from gateway.session_context import get_session_env
++
++            value = get_session_env("HERMES_SINGLE_QUERY_SESSION", "")
++        except Exception:
++            value = ""
++        if not str(value).strip():
++            value = os.environ.get("HERMES_SINGLE_QUERY_SESSION", "")
++        return str(value).strip().lower() not in ("", "0", "false", "no", "off")
++    except Exception:
++        logger.debug("one-shot session check failed; titling as usual", exc_info=True)
++        return False
++
++
+ def maybe_auto_title(
+     session_db,
+     session_id: str,
+@@ -747,6 +789,32 @@ def maybe_auto_title(
+ 
+     apply_instant_title(session_db, session_id, user_message, title_callback)
+ 
++    # ⛔ A ONE-SHOT ``-q`` / ``-Q`` SESSION GETS THE DERIVED TITLE AND NOTHING
++    # MORE [bd-dre-x8kyt]. The instant title above has already landed, so the
++    # session is named either way; what is skipped is the LLM upgrade, and the
++    # upgrade only pays for itself if someone later BROWSES a session list.
++    # Nobody browses these: a one-shot run prints its answer to a pipe and exits,
++    # and it is overwhelmingly a script rather than a person (the same marker is
++    # why the approval gate takes its deterministic path — "a -q run has NO user
++    # waiting"). Measured on the architect profile: 258 of these per day, one per
++    # hermes-monitor tick, every one titling a session no human would ever list,
++    # each landing a request on the GPU0 card the main lanes are prefilling on.
++    #
++    # The stage still RUNS, with ``skip_llm`` — it is the only thing that
++    # recovers a derived-title COLLISION, because apply_instant_title above
++    # passes dedupe=False and so writes nothing when the name is taken. On a
++    # machine lane it is taken every time (the monitor's suffix counter had
++    # reached #905), so returning here instead would trade 258 model calls for
++    # 258 nameless sessions. Skipping only the model call keeps both.
++    #
++    # Read through get_session_env so a gateway-hosted session sees its OWN
++    # environment rather than the host process's.
++    _one_shot = _is_one_shot_session()
++    if _one_shot:
++        logger.debug(
++            "Auto-title: derived title only, no model call "
++            "(one-shot -q session; nothing lists it)")
++
+     thread = threading.Thread(
+         target=auto_title_session,
+         args=(session_db, session_id, user_message),
+@@ -755,6 +823,7 @@ def maybe_auto_title(
+             "main_runtime": main_runtime,
+             "title_callback": title_callback,
+             "runtime_validator": runtime_validator,
++            "skip_llm": _one_shot,
+         },
+         daemon=True,
+         name="auto-title",
+diff --git a/cli.py b/cli.py
+index 9470123..9651118 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1580,6 +1580,49 @@ def _raise_single_query_async_incomplete(cli, residue: list[dict]) -> None:
+     raise SystemExit(_SINGLE_QUERY_ASYNC_INCOMPLETE_EXIT_CODE)
+ 
+ 
++def turn_request_priority(auto_kind, one_shot: bool):
++    """SGLang request priority for the turn about to run: ``(priority, why)``.
++
++    [bd-dre-i4qoy] Interactive (100) when a human started the turn, normal (0)
++    when the agent scheduled it.
++
++    ⛔ A ONE-SHOT ``-q`` / ``-Q`` RUN IS NOT INTERACTIVE [bd-dre-x8kyt].
++    The classifier used to split only "the agent scheduled this turn" from
++    everything else, so a SCRIPT piping a prompt in fell through to INTERACTIVE
++    and competed with Andre's typed turn on GPU0 at EQUAL priority — the one
++    thing priority scheduling exists to prevent. Measured over 24 h on the
++    architect profile: the hermes-monitor loop (``hermes chat -Q -q``, every
++    240 s) issued 305 calls carrying 12.9 M prompt tokens — mean 42,340, a fresh
++    full system prompt per tick — to produce 222 K output tokens, every one of
++    them at priority 100 against two 270 K-context main lanes.
++
++    ``_single_query_mode`` already carries the fact this relies on; cli.py states
++    it outright where the marker is set: "a -q run has NO user waiting to answer
++    approval prompts". Nobody waits on the latency, so the turn yields to the
++    lanes where somebody does.
++
++    Deliberately NOT keyed on ``isatty()``: a human running ``hermes -q`` from an
++    interactive shell still has no turn-by-turn loop blocked on it, and a tmux
++    main lane is not reliably a tty either.
++
++    Returns ``(None, why)`` when pool_broker cannot be imported, which leaves the
++    request untagged exactly as before.
++    """
++    if auto_kind:
++        why = f"autonomous: {auto_kind}"
++    elif one_shot:
++        why = "one-shot -q/-Q: no user waiting, yields to main lanes"
++    else:
++        why = "interactive"
++    try:
++        from agent.pool_broker import PRIORITY_INTERACTIVE, PRIORITY_NORMAL
++    except Exception:
++        return None, why
++    if auto_kind or one_shot:
++        return PRIORITY_NORMAL, why
++    return PRIORITY_INTERACTIVE, why
++
++
+ def _flush_one_shot_session_store(cli) -> None:
+     """Durably flush + finalize the one-shot session row before process exit.
+ 
+@@ -17490,18 +17533,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+                     "2-3 sentences max. No code blocks or markdown.] "
+                 )
+ 
+-            # Request priority for THIS turn [bd-dre-i4qoy]: interactive (100)
+-            # when a human started it, normal (0) when the agent did. Consumed
+-            # here so a stale marker can never leak into a later typed turn.
++            # Request priority for THIS turn — see turn_request_priority().
++            # Consumed here so a stale marker can never leak into a later typed
++            # turn.
+             _auto_kind = getattr(self, "_next_turn_autonomous_kind", None)
+             self._next_turn_autonomous_kind = None
+-            try:
+-                from agent.pool_broker import PRIORITY_INTERACTIVE, PRIORITY_NORMAL
+-                _turn_priority = PRIORITY_NORMAL if _auto_kind else PRIORITY_INTERACTIVE
+-            except Exception:
+-                _turn_priority = None
+-            logger.info("turn request priority: %s (%s)", _turn_priority,
+-                        f"autonomous: {_auto_kind}" if _auto_kind else "interactive")
++            _one_shot = bool(getattr(self, "_single_query_mode", False))
++            _turn_priority, _prio_why = turn_request_priority(_auto_kind, _one_shot)
++            logger.info("turn request priority: %s (%s)", _turn_priority, _prio_why)
+ 
+             def run_agent():
+                 nonlocal result
+diff --git a/tests/agent/test_aux_yields_to_mains.py b/tests/agent/test_aux_yields_to_mains.py
+new file mode 100644
+index 0000000..0068bf2
+--- /dev/null
++++ b/tests/agent/test_aux_yields_to_mains.py
+@@ -0,0 +1,465 @@
++# Copyright © 2026 Ligandal, Inc. All rights reserved.
++"""Auxiliary work must not compete with the main lanes on GPU0 [bd-dre-x8kyt].
++
++GPU1 is training and the 27B lane is off-limits, so the "put aux on the other
++card" plan (bd-dre-oh6sp.32) is unavailable. Aux has to share GPU0 and simply
++cost the mains less. Three mechanisms do that, and these tests pin each one
++together with the case it must NOT change:
++
++1. A one-shot ``-q`` turn yields (``cli.turn_request_priority``). Measured: the
++   hermes-monitor loop's 305 calls/24 h, 12.9 M prompt tokens, ran at the same
++   priority 100 as Andre's typed turn.
++2. Background aux carries an explicit low ``priority`` so SGLang schedules it
++   behind the mains — and the goal judge NEVER does, because Andre asked for it
++   to stay prioritised.
++3. Judge-shaped aux prompts are bounded, because a large aux prefix evicts the
++   mains' radix entries. Measured: the mains wasted 143,596 prompt tokens per
++   call on re-prefill while an aux request was in flight versus 5,028 when none
++   was.
++
++The exemptions matter as much as the mechanisms: truncating ``compression`` would
++silently discard transcript the summary exists to preserve, and demoting the
++aux a turn is BLOCKED on would slow the main lane down — the opposite of the
++point. Both are asserted here so a later "unify the ceilings" refactor fails
++loudly.
++"""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++import agent.auxiliary_client as aux
++import agent.title_generator as tg
++
++
++GPU0 = "http://127.0.0.1:30000/v1"
++OFFHOST = "https://api.openai.com/v1"
++
++
++@pytest.fixture(autouse=True)
++def _priority_is_taggable(monkeypatch):
++    """Pretend the backend accepts a priority field, and that GPU0 is GPU0.
++
++    Both are read from the live pool broker in production; pinning them keeps
++    these tests independent of whether a server happens to be up.
++    """
++    monkeypatch.setattr(aux, "_aux_priority_safe", lambda: True)
++    import agent.pool_broker as pb
++    monkeypatch.setattr(pb, "gpu0_hosts", lambda: frozenset({"127.0.0.1"}))
++    monkeypatch.delenv("HERMES_AUX_BACKGROUND_PRIORITY", raising=False)
++
++
++# ── 1. one-shot turns yield ──────────────────────────────────────────────────
++
++def test_one_shot_turn_is_not_interactive():
++    import cli
++    from agent.pool_broker import PRIORITY_INTERACTIVE, PRIORITY_NORMAL
++
++    prio, why = cli.turn_request_priority(None, True)
++    assert prio == PRIORITY_NORMAL
++    assert "one-shot" in why
++    # The regression this exists for: it used to come back at 100.
++    assert prio != PRIORITY_INTERACTIVE
++
++
++def test_typed_turn_keeps_interactive_priority():
++    import cli
++    from agent.pool_broker import PRIORITY_INTERACTIVE
++
++    prio, why = cli.turn_request_priority(None, False)
++    assert prio == PRIORITY_INTERACTIVE
++    assert why == "interactive"
++
++
++def test_autonomous_turn_still_normal_and_names_its_kind():
++    import cli
++    from agent.pool_broker import PRIORITY_NORMAL
++
++    prio, why = cli.turn_request_priority("goal-loop", False)
++    assert prio == PRIORITY_NORMAL
++    assert "goal-loop" in why
++
++
++# ── 2. background aux yields; the judge does not ─────────────────────────────
++
++def test_background_aux_is_tagged_below_an_interactive_main():
++    from agent.pool_broker import PRIORITY_INTERACTIVE
++
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert "priority" in body
++    assert body["priority"] < PRIORITY_INTERACTIVE
++
++
++@pytest.mark.parametrize("task", sorted(aux._AUX_BACKGROUND_TASKS))
++def test_every_declared_background_task_is_tagged(task):
++    body: dict = {}
++    aux._apply_aux_background_priority(body, task, GPU0)
++    assert "priority" in body, f"{task} is declared background but was not tagged"
++
++
++def test_goal_judge_is_never_demoted():
++    """Andre asked for the judge to stay prioritised; it runs at 100 via
++    pool_broker.control_plane_call and must reach the transport untagged so that
++    inheritance still applies."""
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "goal_judge", GPU0)
++    assert body == {}
++
++
++@pytest.mark.parametrize("task", ["compression", "vision", "approval",
++                                 "web_extract", "mcp", "skills_hub",
++                                 "moa_reference", "moa_aggregator"])
++def test_critical_path_aux_is_not_demoted(task):
++    """These block the turn. Demoting them makes the main lane slower."""
++    assert task not in aux._AUX_BACKGROUND_TASKS
++    body: dict = {}
++    aux._apply_aux_background_priority(body, task, GPU0)
++    assert body == {}
++
++
++def test_priority_is_a_gpu0_concept_only():
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", OFFHOST)
++    assert body == {}
++
++
++def test_an_explicit_caller_priority_wins():
++    body = {"priority": 77}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert body["priority"] == 77
++
++
++def test_tagging_can_be_switched_off(monkeypatch):
++    monkeypatch.setenv("HERMES_AUX_BACKGROUND_PRIORITY", "off")
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert body == {}
++
++
++def test_a_negative_priority_is_reachable_without_a_code_change(monkeypatch):
++    """Yielding to subagents too needs a sub-zero value; this backend's
++    acceptance of one is unmeasured, so it lives behind the env rather than in
++    the default."""
++    monkeypatch.setenv("HERMES_AUX_BACKGROUND_PRIORITY", "-50")
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert body["priority"] == -50
++
++
++def test_an_unsafe_backend_gets_no_tag(monkeypatch):
++    """--abort-on-priority-when-disabled turns an unwanted field into a hard
++    failure, so the check fails CLOSED."""
++    monkeypatch.setattr(aux, "_aux_priority_safe", lambda: False)
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert body == {}
++
++
++def test_tagging_never_raises(monkeypatch):
++    monkeypatch.setattr(aux, "_aux_background_priority",
++                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
++    body: dict = {}
++    aux._apply_aux_background_priority(body, "title_generation", GPU0)
++    assert body == {}
++
++
++# ── 3. bounded aux context ───────────────────────────────────────────────────
++
++def _msgs(system_chars: int, user_chars: int) -> list:
++    return [{"role": "system", "content": "S" * system_chars},
++            {"role": "user", "content": "U" * user_chars}]
++
++
++def test_a_judge_prompt_is_bounded():
++    ceiling = aux._AUX_PROMPT_CHAR_CEILINGS["goal_judge"]
++    out = aux._bound_aux_prompt(_msgs(2_000, 300_000), "goal_judge")
++    assert sum(len(m["content"]) for m in out) <= ceiling
++
++
++def test_bounding_never_shortens_the_shared_system_prefix():
++    """The system message is the prefix we WANT resident in the radix cache;
++    changing it changes the cache key and defeats the purpose."""
++    msgs = _msgs(2_000, 300_000)
++    out = aux._bound_aux_prompt(msgs, "goal_judge")
++    assert out[0]["content"] == msgs[0]["content"]
++
++
++def test_bounding_keeps_both_ends_of_the_elided_message():
++    msgs = [{"role": "system", "content": "sys"},
++            {"role": "user", "content": "HEAD" + "x" * 300_000 + "TAIL"}]
++    out = aux._bound_aux_prompt(msgs, "goal_judge")
++    body = out[1]["content"]
++    assert body.startswith("HEAD")
++    assert body.endswith("TAIL")
++    assert "elided" in body
++
++
++def test_a_short_prompt_is_returned_unchanged_and_unallocated():
++    msgs = _msgs(100, 100)
++    assert aux._bound_aux_prompt(msgs, "goal_judge") is msgs
++
++
++def test_compression_input_is_never_truncated():
++    """Its input IS the transcript. Truncating it is data loss wearing a
++    performance optimisation's clothes."""
++    assert "compression" not in aux._AUX_PROMPT_CHAR_CEILINGS
++    msgs = _msgs(2_000, 900_000)
++    assert aux._bound_aux_prompt(msgs, "compression") is msgs
++
++
++@pytest.mark.parametrize("task", ["vision", "web_extract", "skills_hub",
++                                 "mcp", "approval", "moa_reference",
++                                 "moa_aggregator", "compression"])
++def test_payload_reading_tasks_have_no_ceiling(task):
++    assert aux._aux_prompt_ceiling(task) is None
++
++
++def test_multimodal_content_is_never_sliced():
++    """A block list carries images; slicing one corrupts the payload."""
++    msgs = [{"role": "system", "content": "sys"},
++            {"role": "user", "content": [{"type": "text", "text": "T" * 300_000},
++                                         {"type": "image_url",
++                                          "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
++    out = aux._bound_aux_prompt(msgs, "goal_judge")
++    assert out[1]["content"] == msgs[1]["content"]
++
++
++def test_no_message_is_elided_below_the_information_floor():
++    msgs = [{"role": "system", "content": "sys"},
++            {"role": "user", "content": "U" * 300_000}]
++    out = aux._bound_aux_prompt(msgs, "goal_judge")
++    assert len(out[1]["content"]) >= aux._AUX_ELISION_FLOOR
++
++
++def test_config_can_widen_or_disable_the_ceiling(monkeypatch):
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config",
++                        lambda task: {"max_prompt_chars": 5_000})
++    assert aux._aux_prompt_ceiling("goal_judge") == 5_000
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config",
++                        lambda task: {"max_prompt_chars": 0})
++    assert aux._aux_prompt_ceiling("goal_judge") is None
++
++
++def test_bounding_never_raises(monkeypatch):
++    monkeypatch.setattr(aux, "_aux_prompt_ceiling",
++                        lambda task: (_ for _ in ()).throw(RuntimeError("boom")))
++    msgs = _msgs(10, 10)
++    assert aux._bound_aux_prompt(msgs, "goal_judge") is msgs
++
++
++def test_bounding_is_not_applied_without_a_task():
++    msgs = _msgs(2_000, 300_000)
++    assert aux._bound_aux_prompt(msgs, None) is msgs
++
++
++# ── both mechanisms reach the wire through _build_call_kwargs ────────────────
++
++def test_kwargs_builder_bounds_a_judge_call():
++    kwargs = aux._build_call_kwargs(
++        "custom", "qwen38-flash-next", _msgs(2_000, 300_000),
++        base_url=GPU0, task="goal_judge")
++    total = sum(len(m["content"]) for m in kwargs["messages"])
++    assert total <= aux._AUX_PROMPT_CHAR_CEILINGS["goal_judge"]
++
++
++def test_kwargs_builder_demotes_a_background_call():
++    kwargs = aux._build_call_kwargs(
++        "custom", "qwen38-flash-next", _msgs(50, 50),
++        base_url=GPU0, task="title_generation")
++    from agent.pool_broker import PRIORITY_INTERACTIVE
++    assert kwargs["extra_body"]["priority"] < PRIORITY_INTERACTIVE
++
++
++def test_kwargs_builder_leaves_the_judge_untagged():
++    kwargs = aux._build_call_kwargs(
++        "custom", "qwen38-flash-next", _msgs(50, 50),
++        base_url=GPU0, task="goal_judge")
++    assert "priority" not in (kwargs.get("extra_body") or {})
++
++
++def test_kwargs_builder_does_not_disturb_a_compression_call():
++    msgs = _msgs(2_000, 400_000)
++    kwargs = aux._build_call_kwargs(
++        "custom", "qwen38-flash-next", msgs, base_url=GPU0, task="compression")
++    assert kwargs["messages"] is msgs
++    assert "priority" not in (kwargs.get("extra_body") or {})
++
++
++# ── 4. a one-shot session keeps its derived title and asks for nothing ───────
++
++class _FakeSessionDB:
++    def __init__(self):
++        self.titles: dict = {}
++
++    def get_session_title(self, session_id):
++        return self.titles.get(session_id)
++
++    def set_auto_title(self, session_id, title, source=None):
++        self.titles[session_id] = title
++        return True
++
++    def get_auto_title_source(self, session_id):
++        return "derived" if session_id in self.titles else None
++
++    def get_conversation_root(self, session_id):
++        return session_id
++
++
++@pytest.fixture
++def _titling_enabled(monkeypatch):
++    monkeypatch.setattr(tg, "_auto_title_enabled", lambda: True)
++    monkeypatch.delenv("HERMES_TITLE_ONE_SHOT", raising=False)
++
++
++def _spy_threads(monkeypatch):
++    """Capture the kwargs the titling stage would be forked with."""
++    started: list = []
++
++    class _Spy:
++        def __init__(self, *a, **kw):
++            self._kwargs = kw.get("kwargs") or {}
++
++        def start(self):
++            started.append(self._kwargs)
++
++    monkeypatch.setattr(tg.threading, "Thread", _Spy)
++    return started
++
++
++def test_one_shot_session_spends_no_llm_title_call(monkeypatch, _titling_enabled):
++    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
++    started = _spy_threads(monkeypatch)
++    db = _FakeSessionDB()
++    tg.maybe_auto_title(db, "s1", "goal: you are prime tmux/GPU pack monitor. "
++                                  "STATUS_JSON={}. Name leftover VRAM holes.")
++    assert len(started) == 1
++    assert started[0]["skip_llm"] is True
++
++
++def test_skip_llm_never_calls_the_model_but_still_names_the_session(monkeypatch):
++    """The stage still runs — it is the only thing that recovers a derived-title
++    collision, which apply_instant_title declines (dedupe=False)."""
++    called: list = []
++    monkeypatch.setattr(tg, "generate_title",
++                        lambda *a, **kw: called.append(True) or "from the model")
++    db = _FakeSessionDB()
++    tg.auto_title_session(db, "s9", "goal: you are prime tmux/GPU pack monitor.",
++                          skip_llm=True)
++    assert called == [], "skip_llm must not reach the model"
++    assert str(db.titles.get("s9") or "").strip()
++
++
++def test_without_skip_llm_the_model_is_asked(monkeypatch):
++    called: list = []
++
++    def _gen(*a, **kw):
++        called.append(True)
++        return "A Model Title"
++
++    monkeypatch.setattr(tg, "generate_title", _gen)
++    db = _FakeSessionDB()
++    tg.auto_title_session(db, "s10", "fix the login redirect on blue")
++    assert called == [True]
++    assert db.titles.get("s10") == "A Model Title"
++
++
++def test_an_interactive_session_still_upgrades_its_title(monkeypatch, _titling_enabled):
++    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
++    started = _spy_threads(monkeypatch)
++    db = _FakeSessionDB()
++    tg.maybe_auto_title(db, "s2", "fix the login redirect on blue")
++    assert len(started) == 1
++    assert started[0]["skip_llm"] is False
++
++
++def test_one_shot_titling_can_be_restored(monkeypatch, _titling_enabled):
++    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
++    monkeypatch.setenv("HERMES_TITLE_ONE_SHOT", "1")
++    started = _spy_threads(monkeypatch)
++    db = _FakeSessionDB()
++    tg.maybe_auto_title(db, "s3", "fix the login redirect on blue")
++    assert len(started) == 1
++    assert started[0]["skip_llm"] is False
++
++
++@pytest.mark.parametrize("value", ["", "0", "false", "off", "no"])
++def test_falsey_one_shot_markers_do_not_suppress_titling(monkeypatch, value):
++    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", value)
++    assert tg._is_one_shot_session() is False
++
++
++def test_one_shot_check_fails_open(monkeypatch):
++    """An unreadable marker must not disable titling for real sessions.
++
++    Swaps the module-global ``os`` inside title_generator only — patching the
++    real ``os.environ`` would break every other fixture's teardown.
++    """
++    class _BoomEnv:
++        def get(self, *a, **kw):
++            raise RuntimeError("environ unreadable")
++
++    class _BoomOS:
++        environ = _BoomEnv()
++
++    monkeypatch.setattr(tg, "os", _BoomOS())
++    assert tg._is_one_shot_session() is False
++
++
++# ── 5. the background-review fork yields too ─────────────────────────────────
++
++def test_review_fork_sets_its_own_priority(monkeypatch):
++    """The fork's requests go out on the MAIN client path, so the aux tag cannot
++    reach them — the thread target has to demote itself."""
++    import agent.background_review as br
++    import agent.pool_broker as pb
++
++    seen: list = []
++    monkeypatch.setattr(pb, "set_turn_priority", lambda p: seen.append(p))
++    monkeypatch.setattr(br, "_run_review_in_thread",
++                        lambda *a, **kw: None)
++    monkeypatch.setattr(br, "_background_review_task_config", lambda *a, **kw: {})
++
++    target, _prompt = br.spawn_background_review_thread(
++        object(), [], review_memory=True)
++    target()
++    assert seen == [pb.PRIORITY_NORMAL]
++
++
++def test_review_fork_runs_even_if_demotion_fails(monkeypatch):
++    import agent.background_review as br
++    import agent.pool_broker as pb
++
++    ran: list = []
++    monkeypatch.setattr(pb, "set_turn_priority",
++                        lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
++    monkeypatch.setattr(br, "_run_review_in_thread",
++                        lambda *a, **kw: ran.append(True))
++    monkeypatch.setattr(br, "_background_review_task_config", lambda *a, **kw: {})
++
++    target, _prompt = br.spawn_background_review_thread(
++        object(), [], review_memory=True)
++    target()
++    assert ran == [True]
++
++
++# ── the judge's 27B fallback is disarmed in the architect profile ────────────
++
++def test_no_27b_lane_is_configured_for_the_judge():
++    """Andre: "I don't want a 27B judge fallback right now. That insane for
++    judge." Read from the real profile on disk rather than the sandboxed test
++    home, because the claim is about what the RUNNING agent is configured to do.
++    """
++    import pathlib
++
++    import yaml
++
++    path = pathlib.Path("~/.hermes/profiles/architect/config.yaml").expanduser()
++    if not path.exists():
++        pytest.skip("architect profile not present on this host")
++    cfg = yaml.safe_load(path.read_text()) or {}
++    judge = ((cfg.get("auxiliary") or {}).get("goal_judge") or {})
++    chain = judge.get("fallback_chain") or []
++    assert chain == [], f"a judge fallback is armed: {chain}"
++    assert "27b" not in str(judge).lower()
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index e4ae76b..ae00c48 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -288,6 +288,10 @@ class TestMaybeAutoTitle:
+                 main_runtime=None,
+                 title_callback=None,
+                 runtime_validator=None,
++                # An ordinary interactive session still asks the model
++                # [bd-dre-x8kyt]; only a one-shot -q run takes the derived
++                # title and skips the call.
++                skip_llm=False,
+             )
+ 
+     def test_writes_instant_title_before_the_model_runs(self, tmp_path):
+-- 
+2.43.0
