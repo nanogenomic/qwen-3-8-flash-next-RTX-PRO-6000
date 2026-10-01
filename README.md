@@ -6,7 +6,7 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 
 **Base commit:** upstream SGLang `6fa3fe69e2e5e19b75cadd9fc285b72634551992`
 (*"[PD] Keep the sampling mask of a replayed rebootstrap token (#41235)"*).
-32 commits on top, 43 files, +6,933 / −77.
+38 commits on top, 50 files, +8,466 / −103.
 
 > **Every performance lever in this tree is env-gated and OFF by default.** With no
 > `SGLANG_QWENOPT_*` variable set and no `--bf16-gemm-backend sm120gemv`, the engine takes
@@ -32,6 +32,7 @@ why this is a cross-engine comparison rather than a single-variable A/B.
 | 4-concurrent aggregate | 351 tok/s | **413.9 tok/s** | **+17.9 %** |
 | KV pool (test card) | 241,728 tokens | **279,680 tokens** | +15.7 % |
 | KV pool (production card, less foreign VRAM resident) | 241,728 tokens | **331,456 tokens** | +37 % |
+| KV pool (production card, fp8 + **host-resident KV**) | 241,728 tokens | **1,310,720 tokens** | **5.4×** |
 | Per-token latency, 325 → 250k context | grows with depth | 14.7 → 15.4 ms | +4.5 % over 770× context |
 
 ### Single-stream throughput across the full context range
@@ -287,21 +288,73 @@ These are the conclusions of the suite, measured on the second card and read acr
 |---|---|---|
 | `--mem-fraction-static` | **0.97**, not 0.98 | 0.98 left 287 MiB of device-free VRAM and died in prefill under a 14-deep queue; 0.97 leaves ~1.74 GB. Costs 71,616 pool tokens |
 | `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
-| Per-request window to advertise | **~400K (393,216)** on a shared card | Where the pool binds. One request that size needs most of the pool, so gate it as exclusive use rather than an ordinary slot |
+| Per-request window to advertise | **~400K (393,216)** on a shared card with an on-GPU pool; **two concurrent 250–300K mains** once the pool is host-resident | Where the pool binds. At 451,264 one ~400K request needs most of the pool, so gate it as exclusive use. At 1,310,720 it stops being the constraint — see below |
 | `--max-mamba-cache-size` | **36** at 4 running requests | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations |
 | `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
 | `--enable-priority-scheduling` | only **if fan-out grows past 4** — and set `--default-priority-value` | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
+| `--max-queued-requests` | **64**, never unbounded | Unset is unbounded. That is how the 2026-09-30 OOM accumulated a 14-deep queue and ~1.49 M pending tokens. At 4 running requests, 64 is 16 batches of runway; over the cap the server returns an error, so the client sees backpressure instead of a silent multi-minute wait |
+| `--crash-dump-folder` | **set it** | The 16:44 and 16:45 deaths left a traceback and no request mix. Costs nothing until something dies |
+| Model weights | **on NVMe, not spinning disk** | Boot 563 s → 285 s measured; weight load 449 s → 151 s |
 
-**The reference deployment now runs exactly this.** It adopted 540,000 / 36 slots / 4 streams on
-2026-09-29 at `--mem-fraction-static 0.98`, with a 522,880-token pool. That configuration **died of
-a runtime CUDA OOM on 2026-09-30** and was moved to **0.97**, where it has a **451,264-token pool**
-`[measured, read from /get_server_info]`, ~1.74 GB of device-free VRAM while serving, and priority
-scheduling off. A ~393,216-token request takes about 87 % of that pool, so it must be gated as
-exclusive use rather than treated as an ordinary slot.
+**The reference deployment ran exactly this, and has since gone further.** It adopted 540,000 / 36
+slots / 4 streams on 2026-09-29 at `--mem-fraction-static 0.98`, with a 522,880-token pool. That
+configuration **died of a runtime CUDA OOM on 2026-09-30** and was moved to **0.97**, where it had
+a **451,264-token pool** `[measured, read from /get_server_info]` and ~1.74 GB of device-free VRAM
+while serving. Later the same day it was cut over to the **host-resident KV pool** below, which is
+what it runs now.
 
 Both pool figures came out above a projection of ~420K made earlier from the *test* card's 519,040;
 the production card carries less foreign VRAM. Note the direction of travel: every pool number in
 this repository is specific to one card's spare memory, and the headroom you must leave is not.
+
+### The pool is no longer the binding constraint: host-resident KV
+
+`[measured, production card, 2026-09-30 23:34Z]` The table above recommends advertising ~400K per
+request because that is where a 451,264-token pool binds. **Moving the KV pool into pinned host RAM
+changes that number by 2.9×**, for no VRAM at all — it gives some back — and it is what the
+reference deployment now serves on:
+
+| | On-GPU KV | **Host-resident KV, current** |
+|---|---|---|
+| `max_total_num_tokens` | 451,264 | **1,310,720** |
+| Pinned host RAM | — | **16.25 GiB** |
+| GPU hot cache | — | 1.02 GiB |
+| Boot `available_gpu_mem` | 4.64 GB | **8.23 GB** |
+
+The mechanism is the 36/12 layer split this model is built on. Only 12 of 48 layers hold
+context-linear KV, and decode's top-k reads a **compressed index**, not the K/V itself. So the K/V
+can live in host RAM behind a small on-GPU direct-mapped cache, while the index stays on the card at
+**832 B/token** instead of 13,312.
+
+The cache is what keeps PCIe off the decode path: **81.2 % hit in steady decode over 1.34 billion
+selected tokens, at 198 host bytes read per selected token** — a 62× reduction against the 12,288
+bytes per token of resident K/V. ⛔ The lane's *first* 30-second sample reports 97.3 % and 27
+bytes/token, because the counters are cumulative from boot; that figure is an artifact and this
+repository has [a whole section](#operational-warning-use---mem-fraction-static-097-not-098) about
+why the early sample is the one that misleads you.
+
+What it buys, measured: **two 250K/200K main agents plus two subagents both keep their prefixes
+(TTFT 1.2 s and 1.0 s, 106 and 117 tok/s), where the same card with a 451,840-token pool loses both
+prefixes entirely (TTFT 22.9 s and 41.1 s, `cache_hit_rate` 0.0).** Needles pass 9/9 at
+300K–520K and 2/2 at two concurrent 250Ks; a 6 × 7-turn agent simulation holds a 95.6 % cached
+fraction with 0 errors. Full tables, the control, and the limits:
+[BENCHMARKS §3.15](BENCHMARKS.md#315-host-resident-qsa-kv-pool--1310720-tokens-on-one-96-gb-card).
+
+Three things to get right before you copy it:
+
+- **⛔ `--max-total-tokens` is mandatory, not tuning.** Without it the pool sizes itself off the
+  `--mem-fraction-static` budget; at 832 B/token on the GPU that is a ~7M-token pool demanding
+  **~89 GiB of pinned host RAM**. The flag is what turns freed VRAM into headroom instead of into an
+  unbounded host allocation. `SGLANG_QSA_HOST_KV_MAX_GB` is the fail-fast behind it.
+- **⛔ You have traded a VRAM budget for a host-RAM budget, and pinned pages cannot be reclaimed.**
+  The cutover was **OOM-killed twice at boot** before it came up, on a 251 GiB host, in the phase
+  that pins the pool ([§3.18a](BENCHMARKS.md#318a-host-ram-is-a-new-boot-time-failure-mode)).
+  Budget host RAM with the same care §3.13 applies to VRAM, and account for whatever page cache the
+  previous instance left behind.
+- **The steady-state VRAM floor on this configuration is not soaked yet.** 8.23 GB is a *boot*
+  figure and this repository has a section about why that matters. One `nvidia-smi` reading six
+  minutes in was 5,863 MiB free, against 1,737–1,739 MiB on the on-GPU configuration — but that
+  earlier figure is the flat floor of 13 h 22 min of samples, and this one is not.
 
 ## The correctness fix, separately
 
@@ -329,9 +382,9 @@ series — not a second copy of all of SGLang. Concretely:
 README.md  CHANGES-vs-upstream.md  BENCHMARKS.md  UPSTREAM-BUG-qsa-index-key-ring.md
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
-patches/                 the 32 commits as a git-am-able series against the base commit
+patches/                 the 38 commits as a git-am-able series against the base commit
 COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
-python/  test/           the 43 changed files, at their exact upstream paths
+python/  test/           the 50 changed files, at their exact upstream paths
 clients/README.md        the client contract: what any orchestrator must do to use this well
 clients/hermes/          Hermes Agent reference implementation -- MIT, not Apache-2.0
 tools/qgate/             the quality-gate harness behind BENCHMARKS §4 (not part of the engine)
@@ -354,7 +407,7 @@ fork where the normal git operations work:
 ```bash
 cd /path/to/sglang-qwenopt
 git diff upstream-base..qwenopt                          # exactly this fork's change set
-git log  --oneline upstream-base..qwenopt                 # the 32 commits
+git log  --oneline upstream-base..qwenopt                 # the 38 commits
 git rebase --onto sglang/main upstream-base qwenopt       # rebase onto newer upstream
 ```
 
@@ -404,8 +457,35 @@ python -m sglang.launch_server \
   --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-  --ple-offload-embedding --enable-metrics --enable-cache-report
+  --ple-offload-embedding --enable-metrics --enable-cache-report \
+  --max-queued-requests 64 \
+  --crash-dump-folder /path/to/crashdumps
 ```
+
+**To serve a host-resident KV pool** — the configuration the reference deployment now runs — add
+the following to the above, and read
+[the host-KV section](#the-pool-is-no-longer-the-binding-constraint-host-resident-kv) first,
+because `--max-total-tokens` is not optional here:
+
+```bash
+export SGLANG_QSA_HOST_KV=all           # 'target' leaves the MTP draft layer's K/V on the GPU
+export SGLANG_QSA_HOST_KV_MAX_GB=24     # hard fail-fast at startup, not a soft limit
+export SGLANG_QSA_HOST_KV_CACHE_SETS=4096   # GPU hot cache: 4 tokens/set per (layer, slot)
+export SGLANG_QSA_HOST_KV_STATS=1
+export SGLANG_OOM_MAX_REQ_RETRACTIONS=3
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+#   ... and on the launch line:
+#   --kv-cache-dtype fp8_e4m3       (the host-side cost below assumes fp8)
+#   --max-total-tokens 1310720      ⛔ MANDATORY. Without it the pool sizes off the
+#                                      --mem-fraction-static budget and demands ~89 GiB of
+#                                      pinned host RAM.
+```
+
+At `--max-total-tokens 1310720` and fp8 that reserves **16.25 GiB of pinned host RAM** and about
+**1.02 GiB of GPU** for the hot cache. Size the host budget before you raise the token count:
+pinned pages are neither swappable nor reclaimable, and this cutover was OOM-killed twice at boot
+on a 251 GiB host before it came up.
 
 Two notes on flags that are easy to get wrong:
 
@@ -577,6 +657,106 @@ that, see the [client contract](clients/README.md#9-throttle-fan-out-on-vram-hea
 > hook returns immediately, or raise the start timeout well past the load time. Do not leave it
 > inline: the mitigation for one outage becomes a restart loop, which is worse than the problem
 > it fixes.
+
+#### The root cause, found afterwards: a prefill transient that scaled with context
+
+Everything above treats headroom as a budgeting problem. It was also a **bug**, and the bug is the
+more useful finding.
+
+`[measured]` QSA's prefill path allocated **four full-context transients per full-attention layer,
+per chunk** (two, in the host-KV tree). So peak non-pool VRAM scaled with the **total context of the
+request**, not with `--chunked-prefill-size` — which defeats the entire purpose of chunked prefill.
+That is why incident three could die in prefill while its pool sat at 27 % free and admission was
+already at its floor of one sequence and exactly 4,096 tokens: **the thing that grew was never the
+chunk.**
+
+Measured peak transient for the gather, isolated, across two runs:
+
+| Context | KV dtype | Old | **Bounded** |
+|---|---|---|---|
+| 65,536 | fp8 | 128 MiB | **32 MiB** |
+| 131,072 | fp8 | 256 MiB | **32 MiB** |
+| 262,144 | fp8 | 512 MiB | **32 MiB** |
+| 524,288 | fp8 | **1,024 MiB** | **32 MiB** |
+| 382,293 | bf16 | **1,495 MiB** | **32 MiB** |
+
+**Flat at every length and both dtypes, and bit-exact** — all 12 micro cases in both runs report
+`max_abs_diff 0.0`, `n_diff 0`. The attention kernel also gets **1.59× faster at 524,288** (4.10 →
+2.58 ms), because it stops writing and re-reading a gigabyte. In-engine at a 500K prompt, peak
+device usage falls from **97,237 MiB to 96,093 MiB** on a 97,887 MiB card — from 650 MiB of
+headroom left to 1,794 MiB. That 1,144 MiB is the margin incident three did not have.
+
+Because it is bit-exact and strictly reduces allocation, this one is **unconditional** rather than
+env-gated.
+
+**⛔ The one cell where it did not show: a 2 × 250K cold prefill on the host-KV configuration
+measured the same non-pool peak on both trees, +1,248 MiB over idle.** The micro and needle results
+are real and reproducible, and the cell that most resembles the production workload saw no
+difference. Why is not established. Full tables, the two cells that get marginally worse, and one
+host-path result that did not reproduce:
+[BENCHMARKS §3.16](BENCHMARKS.md#316-bounded-qsa-prefill-gather--the-transient-that-scaled-with-context).
+
+**Upstream fixed the same bug class in the DSA backend in `63d320c723`. QSA had no equivalent.** If
+you run QSA prefill at long context on any tree without this change, your peak VRAM is a function
+of your context length, whatever your chunk size says.
+
+#### And when headroom still runs out: retract the batch, do not kill the lane
+
+`[measured]` Every incident above ends the same way: one allocation fails, the scheduler raises,
+`SIGQUIT` follows, and the whole lane dies — **including every healthy in-flight request** — for 9
+to 13 minutes. A 560 MiB allocation failure taking down a 200-turn agent session is a blast radius
+out of all proportion to the fault.
+
+This tree makes an **EXTEND-batch OOM retract the offending requests and continue.** An eight-test
+battery run twice injected **39 forced OOMs** each time and caught **6 and 3 real ones**, for **45
+and 42 recoveries**, with the engine alive after every test. The upstream registered scheduler suite
+passes 100/100 on the same tree.
+
+**⛔ The scope is narrower than it sounds.** Nine conditions must hold — overlap scheduling, EXTEND
+mode, `tp = pp = 1`, no MLP sync, no disaggregation, HiSparse off, PDMux off, no diffusion-LM config
+— and the handler catches `torch.OutOfMemoryError` and nothing else, because that one is raised by
+the caching allocator *before* the failing kernel launches, so the CUDA context is still intact.
+**Decode OOMs and driver-level errors stay fatal**: a decode-phase OOM means the resident set no
+longer fits, which retraction cannot fix, and a driver-level fault leaves the communicator undefined
+— surviving it would serve garbage. `SGLANG_OOM_MAX_REQ_RETRACTIONS` (default 3) stops one request
+being retracted forever instead of failed; without a cap, a request whose context can never fit
+re-admits and re-OOMs with no progress, no crash and no alert, which is worse than the crash it
+replaced.
+
+**Peers that were decoding across the OOM all complete, and they are not bit-identical — but
+neither are OOM-free reruns**, because this engine is not run-to-run deterministic in this
+configuration. Over 12 runs, reference-vs-reference pairs diverged at a mean of 6.0 tokens; the
+OOM-involved pairs at 5.3. Indistinguishable from the engine's own noise, which is the claim — not
+identity.
+
+**⛔ Be clear what was validated where: the 39-injection battery ran on the `oom-retract` branch
+with host KV off.** On the merged ship tree at the 1.31M pool, a first injection run was invalidated
+by a harness defect and a re-run passed — but with **2 injections, not 39.** Details:
+[BENCHMARKS §3.17](BENCHMARKS.md#317-non-fatal-oom--retract-the-batch-instead-of-killing-the-lane).
+
+**Do not read non-fatal OOM as permission to raise `--mem-fraction-static` again.** It shortens an
+outage; it does not create memory. The bracket for the lowest safe fraction is still
+[not established](BENCHMARKS.md#6-open-measurements).
+
+#### Bound the queue, and keep the weights off spinning disk
+
+Two small changes from the same incident, both cheap:
+
+- **`--max-queued-requests 64`.** Unset means unbounded, and that is how incident three
+  accumulated a 14-deep queue holding ~1.49 M pending tokens while one request ran. At 4 running
+  requests, 64 is sixteen batches of runway — deep enough that ordinary fan-out is never rejected,
+  shallow enough that pending tokens cannot reach 1.5 M. Over the cap the server returns an error,
+  so a client sees **backpressure instead of a silent multi-minute wait**. Peak queue depth on the
+  incident day measured 26.
+- **`--crash-dump-folder`.** The two deaths left a traceback and no record of the request mix that
+  produced them.
+- **Weights on NVMe.** `[measured]` Moving 126 GiB of weights off a RAID6 spindle array cut weight
+  load **449 s → 151 s (2.96×)** and total restart-to-ready **563 s → 285 s (1.98×)**, both read
+  from the lane's own boot logs. An O_DIRECT sequential read of the same shard is recorded at
+  5.8 GB/s against 293 MB/s — **19.8×** — but do not quote that as a boot speedup: checkpoint
+  loading is 206 shards through a quantizing loader, not a sequential read, and 2.96× is what the
+  19.8× actually bought. (That bandwidth pair is also the weakest-sourced number here — the method
+  was recorded, the result artifact was not kept.)
 
 ### Sizing for multiple clients and subagents
 
@@ -833,6 +1013,20 @@ Everything is off unless listed otherwise. Details and measured effects per leve
 | `SGLANG_QWENOPT_FUSE_MOE_FINALIZE=1` | off | flashinfer's own fused finalize. **LOSSY and non-deterministic** (bf16 atomic adds). Not in the lossless stack. |
 | `SGLANG_QSA_SHARE_SCRATCH` | **on** | One shared 128 MiB trtllm workspace + packed-KV scratch across QSA backends, instead of one per adaptive tier. Auto-off under two-batch overlap / PDMux. |
 
+### Capacity and resilience levers
+
+| Variable / flag | Default | Effect |
+|---|---|---|
+| `SGLANG_QSA_HOST_KV` | off | `all` puts the 12 full-attention layers' **and** the MTP draft layer's K/V in pinned, UVA-mapped host RAM, leaving only the compressed index on the GPU. `target` leaves the draft layer on the card (costs ~2 GiB more VRAM at a 1.31M pool). ⛔ **Requires `--max-total-tokens`** — see [the host-KV section](#the-pool-is-no-longer-the-binding-constraint-host-resident-kv). |
+| `SGLANG_QSA_HOST_KV_MAX_GB` | — | Hard startup fail-fast on the host allocation. At 24 it caps the pool at 2,097,152 fp8 tokens and dies with a named error rather than reaching the host OOM killer. Set it. |
+| `SGLANG_QSA_HOST_KV_CACHE_SETS` | — | GPU hot cache in front of the host pool: direct-mapped, 4 tokens per set, per (layer, request slot). 4,096 sets = 16,384 tokens per slot ≈ 1.02 GiB of GPU, measured **81 %** hit in steady decode (not the 97 % the first sample reports). 2,048 halves the VRAM at a reported ~92 % on another card. |
+| `SGLANG_QSA_HOST_KV_STATS=1` | off | Periodic hit-rate and host-bytes-per-token lines. Inert otherwise. |
+| `SGLANG_OOM_MAX_REQ_RETRACTIONS` | 3 | How many times one request may be retracted by the non-fatal-OOM path before it is failed instead of retried. EXTEND batches only; decode and driver-level OOMs stay fatal. |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | unset | Not ours. Recovers ~1.0 GiB of reserved-but-unallocated VRAM that showed up in the 900k OOM report. Relevant to every configuration in this repository, not just host KV. |
+
+The **bounded QSA prefill gather** has no variable: it is bit-exact and strictly reduces
+allocation, so it is unconditional.
+
 ### Measured not to pay — present, documented, off
 
 | Variable | Why it is off |
@@ -893,6 +1087,25 @@ The **stock comparison baseline** ran a different, older venv: SGLang PR #36497
 @`73a255206f`, **flashinfer 0.6.17**, **sglang-kernel 0.4.6.post1**, same driver, torch and
 triton. Both venvs are named where it matters in BENCHMARKS.md, because the stock-vs-this
 comparison is a cross-engine comparison, not a single-variable A/B.
+
+### ⛔ A second card appears from §3.15 onward, and it is a different SKU
+
+The host-resident KV pool, the bounded prefill gather and the non-fatal-OOM battery were validated
+on a **rented** RTX PRO 6000 Blackwell, and it is not the same part as the one above:
+
+| | Reference deployment | Validation card |
+|---|---|---|
+| Edition | Max-Q **Workstation** | **Server** |
+| Power limit | **300 W** | **600 W** |
+| PCIe | gen 4 ×16 | **gen 5 ×16** |
+| VRAM | 97,887 MiB | 97,887 MiB |
+| Driver | 610.43.02 | **580.95.05** |
+
+**Double the power limit is a bigger confound than the link generation**, and no cross-SKU scaling
+factor was measured. So every absolute tok/s figure from the validation card belongs to the Server
+Edition; expect the 300 W part to be slower, by an amount this repository does not establish. The
+*ratios* within a single arm-and-control pair on the same card — which is how §3.15b and §3.16 are
+constructed — do not depend on that.
 
 ### The model
 

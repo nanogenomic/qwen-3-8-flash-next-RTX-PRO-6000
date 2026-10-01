@@ -1,7 +1,7 @@
 # CHANGES vs upstream — full specification
 
 Base: upstream SGLang `6fa3fe69e2e5e19b75cadd9fc285b72634551992`.
-This fork: 32 commits, 43 files, +6,933 / −77.
+This fork: 38 commits, 50 files, +8,466 / −103.
 
 **How numbers are labelled.** `[measured]` means a number produced by a run on the
 hardware named. `[GPU2-proxy]` means it was measured on a **second, smaller SM120 card
@@ -119,6 +119,93 @@ It is recorded because any future batch-aware routing scheme must dedupe per tok
 kernel. It is also a candidate upstream report.
 
 ---
+
+### 1.5 QSA chunked prefill gathered the whole context, not the chunk
+
+| | |
+|---|---|
+| **Enabled by** | nothing — unconditional. It is bit-exact and strictly reduces allocation. |
+| **Files** | `python/sglang/srt/layers/attention/qsa/sparse_attn.py` (new), `qwen_sparse_attn_backend.py` |
+| **Patches** | `0035` |
+| **Quality verdict** | **bit-exact.** 12 micro cases × 2 runs, `max_abs_diff 0.0`, `n_diff 0`, no NaNs either side; 9 / 9 needles in an in-engine A/B. |
+
+`forward_extend` built its K/V by `index_select` over the request's **entire** `req_to_token` row
+and then `torch.cat` — four such full-context transients per full-attention layer per chunk (two in
+the host-KV layout). So the peak non-pool allocation was a function of the request's **total
+context**, not of `--chunked-prefill-size`.
+
+That is the mechanism behind the operational history in §3.14 of
+[BENCHMARKS.md](BENCHMARKS.md#314-runtime-cuda-oom-under-a-deep-queue-2026-09-30--why-098-is-not-usable):
+a lane could sit at 27 % pool utilisation, with admission already floored at one sequence and
+exactly 4,096 tokens, and still die inside `_forward_prefill_batch`. Lowering the chunk size does
+not help, because the chunk was never what grew. Measured: 128 MiB at 64K rising to **1,024 MiB at
+512K** in fp8, and **1,495 MiB at 382K** in bf16 — now **flat at 32 MiB** at every length and both
+dtypes, with the attention kernel **1.59× faster** at 512K.
+
+The fix reads each chunk's K/V from the pool in bounded blocks instead of materialising the prefix.
+Two cells get marginally worse and both are stated in §3.16: a fixed 32 MiB block has a floor, so a
+1,512-token context pays 4.0 MiB rather than 2.95 MiB, and the wide-int64-slot path peaks at 64 MiB
+rather than 32.
+
+**Upstream fixed this bug class in the DSA backend** in `63d320c723` ("[DSA] Chunk the kpool
+indexer MQA logits by query rows under a free-memory budget", #40854), gated on
+`SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION`. **QSA had no equivalent.** This fix is not a port of
+that one — it bounds a different allocation in a different backend — but it is the same class of
+defect, and the DSA precedent is why it is worth reporting rather than carrying locally.
+
+⚠️ **One honest negative.** At the production-shaped cell — a 2 × 250K cold prefill on the host-KV
+configuration — both trees measured the **same** non-pool peak, +1,248 MiB over idle. The micro and
+needle results are solid; this cell shows no benefit, and why is not established.
+
+### 1.6 A prefill OOM killed the whole lane
+
+| | |
+|---|---|
+| **Enabled by** | unconditional, but gated at runtime on nine conditions (below). `SGLANG_OOM_MAX_REQ_RETRACTIONS` (default 3) caps retries. |
+| **Files** | `python/sglang/srt/managers/scheduler.py`, `python/sglang/srt/environ.py`, `python/sglang/srt/models/qwen4_exp.py` |
+| **Patches** | `0036` (the recovery), `0037` (the holes found reviewing it). **Deploy them together.** |
+| **Quality verdict** | peers across an OOM complete and are **indistinguishable from OOM-free reruns** — not identical; see below. |
+
+There was no `try`/`except` anywhere between `run_batch` and the top of the process, so a
+`torch.OutOfMemoryError` in `forward_extend` reached `run_scheduler_process`'s bare
+`except Exception`, which sent `SIGQUIT`, whose handler called `kill_process_tree`. One 560 MiB
+allocation failure therefore destroyed every healthy in-flight request and took the lane down for
+9–13 minutes. The 2026-09-30 incident lost the lane while its KV pool was 27 % empty.
+
+This catches the OOM at the batch boundary, releases the offending prefill batch, requeues its
+requests and continues. It is safe because every resource is committed *before* the forward starts,
+and the teardown for exactly that set already existed and was already exercised by
+`pause_generation(mode="retract")`.
+
+`0037` is not cosmetic. It adds a device-wide drain before freeing pages (a per-stream drain left
+the draft/copy streams free to write into pages the release had already handed back), resets
+cross-layer model state the torn forward left behind (`Qwen4ExpPLELayer` arms the *next* layer's
+prefetch state before the current one runs, so an OOM mid-layer made a later, unrelated prefill
+raise `PLE prefetch state was not consumed before reuse` and SIGQUIT the lane with the blame in the
+wrong place), counts prefill OOMs per request rather than reusing `retraction_count` (which also
+counts KV-pressure decode retractions), and releases requests that had already finished or aborted
+instead of requeueing and resurrecting them.
+
+**⛔ Scope — nine conditions, all required:** overlap scheduling on, `forward_mode == EXTEND`,
+`tp_size == 1`, `pp_size == 1`, no MLP sync, no disaggregation, HiSparse off, PDMux off, no
+diffusion-LM config. It also declines if its device drain does not complete. With TP peers, one rank
+swallowing an OOM while the others enter a collective is a hang — hence the single-rank gate. The
+previous `is_extend()` shape would also have admitted `MIXED` and `TARGET_VERIFY`.
+
+**Decode OOMs and driver-level failures stay fatal, by design.** The handler catches
+`torch.OutOfMemoryError` only, because the caching allocator raises that *before* the failing kernel
+launches, leaving the CUDA context intact. A driver-level failure — the 2026-09-29
+`ncclUnhandledCudaError: Failed to CUDA calloc` — leaves the communicator undefined; surviving it
+would serve garbage.
+
+**On "no corruption", stated precisely.** Peers that were decoding across an OOM all complete, and
+their outputs are **not bit-identical to an OOM-free rerun — but neither are two OOM-free reruns of
+each other.** This engine is not run-to-run deterministic in this configuration, and
+`--enable-deterministic-inference` does not make it so. The test is therefore two-sided: over 12
+runs, reference-versus-reference pairs first diverged at a mean of **6.0 tokens** with mean
+\|Δlogprob\| **0.094** on the shared prefix; OOM-involved pairs at **5.3** and **0.084**. Inside the
+engine's own noise. Validation detail, including what was *not* measured on the merged tree, is in
+[BENCHMARKS §3.17](BENCHMARKS.md#317-non-fatal-oom--retract-the-batch-instead-of-killing-the-lane).
 
 ## 2. Kernel levers that shipped on
 
@@ -398,6 +485,59 @@ the layers — a small positional surface, which would be consistent with gracef
 No experiment here isolates that, and it should not be cited as the mechanism.
 
 ---
+
+### 3.6 Host-resident QSA K/V — the pool stops being a VRAM problem
+
+| | |
+|---|---|
+| **Enabled by** | `SGLANG_QSA_HOST_KV=all` (or `target`). ⛔ **`--max-total-tokens` becomes mandatory.** |
+| **Also** | `SGLANG_QSA_HOST_KV_MAX_GB` (startup fail-fast), `SGLANG_QSA_HOST_KV_CACHE_SETS` (hot-cache size), `SGLANG_QSA_HOST_KV_STATS` |
+| **Files** | `qsa/host_kv_cache.py` (new), `mem_cache/qsa_host_kv.py` (new), `model_executor/pool_configurator.py` (new), `qwen_sparse_attn_backend.py`, `mem_cache/kv_cache_configurator.py`, `mem_cache/qsa_kv_pool.py` |
+| **Patches** | `0033`, `0034`; tests in `0038` |
+| **Quality verdict** | decode-path equivalence **PASS** at concurrency 1 and 4 against the on-GPU arm, degeneracy PASS, prefix-cache integrity PASS. The composite verdict returns FAIL on a scope rule, not a measurement — [§3.15c](BENCHMARKS.md#315c-quality-gate-decode-path-lossless-composite-verdict-not-assembled). |
+
+**Measured: 451,264 → 1,310,720 tokens (2.905×) on one 96 GB card**, for 16.25 GiB of pinned host
+RAM and about 1 GiB of GPU, while *returning* VRAM to runtime headroom.
+
+Why it is possible here and would not be on a dense model: of 48 layers only **12** are
+full-attention, and QSA's decode reads a **compressed index**, not the K/V. Per token:
+
+| | On the GPU | In host RAM |
+|---|---|---|
+| 12 full-attention layers, K+V, fp8 | 12,288 B | 12,288 B |
+| MTP draft layer, K+V, fp8 | 1,024 B | 1,024 B |
+| **Compressed index** (1 index KV head × 128 dim / ratio 4 × 2 B × 12 layers, + 64 B draft) | **832 B** | — |
+
+So the on-GPU layout costs 13,312 B/token of VRAM and the host layout costs **832 B/token** of VRAM
+plus 13,312 B/token of host RAM — a **16× reduction in VRAM per token**. `all` puts the draft
+layer's K/V on the host too; `target` leaves it on the card.
+
+A direct-mapped GPU cache in front of the host pool keeps PCIe out of decode: 4 tokens per set, per
+(layer, request slot), so `SGLANG_QSA_HOST_KV_CACHE_SETS=4096` is 16,384 tokens per slot ≈ 1.02 GiB.
+Measured **81.2 % hit in steady decode at 198 host bytes per selected token** — a 62× cut in PCIe
+traffic against 12,288 B/token of resident K/V. ⛔ The first 30-second sample reads 97.3 % and 27
+B/token because the counters are cumulative from boot; that figure is an artifact.
+
+**⛔ `--max-total-tokens` is mandatory, not tuning.** `kv_cache_configurator` clamps the pool to it
+only `if max_total_tokens is not None`; unset, the pool sizes itself to consume the whole
+`--mem-fraction-static` budget, which at 832 B/token is a ~7M-token pool wanting ~89 GiB of pinned
+host RAM `[arithmetic]`. `SGLANG_QSA_HOST_KV_MAX_GB` is the fail-fast behind it — at 24 it caps the
+pool at 2,097,152 fp8 tokens and dies at startup with a named error rather than reaching the host
+OOM killer.
+
+**⛔ The new failure mode is host RAM, and pinned pages are neither swappable nor reclaimable.** The
+production cutover was **OOM-killed on two boots** before the third came up, on a 251 GiB host, in
+the pinning phase after the weights had already loaded. A host-resident KV pool converts a VRAM
+budget into a host-RAM budget; budget it with the care §3.13 applies to VRAM, including the page
+cache the previous instance left behind.
+
+`0034` is a correctness fix on top: the hot cache's margin has to follow the **speculative window**,
+because a wide verify touches more positions per step than a single decode does.
+
+What it buys, and what it does not, is in
+[BENCHMARKS §3.15](BENCHMARKS.md#315-host-resident-qsa-kv-pool--1310720-tokens-on-one-96-gb-card) —
+including two 250K/200K mains keeping their prefixes where the on-GPU control loses both, and the
+unexplained per-turn re-prefill at 2 × 500K.
 
 ## 4. Levers that are present and off
 
@@ -756,10 +896,20 @@ decay over uptime).
 
 ## 9. Commit list
 
-31 functional commits plus one commit that ships the adaptive-speculation tier configs
-in-tree. The original development history had 39 commits: 8 were merge commits from
-integrating parallel feature branches, and those are branch bookkeeping that was dropped when
-linearizing onto the upstream base.
+36 functional commits plus two that ship things in-tree rather than changing behaviour (the
+adaptive-speculation tier configs in `0032`, the host-KV tests in `0038`). The development
+history these are linearized from carries 53 commits across the same range, 10 of which are
+merge commits from integrating parallel feature branches — branch bookkeeping that is dropped
+when linearizing onto the upstream base.
+
+**Patches `0033`–`0038` are the 2026-09-30 group** and they are a *subset* of that day's
+development commits, not all of it. Five engine commits and one test commit are published; the
+deployment harness that was developed alongside them — lane launchers, a production-config
+driver, a Modal replica suite and the long-context needle drivers — is **deliberately not
+published**, for the same reason stated in §8: it encodes one deployment's model pins, paths,
+addresses and lane policy, and it would be a liability to read and useless to run. The
+measurements those harnesses produced **are** published, in
+[BENCHMARKS §3.15–§3.18](BENCHMARKS.md#315-host-resident-qsa-kv-pool--1310720-tokens-on-one-96-gb-card).
 
 **The published tree was verified byte-identical to the original 39-commit merge-based head**
 before publication hygiene was applied. That hygiene — making the optional build and
