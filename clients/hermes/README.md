@@ -11,13 +11,14 @@ The reference implementation of the [client contract](../README.md) for
 > [`NOTICE`](NOTICE) for the attribution and the exact list of changes, and
 > [`BASELINE.md`](BASELINE.md) for how the 0.20.4 baseline was identified and verified.
 
-> **Status: partial, refresh pending.** This directory currently covers **patches
-> 0001–0002 against upstream 0.20.4** (tag `v2026.8.18`). A rebase onto upstream
-> **0.21.5** (`v2026.9.24`) is in progress and will add the rest of the client contract
-> as code: a pool broker, task-sized child windows, grow-instead-of-compact,
-> interactive-aware priority, judge priority, an overflow toggle to a hosted provider
-> (Cerebras), and a test-isolation guard. Until then, [`../README.md`](../README.md)
-> describes those behaviours and the evidence for them; this directory implements two.
+> **Status: two patches, plus four write-ups.** This directory ships **patches
+> 0001–0002 against upstream 0.20.4** (tag `v2026.8.18`) as applicable code. The later
+> work — a cross-session pool broker with share-bounded grants, a live-share status bar,
+> interrupt-provenance classification for autonomous loops, background-priority
+> demotion, task-sized child windows, grow-instead-of-compact, an overflow toggle to a
+> hosted provider, and a test-isolation guard — is published as **write-ups in
+> [`docs/`](docs/)** and as framework-agnostic rules in [`../README.md`](../README.md).
+> A rebase onto upstream **0.21.5** (`v2026.9.24`) is in progress.
 
 > **Read with the rest of this repository.** The concurrency arithmetic in
 > [`docs/child-context-window.md`](docs/child-context-window.md) and
@@ -170,6 +171,30 @@ edit.
 
 ---
 
+## Why this round is write-ups and not patches
+
+The 2026-09-30 client work — rules 10 to 14 of the [client contract](../README.md) — exists as
+real, tested code on this fork. It is published here as prose, and that is a deliberate choice
+rather than laziness or a packaging gap.
+
+The diffs carry, in their *added* lines: a private backend address, two live process ids baked
+into a regression test's expected output, an absolute home-directory path, internal profile and
+lane names, internal tracker ids throughout, and — in one test's fixture corpus — five verbatim
+production judge verdicts that name a third-party platform and describe a blocked commercial
+submission. One of those is in a **removed** line, which a raw `git format-patch` publishes just
+as faithfully as an added one.
+
+Most of that is mechanically scrubbable, and the established posture for this directory
+([`NOTICE`](NOTICE)) scrubs exactly those classes. The fixture corpus is not: those strings are
+load-bearing, because they are the precise linguistic shapes the classifier has to catch, so they
+can be paraphrased but not deleted — and a paraphrased corpus is no longer the evidence it claims
+to be. Publishing a diff whose own test data has been rewritten is worse than publishing the
+reasoning and the measurements, which is what [`docs/`](docs/) does.
+
+The honest summary: **the mechanisms, the measured numbers, the failure modes and the design
+decisions are all here. The code is not.** For the two patches that *are* here, the diffs are
+real and verified.
+
 ## What is *not* here, and why
 
 The deployment these patches run on carries a good deal of surrounding machinery: a
@@ -206,6 +231,8 @@ docs/
   status-bar-accounting.md    patch 0001 in full, integration points, the pitfall
   child-context-window.md     the incident arithmetic, the ladder, the knobs
   design-notes.md             generic patterns for sharing one backend
+  shared-pool-grants.md       share-bounded grant ceilings + the live-share status bar
+  autonomous-loop-provenance.md  why a loop stops unasked; background priority and payload
 ```
 
 `cli.py` is **not** shipped as a whole file. It is ~1 MB and this fork's copy
