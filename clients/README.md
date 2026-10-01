@@ -15,6 +15,14 @@ applicable patches — rule 3 (patch 0002) and own-versus-shared status accounti
 Rules 10–14 were implemented on that framework too, but are published here as **write-ups
 rather than diffs**; its README says why.
 
+> **These rules assume a backend that is up, and a monitor you can believe.** Neither is free.
+> The control-plane layer that keeps them true — the cross-session pool broker that publishes
+> the allowance rules 10 and 11 read, reboot survival, the sampler whose numbers rules 9 and 15
+> gate on, log rotation, and how a serving config change lands without restarting what it
+> configures — is [**`../ops/`**](../ops/README.md). Rules 9, 10, 11, 14, 15 and 16 each have a
+> counterpart there; the eleven ops lessons at the top of that README are the systemd, tmux and
+> log-reading failures underneath them, and every one is silent.
+
 Contents:
 
 1. [Priority-tag control-plane calls](#1-priority-tag-control-plane-calls)
@@ -310,6 +318,11 @@ flagged critical headroom on **every sample that day**, sent a low-VRAM alert **
 before the crash, and sent a queue-depth alert **53 s** before it. All of it was correct, and
 none of it reached anything that could defer work. If your client can read headroom, it should
 **act** on it — reduce concurrency, defer a fan-out, wait — not merely log it.
+
+The monitor that produced those readings, why its absolute thresholds were useless (the critical
+one fired on **48 of 48** samples at healthy steady state) and what replaced them, are in
+[`../ops/observability.md`](../ops/observability.md). That page also carries the other half of this
+rule: the sampler it replaced had been **silently dead for 24 h** while reading `active (elapsed)`.
 
 ## 10. Bound the ceilings you GRANT, not the reservations you MEASURE
 
@@ -646,7 +659,11 @@ streams. No main's window, growth ceiling or request priority is touched by any 
 **Two design notes that generalise past this gate.**
 
 - **Make every threshold resolve at call time** — environment, then a config file, then the module
-  default. Retuning a throttle must not mean relaunching the sessions being throttled.
+  default. Retuning a throttle must not mean relaunching the sessions being throttled. The pattern,
+  the mtime-keyed parse cache that makes it cheap, and the published "what resolved and from where"
+  are in [`../ops/pool-broker.md` §1](../ops/pool-broker.md#1-the-runtime-tunable-config-pattern);
+  the annotated config with every default is
+  [`../ops/examples/pool-broker.json`](../ops/examples/pool-broker.json).
 - **Refuse the *second* concurrent child outright rather than letting six start and self-clamping.**
   A gate that admits and then recovers has already paid the prefill, the eviction and the queue. The
   observed state it was meant to prevent — three children on three of four slots with fifteen queued

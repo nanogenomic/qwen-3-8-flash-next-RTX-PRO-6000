@@ -1,0 +1,95 @@
+{
+  "_comment": "Cross-session KV pool broker config. Read AT CALL TIME (parse cached on mtime_ns+size), so editing this file retunes every live agent session within ~5s WITH NO RELAUNCH. Resolution order per key: environment variable > this file > the module default. Remove the 'backend' key to disable the broker entirely — every caller then falls back to its configured defaults, which is the pre-broker behaviour. See ops/pool-broker.md.",
+
+  "backend": "http://127.0.0.1:30000",
+  "router": "http://127.0.0.1:8000",
+
+  "_throttle_comment": "Child-concurrency throttle. The GATE is prefill capacity (scheduler slots + backlog drain time + pool residency); runtime free VRAM is only a FLOOR backstop — see clients/hermes/docs/prefill-capacity-throttle.md for why, and client rule 15 for the general trap. Every default below is derived from a measurement on ONE deployment: re-measure before trusting a magnitude. Omit a key to use its default.",
+
+  "_keys": {
+    "total_stream_cap": {
+      "env": "HERMES_POOL_TOTAL_STREAM_CAP",
+      "default": 2,
+      "what": "TOTAL concurrent streams the backend may carry, MAINS INCLUDED. The single knob for 'push things harder'.",
+      "derivation": "There is NO interior aggregate maximum below --max-running-requests: aggregate decode rises monotonically with concurrency on both pool geometries measured. So the cap cannot be read off the aggregate curve and must be keyed on a LANE's own share of its solo rate — the number a human is actually reading. 2 is the largest concurrency at which a lane keeps about two thirds of itself. Authoritative curve: BENCHMARKS.md §3.20 (queue-filtered). Raising it buys aggregate throughput at a lane's expense, which is a product decision, which is why it is a runtime key and not a constant."
+    },
+    "stream_cap": {
+      "env": "HERMES_POOL_STREAM_CAP",
+      "default": 12,
+      "what": "Cross-session stream target for a larger server. The live max_running_requests and total_stream_cap both still bound it; requests beyond the server's slots queue."
+    },
+    "cache_reserve_frac": {
+      "env": "HERMES_KV_CACHE_RESERVE_FRAC",
+      "default": 0.10,
+      "what": "Fraction of the pool kept as prefix-cache slack and never handed out. usable = pool - cache_reserve, and every granted ceiling is water-filled out of usable."
+    },
+    "main_slot_reserve": {
+      "env": "HERMES_POOL_MAIN_SLOT_RESERVE",
+      "default": 1,
+      "what": "Scheduler slots held for EACH live main before any child is admitted. A main that cannot get a slot waits however much pool and VRAM are free, and every main needs a slot for its own control-plane calls (compaction, titling, the goal judge). 2 also protects one auxiliary call per main."
+    },
+    "prefill_rate_tps": {
+      "env": "HERMES_POOL_PREFILL_RATE_TPS",
+      "default": 8481,
+      "what": "Fallback prefill throughput, used only until the live counters have accumulated.",
+      "derivation": "Prefer SELF-CALIBRATION from the server's own cumulative counters: total_prefill_uncached_tokens / total_prefill_busy_us. That divisor then survives a model swap, a quantisation change or a card change with nobody editing a constant. The default here is one measurement of that ratio (8,481 tok/s; independently 8,377 an hour later on the same lane; log-derived chunk-saturated median 8,958, p25-p75 7,257-10,191)."
+    },
+    "drain_budget_s": {
+      "env": "HERMES_POOL_DRAIN_BUDGET_S",
+      "default": 30.0,
+      "what": "How long the uncached waiting backlog may take to drain before children are refused.",
+      "derivation": "NOT a round number: it is the control-plane goal-judge timeout, past which the judge times out and an autonomous loop can halt. Tie a drain budget to the deadline it protects."
+    },
+    "waste_base_tokens": {
+      "env": "HERMES_POOL_WASTE_BASE_TOKENS",
+      "default": 2622,
+      "what": "Measured wasted prefill per call with NO contention — tokens the server recomputed beyond genuine prompt growth, i.e. the cached prefix was evicted."
+    },
+    "waste_growth": {
+      "env": "HERMES_POOL_WASTE_GROWTH",
+      "default": 2.145,
+      "what": "Multiplier on that waste per added concurrent stream, fitted through the measured 114,385 wasted tokens at five other in-flight requests. ⛔ This curve depends entirely on YOUR prefix sizes — see client rule 12."
+    },
+    "prefill_alloc_mib": {
+      "env": "HERMES_POOL_PREFILL_ALLOC_MIB",
+      "default": 560,
+      "what": "Largest single allocation MEASURED to be fatal (a prefill CUDA OOM whose own message read 'Tried to allocate 560.00 MiB ... 280.94 MiB is free')."
+    },
+    "prefill_transient_mib": {
+      "env": "HERMES_POOL_PREFILL_TRANSIENT_MIB",
+      "default": 32,
+      "what": "Per-in-flight-prefill transient VRAM after the bounded-gather fix: flat at every context length, down from 1,024 MiB at 512K. The VRAM FLOOR is prefill_alloc_mib + max_running_requests * prefill_transient_mib = 688 MiB at mrr 4. Below it, admit nothing and let in-flight work drain; above it, VRAM contributes no cap at all."
+    },
+    "vram_hold_max_s": {
+      "env": "HERMES_POOL_VRAM_HOLD_S",
+      "default": 60.0,
+      "what": "How long a child dispatch is held while the floor leg is critical, before it proceeds anyway. Bounded on purpose: an OOM that kills the lane for every session is worse than a slow dispatch, but a permanently stalled agent is worse than a risked one."
+    },
+    "hot_token_usage": {
+      "env": "HERMES_POOL_HOT_TOKEN_USAGE",
+      "default": 0.70,
+      "what": "POOL-MEMORY pressure rung for window sizing. Memory pressure is what a memory rule is for; queueing is a prefill-throughput effect and belongs to the prefill gate."
+    },
+    "critical_token_usage": {
+      "env": "HERMES_POOL_CRITICAL_TOKEN_USAGE",
+      "default": 0.85,
+      "what": "The upper pool-memory rung."
+    }
+  },
+
+  "_not_tunable_at_runtime": {
+    "REFRESH_S": "5.0 — how old the allowance may be before a reader refreshes it",
+    "STALE_S": "30.0 — past this the allowance returns None and callers use their configured defaults",
+    "PROBE_TIMEOUT_S": "1.5 — every backend probe is bounded",
+    "VRAM_SAMPLE_TTL_S": "20.0 — matches the sampler's cadence",
+    "VRAM_SAMPLE_MAX_AGE_S": "90.0 — four consecutive misses: the publisher is GONE, not busy. Past it the sample is discarded, not trusted",
+    "MAIN_WINDOW_FLOOR": "64000 — the actual floor a main window is clamped to",
+    "GUARANTEED_LANE_WINDOW": "131072 — the share a lane is guaranteed BEFORE lending. ⛔ NOT a floor; at five live mains the grant drops to 65,536",
+    "WINDOW_GRID": "8192 — windows are chosen on this grid: legible, and aligned to the engine's paging",
+    "ALLOCATE_BUDGET_MS": "200 — a pluggable policy that exceeds this is dropped for that refresh"
+  },
+
+  "throttle": {
+    "total_stream_cap": 3
+  }
+}
