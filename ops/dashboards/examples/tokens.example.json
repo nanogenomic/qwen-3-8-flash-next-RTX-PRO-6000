@@ -1,0 +1,1262 @@
+{
+ "attribution": "synthetic; no sessions were read",
+ "days": {
+  "2026-07-24": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 58309,
+    "calls": 50,
+    "input": 152404,
+    "output": 3707,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 162,
+    "input": 632127,
+    "output": 10707,
+    "sessions": 2
+   }
+  },
+  "2026-07-27": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 145592,
+    "calls": 247,
+    "input": 323210,
+    "output": 8542,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 176,
+    "input": 388792,
+    "output": 13395,
+    "sessions": 2
+   }
+  },
+  "2026-07-28": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 221558,
+    "calls": 136,
+    "input": 365059,
+    "output": 9084,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 66,
+    "input": 186072,
+    "output": 4967,
+    "sessions": 1
+   }
+  },
+  "2026-07-29": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 308779,
+    "calls": 183,
+    "input": 538519,
+    "output": 13048,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 154,
+    "input": 607892,
+    "output": 12350,
+    "sessions": 2
+   }
+  },
+  "2026-07-30": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 145885,
+    "calls": 89,
+    "input": 248808,
+    "output": 7993,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 153,
+    "input": 445163,
+    "output": 6091,
+    "sessions": 2
+   }
+  },
+  "2026-07-31": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 58218,
+    "calls": 63,
+    "input": 158355,
+    "output": 4334,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 197,
+    "input": 746448,
+    "output": 14343,
+    "sessions": 3
+   }
+  },
+  "2026-08-01": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 54793,
+    "calls": 124,
+    "input": 139737,
+    "output": 2544,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 104,
+    "input": 114421,
+    "output": 3219,
+    "sessions": 1
+   }
+  },
+  "2026-08-02": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 180999,
+    "calls": 74,
+    "input": 241600,
+    "output": 4827,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 60,
+    "input": 174962,
+    "output": 4086,
+    "sessions": 1
+   }
+  },
+  "2026-08-03": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 164163,
+    "calls": 101,
+    "input": 221203,
+    "output": 3064,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 154,
+    "input": 279797,
+    "output": 4238,
+    "sessions": 2
+   }
+  },
+  "2026-08-04": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 252485,
+    "calls": 162,
+    "input": 337599,
+    "output": 11487,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 45,
+    "input": 62967,
+    "output": 1709,
+    "sessions": 1
+   }
+  },
+  "2026-08-05": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 54605,
+    "calls": 111,
+    "input": 101399,
+    "output": 2077,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 131,
+    "input": 172149,
+    "output": 5467,
+    "sessions": 2
+   }
+  },
+  "2026-08-06": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 546406,
+    "calls": 186,
+    "input": 702007,
+    "output": 19412,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 162,
+    "input": 359094,
+    "output": 5164,
+    "sessions": 2
+   }
+  },
+  "2026-08-07": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 366745,
+    "calls": 390,
+    "input": 918086,
+    "output": 23701,
+    "sessions": 6
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 17,
+    "input": 23785,
+    "output": 340,
+    "sessions": 1
+   }
+  },
+  "2026-08-09": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 175113,
+    "calls": 75,
+    "input": 224516,
+    "output": 5804,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 30,
+    "input": 111044,
+    "output": 3868,
+    "sessions": 1
+   }
+  },
+  "2026-08-10": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 177478,
+    "calls": 77,
+    "input": 259792,
+    "output": 5977,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 84,
+    "input": 82002,
+    "output": 2777,
+    "sessions": 1
+   }
+  },
+  "2026-08-11": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 652205,
+    "calls": 396,
+    "input": 1347141,
+    "output": 36085,
+    "sessions": 6
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 306,
+    "input": 539074,
+    "output": 11015,
+    "sessions": 5
+   }
+  },
+  "2026-08-12": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 402234,
+    "calls": 247,
+    "input": 632048,
+    "output": 16499,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 359,
+    "input": 1292579,
+    "output": 37506,
+    "sessions": 5
+   }
+  },
+  "2026-08-13": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 981662,
+    "calls": 334,
+    "input": 1391341,
+    "output": 31808,
+    "sessions": 5
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 317,
+    "input": 1285910,
+    "output": 28658,
+    "sessions": 5
+   }
+  },
+  "2026-08-14": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 132438,
+    "calls": 180,
+    "input": 292954,
+    "output": 4840,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 232,
+    "input": 963106,
+    "output": 25075,
+    "sessions": 3
+   }
+  },
+  "2026-08-15": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 129815,
+    "calls": 170,
+    "input": 200560,
+    "output": 6603,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 160,
+    "input": 396401,
+    "output": 6384,
+    "sessions": 2
+   }
+  },
+  "2026-08-16": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 243504,
+    "calls": 208,
+    "input": 458903,
+    "output": 15500,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 42,
+    "input": 175445,
+    "output": 2216,
+    "sessions": 1
+   }
+  },
+  "2026-08-17": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 255415,
+    "calls": 89,
+    "input": 322846,
+    "output": 8754,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 94,
+    "input": 254678,
+    "output": 3181,
+    "sessions": 1
+   }
+  },
+  "2026-08-18": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 801308,
+    "calls": 463,
+    "input": 1079517,
+    "output": 33466,
+    "sessions": 7
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 35,
+    "input": 56076,
+    "output": 1319,
+    "sessions": 1
+   }
+  },
+  "2026-08-19": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 318819,
+    "calls": 424,
+    "input": 466817,
+    "output": 15240,
+    "sessions": 7
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 303,
+    "input": 1176906,
+    "output": 25508,
+    "sessions": 5
+   }
+  },
+  "2026-08-20": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 721816,
+    "calls": 273,
+    "input": 1032010,
+    "output": 26828,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 107,
+    "input": 263490,
+    "output": 7556,
+    "sessions": 1
+   }
+  },
+  "2026-08-21": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 500269,
+    "calls": 287,
+    "input": 715263,
+    "output": 23113,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 147,
+    "input": 266632,
+    "output": 7935,
+    "sessions": 2
+   }
+  },
+  "2026-08-23": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 38898,
+    "calls": 25,
+    "input": 49363,
+    "output": 1280,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 171,
+    "input": 409158,
+    "output": 9928,
+    "sessions": 2
+   }
+  },
+  "2026-08-24": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 867010,
+    "calls": 298,
+    "input": 1129635,
+    "output": 37531,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 465,
+    "input": 628932,
+    "output": 9306,
+    "sessions": 7
+   }
+  },
+  "2026-08-25": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 197064,
+    "calls": 253,
+    "input": 405274,
+    "output": 6003,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 525,
+    "input": 1587290,
+    "output": 32415,
+    "sessions": 8
+   }
+  },
+  "2026-08-26": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 308124,
+    "calls": 144,
+    "input": 582229,
+    "output": 13511,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 476,
+    "input": 682030,
+    "output": 14953,
+    "sessions": 7
+   }
+  },
+  "2026-08-27": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 136975,
+    "calls": 221,
+    "input": 266137,
+    "output": 5262,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 268,
+    "input": 257191,
+    "output": 5047,
+    "sessions": 4
+   }
+  },
+  "2026-08-28": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 158441,
+    "calls": 89,
+    "input": 349877,
+    "output": 11251,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 174,
+    "input": 179331,
+    "output": 5365,
+    "sessions": 2
+   }
+  },
+  "2026-08-29": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 553696,
+    "calls": 228,
+    "input": 713802,
+    "output": 15230,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 246,
+    "input": 684608,
+    "output": 19244,
+    "sessions": 4
+   }
+  },
+  "2026-08-30": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 107114,
+    "calls": 59,
+    "input": 227412,
+    "output": 2816,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 219,
+    "input": 257620,
+    "output": 8164,
+    "sessions": 3
+   }
+  },
+  "2026-08-31": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 74231,
+    "calls": 33,
+    "input": 137979,
+    "output": 4560,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 102,
+    "input": 269159,
+    "output": 4705,
+    "sessions": 1
+   }
+  },
+  "2026-09-01": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 339751,
+    "calls": 135,
+    "input": 536815,
+    "output": 12998,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 199,
+    "input": 507508,
+    "output": 8166,
+    "sessions": 3
+   }
+  },
+  "2026-09-02": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 27745,
+    "calls": 50,
+    "input": 48041,
+    "output": 1657,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 313,
+    "input": 1247092,
+    "output": 18013,
+    "sessions": 5
+   }
+  },
+  "2026-09-03": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 683255,
+    "calls": 538,
+    "input": 1182085,
+    "output": 32883,
+    "sessions": 8
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 237,
+    "input": 864231,
+    "output": 24418,
+    "sessions": 3
+   }
+  },
+  "2026-09-04": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 830115,
+    "calls": 636,
+    "input": 2329071,
+    "output": 61453,
+    "sessions": 10
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 295,
+    "input": 319432,
+    "output": 8720,
+    "sessions": 4
+   }
+  },
+  "2026-09-05": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 75334,
+    "calls": 92,
+    "input": 156335,
+    "output": 3528,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 89,
+    "input": 81163,
+    "output": 1653,
+    "sessions": 1
+   }
+  },
+  "2026-09-06": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 165967,
+    "calls": 83,
+    "input": 339196,
+    "output": 6852,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 109,
+    "input": 128275,
+    "output": 2362,
+    "sessions": 1
+   }
+  },
+  "2026-09-07": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 22824,
+    "calls": 33,
+    "input": 58467,
+    "output": 1238,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 284,
+    "input": 536428,
+    "output": 14205,
+    "sessions": 4
+   }
+  },
+  "2026-09-08": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 1073057,
+    "calls": 520,
+    "input": 1596344,
+    "output": 51432,
+    "sessions": 8
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 529,
+    "input": 1734186,
+    "output": 40521,
+    "sessions": 8
+   }
+  },
+  "2026-09-09": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 162093,
+    "calls": 59,
+    "input": 215730,
+    "output": 5701,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 495,
+    "input": 1271301,
+    "output": 41860,
+    "sessions": 8
+   }
+  },
+  "2026-09-10": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 92024,
+    "calls": 41,
+    "input": 129779,
+    "output": 3680,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 462,
+    "input": 545530,
+    "output": 7071,
+    "sessions": 7
+   }
+  },
+  "2026-09-12": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 351089,
+    "calls": 187,
+    "input": 555695,
+    "output": 15367,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 96,
+    "input": 231161,
+    "output": 3146,
+    "sessions": 1
+   }
+  },
+  "2026-09-14": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 981784,
+    "calls": 558,
+    "input": 1374762,
+    "output": 43251,
+    "sessions": 9
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 547,
+    "input": 862738,
+    "output": 25033,
+    "sessions": 9
+   }
+  },
+  "2026-09-15": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 822745,
+    "calls": 375,
+    "input": 1183574,
+    "output": 30998,
+    "sessions": 6
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 174,
+    "input": 500950,
+    "output": 9834,
+    "sessions": 2
+   }
+  },
+  "2026-09-16": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 157305,
+    "calls": 443,
+    "input": 416928,
+    "output": 7580,
+    "sessions": 7
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 105,
+    "input": 169930,
+    "output": 3952,
+    "sessions": 1
+   }
+  },
+  "2026-09-17": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 363179,
+    "calls": 374,
+    "input": 482856,
+    "output": 8007,
+    "sessions": 6
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 718,
+    "input": 687675,
+    "output": 15511,
+    "sessions": 11
+   }
+  },
+  "2026-09-18": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 287749,
+    "calls": 233,
+    "input": 371043,
+    "output": 6250,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 101,
+    "input": 340037,
+    "output": 6128,
+    "sessions": 1
+   }
+  },
+  "2026-09-19": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 474385,
+    "calls": 186,
+    "input": 711755,
+    "output": 12328,
+    "sessions": 3
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 148,
+    "input": 210887,
+    "output": 7138,
+    "sessions": 2
+   }
+  },
+  "2026-09-20": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 63108,
+    "calls": 63,
+    "input": 128209,
+    "output": 4016,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 126,
+    "input": 254053,
+    "output": 5375,
+    "sessions": 2
+   }
+  },
+  "2026-09-21": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 288152,
+    "calls": 257,
+    "input": 546981,
+    "output": 19129,
+    "sessions": 4
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 94,
+    "input": 371663,
+    "output": 10919,
+    "sessions": 1
+   }
+  },
+  "2026-09-23": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 583634,
+    "calls": 533,
+    "input": 741625,
+    "output": 16340,
+    "sessions": 8
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 184,
+    "input": 392297,
+    "output": 13334,
+    "sessions": 3
+   }
+  },
+  "2026-09-24": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 1814907,
+    "calls": 759,
+    "input": 3039269,
+    "output": 86771,
+    "sessions": 12
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 775,
+    "input": 1748340,
+    "output": 45706,
+    "sessions": 12
+   }
+  },
+  "2026-09-25": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 122527,
+    "calls": 76,
+    "input": 300835,
+    "output": 6877,
+    "sessions": 1
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 262,
+    "input": 456915,
+    "output": 13246,
+    "sessions": 4
+   }
+  },
+  "2026-09-26": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 182046,
+    "calls": 126,
+    "input": 345134,
+    "output": 5469,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 44,
+    "input": 112287,
+    "output": 3444,
+    "sessions": 1
+   }
+  },
+  "2026-09-27": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 377070,
+    "calls": 383,
+    "input": 913405,
+    "output": 15003,
+    "sessions": 6
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 81,
+    "input": 221485,
+    "output": 4284,
+    "sessions": 1
+   }
+  },
+  "2026-09-28": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 1391818,
+    "calls": 770,
+    "input": 2597879,
+    "output": 55904,
+    "sessions": 12
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 211,
+    "input": 378068,
+    "output": 11076,
+    "sessions": 3
+   }
+  },
+  "2026-09-29": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 231959,
+    "calls": 143,
+    "input": 366252,
+    "output": 11663,
+    "sessions": 2
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 116,
+    "input": 447691,
+    "output": 9332,
+    "sessions": 1
+   }
+  },
+  "2026-09-30": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 1025661,
+    "calls": 754,
+    "input": 2850527,
+    "output": 36320,
+    "sessions": 12
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 682,
+    "input": 2423843,
+    "output": 83066,
+    "sessions": 11
+   }
+  },
+  "2026-10-01": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 2205638,
+    "calls": 828,
+    "input": 3001039,
+    "output": 103120,
+    "sessions": 13
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 706,
+    "input": 1156810,
+    "output": 17927,
+    "sessions": 11
+   }
+  },
+  "2026-10-02": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 1784809,
+    "calls": 642,
+    "input": 2371212,
+    "output": 33090,
+    "sessions": 10
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 41,
+    "input": 53900,
+    "output": 1352,
+    "sessions": 1
+   }
+  }
+ },
+ "families": [
+  {
+   "key": "flashnext",
+   "label": "Flash-Next (SYNTHETIC)",
+   "models": [
+    "example/flash-next-synthetic"
+   ]
+  },
+  {
+   "key": "q27b",
+   "label": "27B (SYNTHETIC)",
+   "models": [
+    "example/27b-synthetic"
+   ]
+  },
+  {
+   "key": "other",
+   "label": "Other",
+   "models": []
+  }
+ ],
+ "generated_at": 1790970294.995662,
+ "last_usage_at": 1790969113.4967678,
+ "profiles": {
+  "profile-1": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 15616912,
+    "calls": 8460,
+    "input": 24525766,
+    "output": 643139,
+    "sessions": 29
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 3565,
+    "input": 9229567,
+    "output": 238847,
+    "sessions": 17
+   }
+  },
+  "profile-2": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 4714560,
+    "calls": 2931,
+    "input": 8202550,
+    "output": 208263,
+    "sessions": 13
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 4336,
+    "input": 10273869,
+    "output": 259074,
+    "sessions": 17
+   }
+  },
+  "profile-3": {
+   "flashnext": {
+    "cache_reported": true,
+    "cached": 7142424,
+    "calls": 4975,
+    "input": 12895929,
+    "output": 289284,
+    "sessions": 22
+   },
+   "q27b": {
+    "cache_reported": false,
+    "cached": 0,
+    "calls": 6765,
+    "input": 14764771,
+    "output": 317072,
+    "sessions": 30
+   }
+  }
+ },
+ "semantics": {
+  "cached": "prompt cache read",
+  "input": "uncached prompt",
+  "output": "completion"
+ },
+ "source": "SYNTHETIC EXAMPLE \u2014 not a measurement",
+ "sources": [
+  {
+   "db": "SYNTHETIC",
+   "profile": "profile-1",
+   "rows": 0
+  },
+  {
+   "db": "SYNTHETIC",
+   "profile": "profile-2",
+   "rows": 0
+  },
+  {
+   "db": "SYNTHETIC",
+   "profile": "profile-3",
+   "rows": 0
+  }
+ ],
+ "synthetic": true,
+ "today": "2026-10-02",
+ "tz": "EDT"
+}

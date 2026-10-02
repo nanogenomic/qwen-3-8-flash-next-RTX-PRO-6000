@@ -1,0 +1,3 @@
+# The dashboards' only hard dependency. Everything else is the standard library
+# plus the `nvidia-smi` and `lspci` binaries already on the host.
+psutil>=5.9

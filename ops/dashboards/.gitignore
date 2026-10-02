@@ -1,0 +1,5 @@
+# Runtime inputs and generated example data. Never commit a real snapshot or a
+# real sampler ring: they carry session identifiers and measured usage.
+var/
+config.json
+__pycache__/

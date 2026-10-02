@@ -20,6 +20,7 @@ Contents:
 | **3** | **Observability and incident capture** — a VRAM/KV sample ring, and one artifact per lane death | [`observability.md`](observability.md) |
 | **4** | **Log rotation for append-only runtime logs** — why `copytruncate` is mandatory and compression is a reader bug | [`log-rotation.md`](log-rotation.md) |
 | **5** | **Cutover discipline** — how a serving config change lands without restarting the thing it configures | [`cutover.md`](cutover.md) |
+| **6** | **Two dashboards** — which cards exist right now (discovered, never configured), and what the agent sessions actually spent. Runnable code, not screenshots | [`dashboards/`](dashboards/README.md) |
 
 Copyable artifacts: [`examples/`](examples/).
 
