@@ -52,8 +52,8 @@ The `138.8 → 166.4` figure compares:
 
 **Many variables move at once**, including the engine version, two library versions, the
 scheduler profile, and a speculative token map that is **not shipped in this repository**.
-Treat `+19.9 %` as *"what this configuration achieved against what was previously in
-production"*, which is the question it was measured to answer — not as the effect of the
+Treat `+19.9 %` as *"what this configuration achieved against what the reference card previously
+ran"*, which is the question it was measured to answer — not as the effect of the
 kernels alone.
 
 For the kernel effect on its own, see the clean same-engine A/B in §3.
@@ -109,7 +109,7 @@ was tested. Without the private corpus, the harness scores public-domain text in
 
 ### 3.1 Single-stream and aggregate, stock vs this tree
 
-`[measured]` Temperature 0. Stock column is the previously-in-production configuration; see
+`[measured]` Temperature 0. Stock column is the previously-in-reference configuration; see
 §1.2 for why this is not a single-variable comparison.
 
 | Metric | Stock | This tree, lossless levers | This tree + fp8 KV (opt-in) |
@@ -118,7 +118,7 @@ was tested. Without the private corpus, the harness scores public-domain text in
 | Single-stream peak (@325 tokens) | — | 180.5 | 167.3 |
 | 4-concurrent aggregate | 351 | **413.9** (+17.9 %) | 411.4 (+17.1 %) |
 | KV pool, test card | 241,728 | **279,680** (+15.7 %) | **542,912** (2.25×) |
-| KV pool, production card | 241,728 | **331,456** (+37 %) | — |
+| KV pool, reference card | 241,728 | **331,456** (+37 %) | — |
 | Per-token time, 325 → 250k context | grows with depth | — | 14.7 → 15.4 ms (+4.5 % over 770× context) |
 
 Single-stream by context depth is in **§3.1b**, which is the one place those figures live.
@@ -126,7 +126,7 @@ Single-stream by context depth is in **§3.1b**, which is the one place those fi
 The fp8-KV column is a **2-rep mean**. The lossless column comes from a single run of the
 final build with both fuse levers on.
 
-A separate live check on the production lane after deployment measured **176.4 tok/s** on a
+A separate live check on the reference deployment after deployment measured **176.4 tok/s** on a
 768-token reply through the serving router.
 
 ### 3.1b Single-stream across the full context range, and where it was not swept
@@ -147,7 +147,7 @@ tok/s, temperature 0, single stream. Per-token latency over the same span:
 **14.7 → 15.4 ms from 325 tokens to 250k, +4.5 % across a 770× context increase.**
 
 **The "not swept" cells are a measurement gap, not a capability limit.** The shipping bf16-KV
-arm holds a 279,680-token pool (331,456 in production) and can serve far past 98k; its context
+arm holds a 279,680-token pool (331,456 on the reference card) and can serve far past 98k; its context
 sweep used harness cells at 4k / 48.6k / 95.4k and stopped there. **A deep single-stream sweep
 on the exact shipping configuration was never run** (§6). The right-hand columns show the
 engine sustaining 141–157 tok/s to 900k, but each carries its own cost: fp8 KV is opt-in lossy,
@@ -227,7 +227,7 @@ to size a shared backend. The guidance built on them is in
 | Pool cost of one extra running request | **29,120 pool tokens** | `[measured, second card]` 710,336 / 652,096 / 593,856 / 477,376 at 4 / 6 / 8 / 12 streams. Its 3 slots are ~12,480 of that (~4,160 per slot there); the rest is other per-stream reservations. An earlier revision estimated ~11,250 from the slots alone, which undercounts. |
 | Concurrency cap | `--max-mamba-cache-size` ÷ 3 | 12 slots → 4 concurrent. Slots beyond 3 per running request hold idle conversations' state and are what keeps multi-turn prefixes cacheable (§3.10) |
 | KV pool, bf16 → fp8, test card | 279,680 → **542,912** | **1.941×** `[measured]` |
-| KV pool, bf16 → fp8, production card | 331,456 → **643,456** | **1.941×** `[measured, read from `/get_server_info` at 18:31Z]`. **Largest pool measured on this hardware.** |
+| KV pool, bf16 → fp8, reference card | 331,456 → **643,456** | **1.941×** `[measured, read from `/get_server_info` at 18:31Z]`. **Largest pool measured on this hardware.** |
 | Cost of declaring a larger window | 542,912 tokens at a 262k declaration vs **519,040** at 540k | `[measured]`, same fp8 build |
 
 **Why the cost is affine rather than linear.** Only 12 of 48 layers are full attention; the other
@@ -252,9 +252,9 @@ included because it identifies the failure mode: **the scheduler queues rather t
 the cost lands as prefix eviction and full re-prefill**, which at ~250k context is tens of seconds
 per turn.
 
-### 3.3c fp8 KV on the production card — live readings, 18:31Z
+### 3.3c fp8 KV on the reference card — live readings, 18:31Z
 
-`[measured, live]` fp8 KV went live on the reference deployment's production card. Configuration
+`[measured, live]` fp8 KV went live on the reference card. Configuration
 read back from `/get_server_info` rather than trusted from the launch line:
 
 | | |
@@ -357,7 +357,7 @@ decodes at most 48 tokens right after its prefill.
 
 **Hardware differs from the rest of this document.** NVIDIA RTX PRO 6000 Blackwell **Server
 Edition, 600 W**, 97,887 MiB, SM120, driver 580.95.05 — against the 300 W Max-Q, driver 610.43.02,
-used everywhere else. Engine: a replica of the production configuration (this tree's final build;
+used everywhere else. Engine: a replica of the reference configuration (this tree's final build;
 fp8 KV; `SGLANG_QWENOPT_FUSE_SBMOE=1`, `SGLANG_QWENOPT_FUSE_HC=1`, `SGLANG_HC_MIX_PREFETCH=1`,
 `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`; `sm120gemv`; NEXTN 3/1/4 with the stock draft head;
 `--mem-fraction-static 0.98`; `--max-running-requests 4`; `--max-mamba-cache-size 12` unless stated),
@@ -575,9 +575,9 @@ losing direction by the scheduler — below an explicit 0 — and SGLang logs a 
 configuration. The Responses API is the exception (default 0). Set `--default-priority-value`, or
 tag every request, or a client's untagged auxiliary calls will queue behind all background work.
 
-### 3.12 The recommended configuration on the production card
+### 3.12 The recommended configuration on the reference card
 
-`[measured, read from /get_server_info]` The reference deployment's production card (300 W Max-Q)
+`[measured, read from /get_server_info]` The reference card (300 W Max-Q)
 was switched to the configuration recommended by §3.8–§3.11, first at `mem_fraction_static` 0.98
 and then — after the OOM in §3.14 — at 0.97, which is what it runs now:
 
@@ -594,16 +594,16 @@ and then — after the OOM in §3.14 — at 0.97, which is what it runs now:
 **The 0.98 row is what died** (§3.14); it is kept because the pool projection below was made
 against it. This closes the one measurement the suite left for the reference hardware. A projection of ~420K,
 made beforehand by subtracting the 36-slot cost from 519,040, was wrong because 519,040 was the
-*test* card's pool at 540,000; the production card carries less foreign VRAM. From its own measured
+*test* card's pool at 540,000; the reference card carries less foreign VRAM. From its own measured
 262,144 baseline of 643,456, the second card's ratios (−2.9 % for the declaration, ≈ −99,840 for 24
 extra slots) predict ≈ 524,900 — within 0.4 % of the measured 522,880.
 
 Only the resulting pool is measured here. Prefix-cache hit rate and time to first token under the
-production workload at 36 slots have not yet been measured on this card, at either fraction.
+reference workload at 36 slots have not yet been measured on this card, at either fraction.
 
 ### 3.13 Static memory fraction: the headroom/pool trade, measured
 
-Four production configurations, each figure read from that boot's own log rather than derived.
+Four reference configurations, each figure read from that boot's own log rather than derived.
 "Boot `available_gpu_mem`" is what SGLang prints at the end of start-up; "device-free while
 serving" is nvidia-smi free on the same card in steady state, sampled every 20 s.
 
@@ -632,7 +632,7 @@ proportion. Measure this per deployment rather than deriving it.
 
 ### 3.14 Runtime CUDA OOM under a deep queue (2026-09-30) — why 0.98 is not usable
 
-`[measured, production card]` At 16:44:17, at `--mem-fraction-static 0.98` with a 522,880-token
+`[measured, reference card]` At 16:44:17, at `--mem-fraction-static 0.98` with a 522,880-token
 pool:
 
 ```
@@ -682,7 +682,7 @@ same as controlling for it.** The client-side obligation is
 
 ### 3.15 Host-resident QSA KV pool — 1,310,720 tokens on one 96 GB card
 
-`[measured, production card, 2026-09-30]` This is the largest capacity change in the repository
+`[measured, reference card, 2026-09-30]` This is the largest capacity change in the repository
 and it does not come out of VRAM. The 12 full-attention layers' K/V — and, at
 `SGLANG_QSA_HOST_KV=all`, the MTP draft layer's as well — are allocated in **pinned, UVA-mapped
 host RAM** and read zero-copy. What stays on the card is only the QSA *compressed index*, which
@@ -694,7 +694,7 @@ draft; the GPU-side compressed index is **832 B/token** (768 for 12 layers at 1 
 128 dim / ratio 4 × 2 B, plus 64 for the draft layer). A token costs ~16× less VRAM in the host-KV
 layout than in the on-GPU one, which is where the 2.9× comes from.
 
-**The production boot, line for line from the engine's own log** (production card,
+**The reference card's boot, line for line from the engine's own log** (reference card,
 `--mem-fraction-static 0.97`, `--kv-cache-dtype fp8_e4m3`, 36 slots, declared context 540,000):
 
 | | On-GPU KV (16:56:52Z) | **Host-resident KV (23:34:00Z)** |
@@ -793,7 +793,7 @@ headroom whose absence killed the lane twice in §3.14. The lowest safe fraction
 bracketed (§6), but the question is now cheap to answer and the answer is worth more than it was.
 
 ⛔ **Measured since, and the premise was wrong in the other direction** `[measured, Modal,
-production replica]`: on this configuration the fraction has **no effect at all**. 0.94 and 0.97
+reference-configuration replica]`: on this configuration the fraction has **no effect at all**. 0.94 and 0.97
 booted identically — pool 1,310,720, 8.88 GiB free at pool end, 5,948 MiB free after boot in
 both. With `--max-total-tokens` fixing the pool, lowering the fraction neither costs capacity nor
 buys headroom; the headroom is already there. The hot cache, not the fraction, is the lever for
@@ -824,9 +824,9 @@ rather than walking into the host OOM killer.
 each re-sending its full history, with two subagents added on the third turn. The control is the
 **same card, same engine, same script**, with `SGLANG_QSA_HOST_KV` off.
 
-**Be precise about the control's pool.** It was **not** pinned to the production lane's size. It
+**Be precise about the control's pool.** It was **not** pinned to the reference deployment's size. It
 ran with `max_total_tokens: None` and sized itself off the static budget, landing at **451,840** —
-within 0.13 % of the production card's 451,264 by coincidence, not by construction. A second control boot of the
+within 0.13 % of the reference card's 451,264 by coincidence, not by construction. A second control boot of the
 same configuration self-sized to 451,648. That the three agree so closely is a property of the
 model and the memory fraction; it is not a control variable anyone set.
 
@@ -901,12 +901,12 @@ Do not cite "the host-KV configuration failed its quality gate". Do not cite "it
 
 #### 3.15d What the host-KV result does not establish
 
-- **⛔ The validation card is not the production card, and the difference is bigger than PCIe.**
+- **⛔ The validation card is not the reference card, and the difference is bigger than PCIe.**
   Modal's is an RTX PRO 6000 Blackwell **Server Edition at 600 W** on **PCIe Gen5**; the reference
   deployment's is a **Max-Q Workstation Edition at 300 W** on **PCIe Gen4** (§ Hardware baseline).
   Double the power limit is a larger confound than the link generation, and **no cross-SKU scaling
   factor was measured** — so treat every absolute tok/s above as belonging to the Server Edition.
-  Expect the production card to be slower; by how much is not established here.
+  Expect the reference card to be slower; by how much is not established here.
 - **A cold prefill starves its peer's decode, and host KV is not the cause.** In the two-mains
   cold turn, the main holding a cached prefix decoded at **24.3 tok/s** while the other cold-
   prefilled 200K. The on-GPU control does the same thing at **27.3 tok/s**. So this is chunked-
@@ -976,10 +976,10 @@ second column: on a 97,887 MiB card the old tree peaked at **97,237 MiB — 650 
 left** at a 500K prompt, while the new tree peaked at 96,093 MiB, leaving **1,794 MiB**. That
 **1,144 MiB** is the margin the 2026-09-30 death did not have.
 
-**⛔ And the honest headline: at the production cell it made no measurable difference.** A
+**⛔ And the honest headline: at the reference cell it made no measurable difference.** A
 2 × 250K cold-prefill peak-VRAM A/B on the host-KV configuration measured the **same non-pool peak
 on both trees — +1,248 MiB over idle either way.** The benefit above is real, reproducible and
-bit-exact, and it did not show up in the one cell that most resembles the production workload. The
+bit-exact, and it did not show up in the one cell that most resembles the reference workload. The
 most likely reading is that at 250K the old transient (512 MiB at 262K) is not what sets the peak
 on that configuration — something else is — but **that was not established**, and the cell is the
 reason this section does not claim an end-to-end win.
@@ -998,7 +998,7 @@ is a hypothesis and the discrepancy is unexplained.** No host-UVA kernel-time cl
 
 ### 3.17 Non-fatal OOM — retract the batch instead of killing the lane
 
-`[measured on Modal, Server Edition card, production flags]` Every incident in §3.14 has the same
+`[measured on Modal, Server Edition card, reference flags]` Every incident in §3.14 has the same
 shape: one allocation fails, the scheduler raises, `SIGQUIT` follows, and the whole lane — every
 healthy in-flight request included — dies for ~9–13 minutes. This makes an EXTEND-batch OOM
 retract the offending requests and continue.
@@ -1050,7 +1050,7 @@ audit under `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` (`pool_check_leak: fals
 
 ### 3.18 Model weights on NVMe — boot time, measured
 
-`[measured, production card, both boots from the same log on the same day]` The reference
+`[measured, reference card, both boots from the same log on the same day]` The reference
 deployment's 126 GiB of weights moved off a RAID6 spindle array onto NVMe.
 
 | | RAID6 (16:47:48 → 16:57:11) | **NVMe (23:29:34 → 23:34:19)** |
@@ -1117,7 +1117,7 @@ instrumented. Do not treat §3.18's 130.67 s as a repeatable figure without a se
 
 ### 3.19 Nondeterministic CUDA-graph capture failure on the host-KV build
 
-`[measured, production card, 2026-09-30]` This is the one result in this repository whose main
+`[measured, reference card, 2026-09-30]` This is the one result in this repository whose main
 value is a list of things it is **not**. The host-KV build's first boot died 314 s in, 2 s into
 CUDA-graph capture, with:
 
@@ -1146,7 +1146,7 @@ captured forward then trips the c10 assert. Three independent pieces of evidence
   23:27:57, so its ticks fell at 23:28:27 and 23:28:57. Capture began at 23:28:56 and the assert
   fired at 23:28:58. The decode and verify captures take long enough that a 30 s tick lands
   inside them often, but not always — which is the nondeterminism.
-- **Incidence.** The whole production log for this card holds **exactly one** capture
+- **Incidence.** The whole serving log for this card holds **exactly one** capture
   invalidation, in the first host-KV boot. Every on-GPU boot before it has none — and the
   reporter exists only when a pool is host-resident. The two host-KV boots since, one with
   stats on and one with stats off, both captured cleanly.
@@ -1248,7 +1248,7 @@ It is a draft: it has one occurrence, no reduction, and no fix.
 
 ### 3.20 Throughput versus concurrency, warm-segmented — and the 0.71× retraction
 
-`[measured, production card]` **Source and method, because the method is what makes these
+`[measured, reference card]` **Source and method, because the method is what makes these
 numbers mean anything.** All figures below are mined from the lane's own
 `Decode batch` scheduler log, frozen at **2026-10-01 01:00 UTC**:
 
@@ -1392,16 +1392,16 @@ soft cap; the full-attention KV of a freed node is kept. **Cap 1 is unsafe**: an
 reuses the checkpoint at the previous prompt's end, which is interior once that turn's reply is
 appended, and a cap of 1 frees exactly that one.
 
-#### The controlled A/B (Modal, production replica)
+#### The controlled A/B (Modal, reference-configuration replica)
 
-`[measured, Modal RTX PRO 6000 Blackwell Server Edition, the production engine build, the
-production flags and host-KV environment; arms differ only in the path cap]` Two main
+`[measured, Modal RTX PRO 6000 Blackwell Server Edition, the reference engine build, the
+reference flags and host-KV environment; arms differ only in the path cap]` Two main
 conversations at 300,000 and 330,000 tokens; each round, each main appends 1,548 tokens and asks
 for 48, and a cold 45,000-token subagent runs between them.
 
 | Run | Arm | Main turns that hit | Main turn wall time | Checkpoint pool after the first cold mains |
 |---|---|---|---|---|
-| 1 | production (cap unlimited) | **0 / 10**, `cached=0` every turn | **31.4–37.3 s** | 33–34 of 36 held by the cache, 0–3 free |
+| 1 | reference flags (cap unlimited) | **0 / 10**, `cached=0` every turn | **31.4–37.3 s** | 33–34 of 36 held by the cache, 0–3 free |
 | 1 | cap 2 | **10 / 10**, each reusing the previous prompt exactly | **0.70–0.85 s** | 4–16 held, 18–32 free |
 | 2 | cap 2, + 3 warm subagent lanes × 4 turns per round | mains **12 / 12**, subagents **72 / 72** | median 0.87 s | — |
 | 2 | cap 2, `--max-mamba-cache-size 64` | 12 / 12, 72 / 72 | median 0.87 s | — **no gain from more slots** |
@@ -1410,9 +1410,9 @@ for 48, and a cold 45,000-token subagent runs between them.
 Run 1 is the A/B. Runs 2 and 3 have no uncapped arm and show only that the cap holds under more
 churn and that a larger pool adds nothing once it is on.
 
-#### Production, before and after
+#### Reference card, before and after
 
-`[measured, production card]` The flag went live with a restart at ~02:13 UTC on 2026-10-01
+`[measured, reference card]` The flag went live with a restart at ~02:13 UTC on 2026-10-01
 (ready 02:18:39); the build, pool and every other flag were unchanged. Engine log frozen at
 03:07:37.
 
@@ -1434,11 +1434,11 @@ full. The cap does not empty it either — it changes which checkpoints are in i
 
 What this does not establish: the post-cap window is 49 minutes; the agents' workload is
 whatever they were doing; per-turn time to first token was not instrumented. The Modal A/B is
-the controlled result; the production table is the same direction on real traffic.
+the controlled result; the reference-card table is the same direction on real traffic.
 
 ### 3.22 What high context costs in speed — per step versus delivered
 
-`[measured, production card, unless marked]` The decision guide built on these numbers is
+`[measured, reference card, unless marked]` The decision guide built on these numbers is
 [CONTEXT-PROFILES](CONTEXT-PROFILES.md). Per-step cost is reported as **step time**,
 `1000 × accept_len × running_req / gen_throughput` from each `Decode batch` line, because
 accept length varies with the generated text (10th–90th percentile ~1.9–3.2 within one era) and
@@ -1492,13 +1492,13 @@ corroborated by §3.21's controlled A/B.
 
 #### Hot-cache sizing, set associativity, and `target` versus `all`
 
-`[measured, Modal RTX PRO 6000 Server Edition, PCIe Gen5, production replica; one 250K stream ×
+`[measured, Modal RTX PRO 6000 Server Edition, PCIe Gen5, reference-configuration replica; one 250K stream ×
 3, then 4 streams (mains 250K + 200K, subagents 20K + 40K)]` Hit is the 12 target layers' hit
 fraction of cacheable selections over the 250K cell.
 
 | Hot cache | GPU | Target hit | Step, 1 × 250K | Step, 4 streams | Free after boot |
 |---|---|---|---|---|---|
-| 4,096 sets, direct-mapped (production) | 1.02 GiB | 0.776 | 16.51 ms (n = 17) | 25.06 ms (n = 26) | 9,072 MiB |
+| 4,096 sets, direct-mapped (reference) | 1.02 GiB | 0.776 | 16.51 ms (n = 17) | 25.06 ms (n = 26) | 9,072 MiB |
 | 2,048 sets × 4-way | 2.04 GiB | 0.839 | 16.20 (18) | 24.00 (29) | 8,028 MiB |
 | 16,384 sets, direct-mapped | 4.06 GiB | **0.908** | **15.49** (15) | **23.31** (27) | 5,948 MiB |
 | 4,096 sets × 4-way (equal bytes) | 4.06 GiB | 0.919 | 15.49 (15) | 23.36 (28) | 5,948 MiB |
@@ -1527,8 +1527,8 @@ factor stands.
 
 ### 3.23 The S8-FP8 profile — 8-bit dense weights, cap 8 (2026-10-27)
 
-`[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` — **not** the production
-Max-Q (300 W, Gen4). Every arm boots the production lane's own launch line (540K context,
+`[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` — **not** the 300 W
+Max-Q (Gen4). Every arm boots the reference deployment's own launch line (540K context,
 `--max-total-tokens 1310720`, host KV `all` with 4,096 hot-cache sets, fp8 KV, NEXTN 3/1/4 with
 the hot-24k token map, `--mamba-max-states-per-path 2`, priority scheduling), and changes only
 what the arm column says. Temperature 0. Patches `0039`–`0042`; the launch block is
@@ -1536,7 +1536,7 @@ what the arm column says. Temperature 0. Patches `0039`–`0042`; the launch blo
 
 | Arm | Tree | Cap (running / graph bs) | Mamba slots | Dense weights |
 |---|---|---|---|---|
-| Previous production | through `0038` | 4 / 4 | 112 | BF16 |
+| Previous reference | through `0038` | 4 / 4 | 112 | BF16 |
 | BF16 cap 8 | through `0041` | 8 / 8 | 48 | BF16 |
 | **S8-FP8** | through `0042` | 8 / 8 | 48 | **FP8** (`SGLANG_SM120_ONLINE_MXFP8=true`, `SGLANG_SM120_ONLINE_FP8_DENSE=rowwise`) |
 
@@ -1546,7 +1546,7 @@ off. The first two arms ran in one Modal session, S8-FP8 in another, the same da
 **Aggregate tok/s, concurrency sweep.** Each cell is 2 rounds of N streams × 512 tokens; the
 mean is shown, with the rounds for S8-FP8.
 
-| Streams | Previous production | BF16 cap 8 | **S8-FP8** (rounds) | vs previous | vs BF16 cap 8 |
+| Streams | Previous reference | BF16 cap 8 | **S8-FP8** (rounds) | vs previous | vs BF16 cap 8 |
 |---|---|---|---|---|---|
 | 1 | 228.3 | 229.2 | **276.8** (276.8 / 276.7) | +21.2 % | +20.8 % |
 | 2 | 342.2 | 342.3 | **400.4** (397.3 / 403.5) | +17.0 % | +17.0 % |
@@ -1558,14 +1558,14 @@ the cap. The FP8 weights' own contribution is the right-hand column.
 
 **Single stream by depth** (512 tokens decoded; one request per deep cell, so treat those as n = 1):
 
-| Prompt | Previous production: decode / TTFT | BF16 cap 8: decode / TTFT | **S8-FP8: decode / TTFT** | S8-FP8 prefill |
+| Prompt | Previous reference: decode / TTFT | BF16 cap 8: decode / TTFT | **S8-FP8: decode / TTFT** | S8-FP8 prefill |
 |---|---|---|---|---|
 | 41 tokens (median of 3) | 233.1 / 0.1 s | 232.2 / 0.09 s | **275.1** (274.8 / 288.9 / 275.1) / — | — |
 | 131,063 | 197.2 / 11.32 s | 200.6 / 11.11 s | **233.4** / 13.10 s | 10,003 tok/s |
 | 499,991 | 190.0 / 70.56 s | 191.4 / 47.83 s | **231.8** / 53.45 s | 9,354 tok/s |
 
 Decode stays near-flat in depth (275 → 232 from short to 500K). The cost is prefill: 500K
-TTFT is **+5.6 s (+12 %)** against BF16 at the same cap. The previous-production 500K TTFT of
+TTFT is **+5.6 s (+12 %)** against BF16 at the same cap. The previous-reference 500K TTFT of
 70.56 s is a single request and is out of line with the other BF16 arms (47.8–48.8 s); it is
 reported as measured and not used for any claim.
 
@@ -1580,7 +1580,7 @@ stack, noise = a second baseline run, [§4](#4-quality-instruments--what-each-on
 | Prefix-cache probe | 6 cache-hit pairs, max mean \|Δlogprob\| 0.42 vs limit 1.33, 0 errors, 0 degenerate | PASS |
 | Needle retrieval | **9 / 9** (131,072, 262,144, 500,000) | — |
 | GSM8K | **0.96** (n = 100; 3 truncated, 0 degenerate) | — |
-| KL divergence vs BF16 | **0.087** nats/token, top-1 **91.8 %** (BF16 vs BF16: 0.005, 99.3 %), [§3.25](#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-production-bigger-pools-2026-10-28) | lossy |
+| KL divergence vs BF16 | **0.087** nats/token, top-1 **91.8 %** (BF16 vs BF16: 0.005, 99.3 %), [§3.25](#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-300-w-card-bigger-pools-2026-10-28) | lossy |
 
 So S8-FP8 is **lossy, not lossless**: greedy outputs diverge from BF16 about 35 % sooner than
 two BF16 runs diverge from each other. No task-level loss was seen at these sample sizes,
@@ -1590,7 +1590,7 @@ which this bundle did not try to satisfy; the needle run above is a separate bun
 
 **Tried and not adopted** (same harness, same day):
 
-- **16,384 hot-cache sets** (§3.22's lever) with the production pool and 540K context: did not
+- **16,384 hot-cache sets** (§3.22's lever) with the 1.31M pool and 540K context: did not
   boot — out of GPU memory at warm-up at `--mem-fraction-static` 0.97 and again at 0.96. S8-FP8
   keeps 4,096.
 - **Adaptive speculation depth** (BF16 cap 8): 231.7 / 338.6 / 514.8 / 740.0 at 1 / 2 / 4 / 8
@@ -1600,15 +1600,14 @@ which this bundle did not try to satisfy; the needle run above is a separate bun
 - **A split-K retune of the 8-bit GEMV** (run `r20261027t`): regressed against the shipped
   launch settings and was dropped; `0042` carries the un-retuned kernel.
 
-Open: the same sweep on the production Max-Q; live numbers from
-the production lane; a same-session A/B of the three arms (the rows above come from two Modal
+Open: the same sweep on an idle 300 W Max-Q card (numbers from a 300 W card serving other traffic are in §3.25); a same-session A/B of the three arms (the rows above come from two Modal
 sessions, and §1.1's ~6 % noise band applies to any single-stream difference smaller than that).
 
 ### 3.24 Troughs, compaction and between-turn (2026-10-28)
 
 Setup: Modal, 1× RTX PRO 6000, S8-FP8 profile (max-running 8, cuda-graph-max-bs-decode 8, mamba 48, chunk 4096, NEXTN 3/1/4,
 host KV pool 1,310,720 tokens, priority scheduling). Each arm was its own engine boot, running 1/2/4-stream agent loops (32K–131K contexts,
-think gaps 1–15 s) with client per-token timelines and server per-step logs. Raw data and scripts: `flashnext-modal-bench/results_trough/`.
+think gaps 1–15 s) with client per-token timelines and server per-step logs. Raw data: Modal runs `r20261028tr*` (not published).
 
 **Boot gotcha.** `SGLANG_QSA_HOST_KV_STATS=1` with a 1 s interval made several arms fail at boot with "CUDA graph capture invalidated"
 (the stats thread's GPU→host copy and sync run during capture). With `=0`, every arm booted. This is the same root cause as UPSTREAM-BUG-cuda-graph-capture-invalidated.md / §3.19.
@@ -1671,35 +1670,35 @@ See [docs/HERMES-COMPACTION.md](docs/HERMES-COMPACTION.md). Headlines:
 - A cold summarizer (Hermes today) stalls 26 s in background vs 31–38 s blocking, and uses about 200K more peak KV.
 - `--prefill-decode-interval 8` keeps the other 7 sessions' longest gap at or under 2 s during a cold compaction, vs 24–25 s on base flags.
 
-#### Live production (zeta, passive /metrics, 00:12–00:51 ET)
+#### Live traffic on a 300 W Max-Q card serving other users (passive /metrics, 39-minute window)
 
 - Prefill was active in 83% of seconds, and a request was queued in 64%.
 - Decode ran at 86 tok/s in seconds with prefill vs 510 tok/s in decode-only seconds.
 - There were 108 decode-starved runs: median 7 s, p90 28 s, max 88 s.
 - Prefill tokens outnumbered decode tokens about 41:1 (14.9M vs 365K).
 
-#### Recommendation (proposal, not applied)
+#### Recommendation
 
 - Add `--prefill-decode-interval 8` and keep chunk 4096, mamba 48 and the overlap scheduler on.
 - Effect: 1-stream speed unchanged within noise; worst stalls −70% to −90%; a cold compaction no longer freezes other sessions.
 - Cost: about +27% on a cold 300K prefill, and about −11% per-stream tok/s at 2 busy streams (−2% at 4).
-- Because zeta is prefill-saturated, watch queue time after the change.
+- On a server that is already prefill-saturated, watch queue time after the change.
 - Do not shrink the chunk size, and do not enable mixed chunk.
 - Keep `SGLANG_QSA_HOST_KV_STATS=0`.
 
-### 3.25 Every measured number for the S8-FP8 profile in one place: quality, speed by context, production, bigger pools (2026-10-28)
+### 3.25 Every measured number for the S8-FP8 profile in one place: quality, speed by context, 300 W card, bigger pools (2026-10-28)
 
 This section collects the S8-FP8 measurements that were spread over §3.23, [KV-POOLS.md](KV-POOLS.md)
-and the production lane's notes, and adds the ones that were still open. Three kinds of number
+and the reference deployment's notes, and adds the ones that were still open. Three kinds of number
 appear, and they are labelled on every row:
 
 - `[Modal]`: one RTX PRO 6000 Blackwell **Server Edition** (600 W, PCIe Gen5) on Modal, nothing
   else on the card, temperature 0. Capability numbers.
-- `[production, under live load]`: the production lane, an RTX PRO 6000 Blackwell **Max-Q
+- `[300 W Max-Q, serving other traffic]`: the reference deployment, an RTX PRO 6000 Blackwell **Max-Q
   Workstation Edition** (300 W, Gen4), the sole routed replica, **serving real users during every
   row**. These are "what one client got while other traffic ran", not capability numbers, and the
   load window is given wherever it was recorded.
-- `[production, boot log]`: read from the server's own boot log; not load-sensitive.
+- `[300 W Max-Q, boot log]`: read from the server's own boot log; not load-sensitive.
 
 #### 3.25.1 Quality
 
@@ -1716,9 +1715,9 @@ appear, and they are labelled on every row:
 | Needle retrieval, 9 cases | **9 / 9** at 1.5M and 2M pools; **9 / 9** at the 4M pool | — | `[Modal]` `r20261028kv`, `r20261028p40`, `r20261028ab` | pass |
 | GSM8K, n = 100 | **0.96** (§3.23), **0.97** (1.5M pool), **0.98** (2M pool), **0.97** (4M pool) | — | `[Modal]` | pass |
 | Needle retrieval at 900K with `--context-length 1048576` | **1 / 3** (depths 0.1 and 0.9 came back empty) | — | `[Modal]` `r20261028kv` | **lossy past the trained window**; keep 540K |
-| GSM8K on production | **0.97** (n = 100, 0 errors, 1 truncated, 0 degenerate) | Modal 0.96 | `[production, under live load]`, 1.31M pool | pass; the one cross-card number fair to compare directly |
-| Needles on production | **9 / 9** (131K, 262K, 500K) | — | `[production, under live load]`, 1.31M pool; haystack file `pg2701.txt` differs from the published corpus | pass |
-| 500K needle on production after the 2M-pool restart | **1 / 1**, 67.4 s wall including the cold 500K prefill | — | `[production, under live load]`, 2M pool, n = 1 | smoke test only |
+| GSM8K on the 300 W card | **0.97** (n = 100, 0 errors, 1 truncated, 0 degenerate) | Modal 0.96 | `[300 W Max-Q, serving other traffic]`, 1.31M pool | pass; the one cross-card number fair to compare directly |
+| Needles on the 300 W card | **9 / 9** (131K, 262K, 500K) | — | `[300 W Max-Q, serving other traffic]`, 1.31M pool; haystack file `pg2701.txt` differs from the published corpus | pass |
+| 500K needle on the 300 W card after the 2M-pool restart | **1 / 1**, 67.4 s wall including the cold 500K prefill | — | `[300 W Max-Q, serving other traffic]`, 2M pool, n = 1 | smoke test only |
 
 S8-FP8 is **lossy, not lossless**, and now by two independent instruments: greedy decode diverges
 from BF16 sooner than BF16 diverges from itself, and the token distributions differ by 0.087 nats per
@@ -1730,23 +1729,23 @@ which can rule out only large regressions ([§4.6](#46-statistical-power--what-t
 Single stream, 512 tokens decoded, decode tok/s and time to first token (TTFT). Deep cells are one
 request each (n = 1).
 
-| Prompt | `[Modal]` 1.31M pool (§3.23) | `[Modal]` 1.5M pool | `[Modal]` 2M pool | `[Modal]` 4M pool (A/B container) | `[production, under live load]` 1.31M pool |
+| Prompt | `[Modal]` 1.31M pool (§3.23) | `[Modal]` 1.5M pool | `[Modal]` 2M pool | `[Modal]` 4M pool (A/B container) | `[300 W Max-Q, serving other traffic]` 1.31M pool |
 |---|---|---|---|---|---|
 | 41–300 tokens | 275.1 / — | 284.0 median / 0.08 s | 281.7 median / 0.09 s | 289.0 median / 0.09 s | 154.7 (running 2–3) · 124.4 (queue ≤ 6, TTFT 9.1 s) · 129.8 (running 2–4) |
 | 131,072 | 233.4 / 13.10 s | 243.6 / 14.21 s | 241.0 / 12.18 s | 230.6 / 12.42 s | 43.4 / 14.31 s (running 1–6, queue ≤ 2) |
 | 500,000 | 231.8 / 53.45 s | 227.2 / 52.99 s | 230.9 / 53.16 s | 225.5 / 53.03 s | 1.81 / 76.4 s (running 2–7, queue ≤ 10); re-measured in a quieter window: 12.45 / 63.9 s (running 1–7, queue 0–6) |
 
-Aggregate decode, N short streams (tok/s; Modal = median of rounds, production = better of 2 rounds):
+Aggregate decode, N short streams (tok/s; Modal = median of rounds, 300 W card = better of 2 rounds):
 
-| Streams | `[Modal]` 1.31M | `[Modal]` 1.5M | `[Modal]` 2M | `[Modal]` 4M (A/B container) | `[production, under live load]` |
+| Streams | `[Modal]` 1.31M | `[Modal]` 1.5M | `[Modal]` 2M | `[Modal]` 4M (A/B container) | `[300 W Max-Q, serving other traffic]` |
 |---|---|---|---|---|---|
 | 1 | 274.9 | 273.4 | 273.9 | 273.0 | 134.4 |
 | 2 | 402.8 | 402.1 | 403.2 | 405.3 | 188.2 (other round 60.2) |
 | 4 | 609.3 | 596.3 | 604.5 | 599.4 | 291.0 (other round 86.2) |
 | 8 | 811.2 | 802.7 | 804.9 | 807.7 | 397.9 (other round 359.8) |
 
-The production server's own decode log recorded 325–570 tok/s aggregate with 2–3 live requests
-during that sweep, well above any one benchmark client's share. Production reaches about half of
+The 300 W card's own decode log recorded 325–570 tok/s aggregate with 2–3 live requests
+during that sweep, well above any one benchmark client's share. The 300 W card reaches about half of
 Modal at every stream count; this run cannot separate the 300 W power budget from live-load
 contention, and it does not try to.
 
@@ -1763,22 +1762,22 @@ under concurrency read low):
 | `[Modal]` 4M pool (8-session container, ran slow, §3.25.4) | 209.0 | 324.7 | — | 394.1 | 444.9 (one log sample) | not logged (no steady decode window) |
 
 Speculative decoding accept length: `[Modal]` 3.1–3.3 tokens per step across all pool sizes and
-depths. `[production, under live load]` scraped from live traffic (n = 256): min 1.45, median
-**2.85**, mean 2.79, max 3.92; the previous production config read 2.79–3.34, essentially unchanged.
+depths. `[300 W Max-Q, serving other traffic]` scraped from live traffic (n = 256): min 1.45, median
+**2.85**, mean 2.79, max 3.92; the previous reference config read 2.79–3.34, essentially unchanged.
 Live traffic is not a controlled comparison.
 
-#### 3.25.3 Production boot after the 2M-pool restart
+#### 3.25.3 Boot log on the 300 W card after the 2M-pool restart
 
-`[production, boot log]`, 2026-10-28 06:06 UTC: `max_total_num_tokens=2097152`, context 540,000,
+`[300 W Max-Q, boot log]`, 2026-10-28: `max_total_num_tokens=2097152`, context 540,000,
 host KV **24.00 + 2.00 GiB** pinned, weights **70.99 GB**, **8.97 GB** free GPU after boot (Modal
 predicted 8.97 GB; at 1.31M the same host showed 9.61 GB, again identical to Modal). Restart to
 `/health` 200: 3 min 59 s. GSM8K, the 9-needle set, the depth table and the concurrency sweep have
-**not** been re-measured on production at 2M.
+**not** been re-measured on the 300 W card at 2M.
 
 #### 3.25.4 The 4M pool and eight 500K sessions
 
 The question: can the pool hold **eight** 500K-token sessions at once, and does a 4,194,304-token
-pool cost anything? Config: S8-FP8 with production's flags, `--max-total-tokens 4194304`,
+pool cost anything? Config: S8-FP8 with the reference flags, `--max-total-tokens 4194304`,
 `SGLANG_QSA_HOST_KV_MAX_GB=50` (the guard is per pool and the target pool needs 48 GiB).
 
 `[Modal]` boot log: host KV **48.00 + 4.00 GiB** pinned; `max_total_num_tokens=4194304`;
@@ -1802,9 +1801,9 @@ container read 5–10 % slow across the board, including on short prompts where 
 | Needles (9) / GSM8K (n = 100) | 9 / 9, 0.97 (8-session container) | 9 / 9, 0.98 (§3.25.1) | — |
 
 So 4M costs no measurable speed and 1.83 GB of free GPU, and buys room for eight 500K sessions.
-**On production since 2026-10-28 4:14 AM ET**, together with `--prefill-decode-interval 8`
-([KV-POOLS §4.1](KV-POOLS.md#41-production-boot-at-4194304-tokens-with---prefill-decode-interval-8-2026-10-28)).
-The prediction held: the production boot log shows 48.00 + 4.00 GiB host KV and **7.14 GB** free GPU,
+**Booted on a 300 W Max-Q card serving other traffic**, together with `--prefill-decode-interval 8`
+([KV-POOLS §4.1](KV-POOLS.md#41-boot-at-4194304-tokens-with---prefill-decode-interval-8)).
+The prediction held: that card's boot log shows 48.00 + 4.00 GiB host KV and **7.14 GB** free GPU,
 the same as Modal, as it was at 1.31M and at 2M.
 
 #### 3.25.5 The 4M pool together with `--prefill-decode-interval 8`
@@ -2004,7 +2003,7 @@ The verdict rule:
 
 | Run | Cache hits (warm/late pairs) | Largest cached prefix | Max mean \|Δlogprob\| on shared continuation | Impossible ids | Verdict |
 |---|---|---|---|---|---|
-| Stock engine, production lane (reference) | 4 / 6 | 49,088 tokens | 0.111 | 0 | reference |
+| Stock engine, reference deployment (reference) | 4 / 6 | 49,088 tokens | 0.111 | 0 | reference |
 | This tree, token-map configuration | 4 / 6 | 49,088 tokens | 0.101 (limit 0.334) | 0 | **PASS** |
 
 The two misses in each row are warm repeats that landed before lazy insertion into the cache.
@@ -2055,10 +2054,10 @@ Recorded so this is not mistaken for a finished evaluation.
 | Whether the reference card's 500K empty completion was capacity | **probable, not confirmed** — 500K has not been re-run on the reference card (§3.8a). |
 | A quality gate or accuracy benchmark at any length past 262,144 | **not run.** §3.8 establishes retrieval, recall and short-context equivalence, not accuracy at length. |
 | Reasoning at length beyond n = 2 per cell | **not run.** §3.8c is a signal per cell, not a rate. |
-| Prefix-cache hit rate and TTFT on the production card at 36 slots, under its real workload | **not yet measured.** §3.12 measures only the resulting pool. |
+| Prefix-cache hit rate and TTFT on the reference card at 36 slots, under its real workload | **not yet measured.** §3.12 measures only the resulting pool. |
 | The lowest safe `--mem-fraction-static` for this workload | **still not bracketed.** 0.99 and 0.98 both died (§3.14); 0.97 has ~1.74 GB device-free while serving and has not. Nothing between 0.97 and 0.98 was tried, and no headroom figure is known to be *sufficient* — only that 287 MiB is not. The host-KV cutover (§3.15) and the bounded gather (§3.16) both enlarge the margin at 0.97, which makes the question **less urgent and no more answered**: the bracket was not re-attempted after either change. |
 | How much prefill working set a queue of depth N actually needs | **not measured.** §3.14 shows a 14-deep queue exhausting ~287 MiB of headroom; the relationship to queue depth, chunk size and prompt length was not characterised, so 0.97 is a measured-safe point rather than a derived margin. |
-| Whether the production OOM recurs at 0.97 under a deeper queue | **open.** Peak queue depth on the incident day measured 16; 0.97 has not yet been exercised at that depth. |
+| Whether the reference card's OOM recurs at 0.97 under a deeper queue | **open.** Peak queue depth on the incident day measured 16; 0.97 has not yet been exercised at that depth. |
 | A quality gate at any length past 262,144 | **not run.** Retrieval passes are a capability probe, not a certified operating point. |
 | Wall times for the ~200k and ~300k native-RoPE needle cases | **not recorded** in the run ledger; omitted rather than estimated. |
 | Why the retrained MTP head won on a B200 under plain upstream SGLang (+1.8 % to +3.7 % in all four cells) and was flat on this tree's SM120 fused path (2.1076 vs 2.1079) | **cause not established.** GPU generation and the fused decode path were never isolated from each other. |
@@ -2074,15 +2073,15 @@ Added by the 2026-09-30 cutover (§3.15–§3.18):
 |---|---|
 | Steady-state device-free VRAM on the host-KV configuration | **two readings, still not soaked.** 5,863 MiB at ~6 minutes and **5,631 MiB at ~70 minutes** after boot (§3.15, §3.15e) — stable to within 4 % across that span, against §3.13's 13 h 22 min flat floor of 1,737–1,739 MiB for the on-GPU configuration. Two points are not a soak, but they no longer leave the magnitude open: call it 5.5–5.7 GiB. |
 | Why one main re-prefills every turn at 2 × 500K | **cause not established** (§3.15d). Not capacity: the pool holds 1,310,720 and the two mains need ~1.0M. It alternates between the two mains across turns. |
-| Cross-SKU scaling from the validation card to the production card | **not measured.** Modal is a Server Edition at 600 W on PCIe Gen5; production is a Max-Q at 300 W on Gen4 (§3.15d). Every absolute tok/s in §3.15b belongs to the Server Edition. No factor is published because none was measured. |
+| Cross-SKU scaling from the validation card to the reference card | **not measured.** Modal is a Server Edition at 600 W on PCIe Gen5; the reference card is a Max-Q at 300 W on Gen4 (§3.15d). Every absolute tok/s in §3.15b belongs to the Server Edition. No factor is published because none was measured. |
 | Non-fatal OOM on the **merged ship tree** at any useful sample size | **2 events.** The 39-injection battery ran on the `oom-retract` branch with host KV off; the ship-tree re-run passed with only 2 injections / 2 recoveries (§3.17). Not a comparable sample. |
-| Why the bounded gather showed no peak-VRAM benefit at the production 2 × 250K cell | **cause not established** (§3.16). Both trees measured +1,248 MiB over idle. The micro and needle A/Bs both show the benefit; this cell does not. |
-| Steady-state hot-cache hit rate as a function of workload | **distribution now measured on the production lane, but not as a function of anything.** 103 target-layer and 187 draft samples over 86 minutes: cumulative **0.8112 / 0.8764** over 1.32 × 10¹⁰ and 1.65 × 10⁹ selected tokens, 30-second windows spanning 0.587–0.901 and 0.746–0.940 (§3.15). That **confirms** the earlier single 0.8121 / 0.8774 readings to within 0.001, and the second card's 0.92 cumulative is consistent in order of magnitude. **No sweep over context mix, request length or concurrency**, so the 0.587–0.901 spread has a measured range and no explanation. The first-30-s figure (0.9734) remains an artifact of cumulative counters. |
+| Why the bounded gather showed no peak-VRAM benefit at the reference 2 × 250K cell | **cause not established** (§3.16). Both trees measured +1,248 MiB over idle. The micro and needle A/Bs both show the benefit; this cell does not. |
+| Steady-state hot-cache hit rate as a function of workload | **distribution now measured on the reference deployment, but not as a function of anything.** 103 target-layer and 187 draft samples over 86 minutes: cumulative **0.8112 / 0.8764** over 1.32 × 10¹⁰ and 1.65 × 10⁹ selected tokens, 30-second windows spanning 0.587–0.901 and 0.746–0.940 (§3.15). That **confirms** the earlier single 0.8121 / 0.8774 readings to within 0.001, and the second card's 0.92 cumulative is consistent in order of magnitude. **No sweep over context mix, request length or concurrency**, so the 0.587–0.901 spread has a measured range and no explanation. The first-30-s figure (0.9734) remains an artifact of cumulative counters. |
 | NVMe-versus-array sequential bandwidth | **artifact not retained** (§3.18). Method recorded, result self-asserted, and a second figure for the array (290.6 MB/s) disagrees slightly from a different method. |
 | Host-UVA kernel time under the bounded gather | **did not reproduce.** Run 1 disagrees with runs 2 and 3 by 30–55× in the opposite direction, and reports a different peak (§3.16). Unexplained; no claim made. |
 | A single assembled quality verdict covering both the decode path and retrieval past 262,144 | **not built.** Both legs pass in separate bundles; the composite verdict returns FAIL on a scope rule, not on a measurement (§3.15c). |
-| Whether the host-KV lane survives a deep queue at 0.97 | **not exercised.** The bounded gather removes the transient that killed §3.14's boot, and non-fatal OOM is meant to absorb what is left, but neither has been tested against a 14–26-deep queue on the production card. |
-| Prefix-cache hit rate and TTFT on the production card under its real workload | **partly measured** (§3.21, §3.22): deep prefix hits per minute (0.46 → 2.18 → 4.33 across the three eras) and cold deep-prefill arrivals per hour (158 → 131 → 15). Not yet a per-request hit fraction or a TTFT distribution. §3.15's hot-cache hit rates are a different quantity. |
+| Whether the host-KV lane survives a deep queue at 0.97 | **not exercised.** The bounded gather removes the transient that killed §3.14's boot, and non-fatal OOM is meant to absorb what is left, but neither has been tested against a 14–26-deep queue on the reference card. |
+| Prefix-cache hit rate and TTFT on the reference card under its real workload | **partly measured** (§3.21, §3.22): deep prefix hits per minute (0.46 → 2.18 → 4.33 across the three eras) and cold deep-prefill arrivals per hour (158 → 131 → 15). Not yet a per-request hit fraction or a TTFT distribution. §3.15's hot-cache hit rates are a different quantity. |
 | How much host RAM the pinning phase needs at boot, and under what contention | **not characterised, and the one candidate event was not it.** An earlier revision cited two OOM-killed boots; §3.18a and §3.19 retract that — one was a commanded stop, the other a CUDA-graph capture failure, and `dmesg` records **zero** kernel OOM events. So the host-RAM failure mode remains a reasoned consequence of pinning (§3.18a) with **no measured instance at all**. |
 | Whether `SGLANG_QSA_HOST_KV_CACHE_SETS` 2048 or 4096 is the better trade | **superseded by §3.22**, which A/Bs 4,096 against 16,384 (and set-associative variants) on one card and one script. Original row: **not A/B'd on one boot.** The 0.9734 figure previously cited for 4096 was a first-sample artifact; the steady figure is **0.8214 cumulative over 9.7 × 10⁹ selected tokens** (§3.15). 2048 was reported at ~0.92 for half the VRAM, on a different run and a different card, so the two are not comparable. Neither has been tested against the ~5.5 GiB now free on the card (§3.15e). |
 
@@ -2091,15 +2090,15 @@ Added by the 2026-10-01 analysis (§3.18a, §3.19, §3.20, §3.15e):
 | Item | Status |
 |---|---|
 | Cause of the CUDA-graph capture invalidation at boot | **established** (§3.19 update): the host-KV statistics thread's copy-plus-synchronize invalidates a capture under `capture_error_mode="global"`. Timing, incidence and a 7 / 24 out-of-engine reproduction agree. Mitigation `SGLANG_QSA_HOST_KV_STATS=0`; the fix is not yet in this series. |
-| How often the capture failure recurs | **n = 1 failure in 2 attempts** on production; two later boots (stats on, then off) both captured cleanly. Out of engine, the old reporter invalidates 7 of 24 captures (§3.19 update). An in-engine rate needs a boot loop with stats on, which has been run for only two boots. |
-| Whether the capture failure predates the host-KV cutover | **checked: it does not.** The production log holds exactly one capture invalidation, in the first host-KV boot; no on-GPU boot has one. |
+| How often the capture failure recurs | **n = 1 failure in 2 attempts** on the reference card; two later boots (stats on, then off) both captured cleanly. Out of engine, the old reporter invalidates 7 of 24 captures (§3.19 update). An in-engine rate needs a boot loop with stats on, which has been run for only two boots. |
+| Whether the capture failure predates the host-KV cutover | **checked: it does not.** The reference card's log holds exactly one capture invalidation, in the first host-KV boot; no on-GPU boot has one. |
 | Whether host RAM can actually exhaust at pin time | **no measured instance** (see the row above). The arithmetic is in §3.18a; the event is not. |
 | Why weight-load time varied 130.67 s → 184.70 s on the same NVMe, same shards | **cause not established** (§3.18a). Page cache from the outgoing instance is the obvious candidate and was not instrumented. 1.41× spread, n = 2, so §3.18's 130.67 s should not be treated as repeatable. |
 | A controlled A/B of the concurrency curve across the two pool geometries | **not run** (§3.20). The two curves come from different boots, hours, pool sizes and client mixes. The −4.4 / −7.8 point per-stream shares at concurrency 2 / 3 on the host-KV build are a hypothesis with supporting evidence, not a measured factor. |
 | Whether the host-KV per-stream penalty is PCIe/UVA bandwidth sharing | **not established.** It is what a shared fetch path predicts, and the direction matches. Nothing isolates it from pool size, workload or context length. The instrument that would settle it is a paired same-boot run with `SGLANG_QSA_HOST_KV` toggled, which §3.15b's control did for latency but not for the concurrency curve. |
 | The host-KV concurrency-4 cell | **n = 21, p25 53.6 — not a rate** (§3.20). The lane's concurrency-4 time is almost entirely spent with a non-empty queue, so an uncontended concurrency-4 sample is rare on this workload. |
 | Single-stream host-KV decode, properly bounded | **one boot, 406 samples.** 158.2 median against a 167.5–178.6 pre-cutover range across six boots. The 0.71× figure is retracted (§3.20); "no regression" is **also** not supported. A same-boot toggle would settle it. |
-| Whether a larger `SGLANG_QSA_HOST_KV_CACHE_SETS` buys anything at 0.82 hit | **measured on Modal** (§3.22): 16,384 sets, hit 0.776 → 0.908, step −6.2 % / −7.0 % at 1 / 4 streams, +3.05 GiB. So most misses at 4,096 were capacity misses. **Not yet re-measured on the production card**, which still runs 4,096. |
+| Whether a larger `SGLANG_QSA_HOST_KV_CACHE_SETS` buys anything at 0.82 hit | **measured on Modal** (§3.22): 16,384 sets, hit 0.776 → 0.908, step −6.2 % / −7.0 % at 1 / 4 streams, +3.05 GiB. So most misses at 4,096 were capacity misses. **Not yet re-measured on the reference card**, which still runs 4,096. |
 | Residency-weighted hot-cache allocation instead of fair-share-per-slot | **not implemented, not tested** (§3.15e). Every request slot gets the same 16,384 tokens whether it lives for one turn or holds 500K. |
 | The lowest safe `--mem-fraction-static` **on the host-KV configuration** | **moot, measured** (§3.15e): with `--max-total-tokens` set, 0.94 and 0.97 boot identically on Modal — same pool, same free memory. The fraction does nothing in this mode. |
 | Whether the on-GPU compressed index and the GPU hot cache are two allocations or one | **cannot be distinguished from the boot log** (§3.15e). The two figures are bit-for-bit identical at this pool size and slot count by arithmetic coincidence, and the boot accounting shows only 0.91 GB for the step that would contain both. Needs a device-side allocation trace. |
@@ -2109,6 +2108,6 @@ Added by the 2026-10-28 S8-FP8 profile (§3.23):
 | Item | Status |
 |---|---|
 | KL divergence of S8-FP8 against BF16 | **measured** (§3.25): 0.087 nats/token, top-1 91.8 % vs BF16-vs-BF16 0.005 / 99.3 %. |
-| S8-FP8 on the production Max-Q (300 W, Gen4) | **not measured.** Every §3.23 number is a 600 W Server Edition number; absolute rates on the Max-Q will be lower, by an amount not measured. Live production numbers under load are in §3.25; a controlled (idle-card) production run has not been done. |
-| A same-session A/B of previous production, BF16 cap 8 and S8-FP8 | **not run.** The FP8 arm and the two BF16 arms ran in two Modal sessions on the same day. |
-| Using the VRAM that FP8 frees (larger pool, or more hot-cache sets) | **not measured.** 16,384 sets did not fit next to the production pool; smaller steps were not tried. |
+| S8-FP8 on the 300 W Max-Q Workstation card (PCIe Gen4) | **not measured on an idle card.** Every §3.23 number is a 600 W Server Edition number; absolute rates on the Max-Q are lower, by an amount not measured; relative comparisons should hold. Numbers from a 300 W Max-Q card serving other traffic are in §3.25. |
+| A same-session A/B of previous reference, BF16 cap 8 and S8-FP8 | **not run.** The FP8 arm and the two BF16 arms ran in two Modal sessions on the same day. |
+| Using the VRAM that FP8 frees (larger pool, or more hot-cache sets) | **not measured.** 16,384 sets did not fit next to the 1.31M pool; smaller steps were not tried. |

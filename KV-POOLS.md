@@ -4,8 +4,8 @@ How to raise the KV pool of the S8-FP8 profile ([CONTEXT-PROFILES §4b](CONTEXT-
 past its benchmarked 1,310,720 tokens, what it costs in host RAM and GPU memory, and what it buys.
 All numbers are measured on one RTX PRO 6000 Blackwell Server Edition (600 W) on Modal, temperature 0,
 S8-FP8 flags with `--context-length 540000`, `--max-mamba-cache-size 48`, `--max-running-requests 8`,
-host QSA KV and 4,096 hot-cache sets (runs `r20261028kv`, 2026-10-28), plus one live production
-restart at 2,097,152 tokens. No code change is needed: this is flags and one environment variable.
+host QSA KV and 4,096 hot-cache sets (runs `r20261028kv`, 2026-10-28), plus boot checks on a 300 W
+Max-Q card serving other traffic at 2,097,152 and 4,194,304 tokens. No code change is needed: this is flags and one environment variable.
 
 ## 1. Short version
 
@@ -14,7 +14,7 @@ restart at 2,097,152 tokens. No code change is needed: this is flags and one env
 | 1,310,720 (S8-FP8 default) | 24 (default 100 is fine too) | 15.00 + 1.25 GiB | 9.61 GB | 2 | baseline |
 | 1,572,864 | 24 | 18.00 + 1.50 GiB | 9.37 GB | 3 | cautious middle step |
 | **2,097,152 (recommended)** | **28** | **24.00 + 2.00 GiB** | **8.97 GB** | **4** | several long agents at once |
-| 4,194,304 | 50 | 48.00 + 4.00 GiB | 7.14 GB | 8 | eight long agents at once (booted in production 2026-10-28 4:14 AM ET with the interval flag; boot log matched Modal) |
+| 4,194,304 | 50 | 48.00 + 4.00 GiB | 7.14 GB | 8 | eight long agents at once (boot on a 300 W Max-Q card matched Modal) |
 
 The pool buys **room, not speed**. Decode speed is the same at every size measured, 1.31M to 4M (section 3). What
 changes is how many long sessions stay resident: at 1.31M a third 500K session evicts the others and
@@ -78,22 +78,22 @@ and 55–64 % with two 900K sessions at once (150–280 host bytes read per atte
 uncached). The hot cache is per request slot, so **pool size does not change the hit rate**; keep
 4,096 sets (16,384 does not boot with this profile, see §4b).
 
-## 4. Production verification (2,097,152 tokens, 2026-10-28)
+## 4. Check on a 300 W Max-Q card serving other traffic
 
-Applied as a systemd drop-in on the production RTX PRO 6000 host:
+At 2,097,152 tokens, applied as a systemd drop-in on an RTX PRO 6000 Max-Q (300 W) card that was serving other traffic:
 
 - Restart to `/health` 200: **3 min 59 s**. No restarts since (`NRestarts=0`).
 - Boot log: `max_total_num_tokens=2097152`, host KV **24.00 + 2.00 GiB**, **8.97 GB** free GPU after
-  boot (Modal: 8.97 GB; at 1.31M the same host showed 9.61 GB, again identical to Modal), weights 70.99 GB.
+  boot (Modal: 8.97 GB; at 1.31M the same card showed 9.61 GB, again identical to Modal), weights 70.99 GB.
 - `nvidia-smi` 90,688 / 97,887 MiB; 377 GiB host RAM still available.
 - Sanity: short chat OK; a 500K-token needle 1/1 in 67.4 s.
 
-### 4.1 Production boot at 4,194,304 tokens with `--prefill-decode-interval 8` (2026-10-28)
+### 4.1 Boot at 4,194,304 tokens with `--prefill-decode-interval 8`
 
 Armed as `60-kvpool.conf` (4M, replacing the 2M file, which is kept as `60-kvpool.conf.bak-2m`) plus
-`70-pdi8.conf`. Boot log at 4:14 AM ET: host KV **48.00 + 4.00 GiB**, `max_total_num_tokens=4194304`,
+`70-pdi8.conf`, same card. Boot log: host KV **48.00 + 4.00 GiB**, `max_total_num_tokens=4194304`,
 **7.14 GB** free GPU after boot (Modal predicted 7.14 GB). `/health` 200, `NRestarts=0`. Quality and
-long-session checks on production are reported separately as they land.
+long-session checks on this card at 4M have not been re-run yet.
 
 ## 5. 1M context is lossy — keep 540K
 

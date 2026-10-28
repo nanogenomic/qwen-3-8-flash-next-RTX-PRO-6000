@@ -1,7 +1,7 @@
 # 60-kvpool-2m.conf.staged -- OPTIONAL (recommended for up to four long sessions). 2,097,152-token pool.
 # Inert while named *.staged. To arm, rename to 60-kvpool.conf (replacing any other 60-kvpool.conf).
-# Modal r20261028kv + production restart 2026-10-28: four 500K sessions stay cached, decode unchanged,
-# needles 9/9, GSM8K 0.98, 8.97 GB free GPU after boot (same on Modal and production).
+# Modal r20261028kv + a 300 W Max-Q card serving other traffic: four 500K sessions stay cached, decode unchanged,
+# needles 9/9, GSM8K 0.98, 8.97 GB free GPU after boot (same on Modal and on the 300 W card).
 # Host KV pinned 24.00 + 2.00 GiB, so the per-pool guard rises to 28 GiB.
 # See KV-POOLS.md section 8. Rollback: remove 60-kvpool.conf, daemon-reload, restart.
 [Service]

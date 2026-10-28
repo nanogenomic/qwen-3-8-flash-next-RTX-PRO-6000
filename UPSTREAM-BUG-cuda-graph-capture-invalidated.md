@@ -5,7 +5,7 @@
 > plus `synchronize()` every 30 s from a side thread, and under PyTorch's default
 > `capture_error_mode="global"` that invalidates any CUDA-graph capture in flight. Timing (a tick
 > due at 23:28:57; capture began 23:28:56 and died 23:28:58), incidence (the only capture
-> invalidation in the whole production log, and the reporter exists only with a host-resident
+> invalidation in the reference card's whole serving log, and the reporter exists only with a host-resident
 > pool) and an out-of-engine reproduction (7 of 24 captures fail with that thread, 0 of 24 under
 > `"relaxed"`, without the thread, or with the fixed reporter) agree. Mitigation:
 > `SGLANG_QSA_HOST_KV_STATS=0`. The fix — counters published by the forward thread into a pinned

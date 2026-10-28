@@ -154,7 +154,7 @@ indexer MQA logits by query rows under a free-memory budget", #40854), gated on
 that one — it bounds a different allocation in a different backend — but it is the same class of
 defect, and the DSA precedent is why it is worth reporting rather than carrying locally.
 
-⚠️ **One honest negative.** At the production-shaped cell — a 2 × 250K cold prefill on the host-KV
+⚠️ **One honest negative.** At the reference-workload cell — a 2 × 250K cold prefill on the host-KV
 configuration — both trees measured the **same** non-pool peak, +1,248 MiB over idle. The micro and
 needle results are solid; this cell shows no benefit, and why is not established.
 
@@ -328,8 +328,8 @@ needed.
 
 ### 3.1 KV pool — what the +15.7 % is made of
 
-`[measured]` Stock **241,728** tokens → **279,680** on the test card → **331,456** in
-production. The production figure is larger only because that card carried less foreign VRAM.
+`[measured]` Stock **241,728** tokens → **279,680** on the test card → **331,456** on the
+reference card. The reference-card figure is larger only because that card carried less foreign VRAM.
 Contributions, all measured:
 
 - `--mem-fraction-static 0.98` instead of 0.958. ⚠ **0.98 is measured to be too tight to run
@@ -366,7 +366,7 @@ measurements are what qualify it.
 
 | | Value |
 |---|---|
-| KV pool | **542,912 tokens** on the test card (2.25× stock). On the production card, **643,456** — the largest pool measured on this hardware. The multiplier is **1.941× on both**, which is why it is a property of the dtype and not of one card's spare VRAM. |
+| KV pool | **542,912 tokens** on the test card (2.25× stock). On the reference card, **643,456** — the largest pool measured on this hardware. The multiplier is **1.941× on both**, which is why it is a property of the dtype and not of one card's spare VRAM. |
 | Single-stream, short context | 159.8 tok/s, **−4.0 %** vs bf16 KV on this tree |
 | Single-stream @250k | **145.8 tok/s** |
 | 4-concurrent aggregate | 411.4 tok/s |
@@ -454,7 +454,7 @@ Host RAM floor during the run: **63 GiB MemAvailable**. Host↔GPU transfer meas
 above the derived window needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`. Full detail in
 [BENCHMARKS §3.8](BENCHMARKS.md#38-long-context-suite--complete-second-card).
 
-Measured on a second card — RTX PRO 6000 Server Edition, 600 W, running a replica of the production
+Measured on a second card — RTX PRO 6000 Server Edition, 600 W, running a replica of the reference
 configuration. Pass/fail and ratios transfer to the 300 W reference card; tok/s and pool sizes do not.
 
 - **Retrieval 60 / 60**, no position ceiling found: 36 / 36 at 300–470K (3 depths × 3 trials), 8 / 8
@@ -527,7 +527,7 @@ pool at 2,097,152 fp8 tokens and dies at startup with a named error rather than 
 OOM killer.
 
 **⛔ The new failure mode is host RAM, and pinned pages are neither swappable nor reclaimable.** The
-production cutover was **OOM-killed on two boots** before the third came up, on a 251 GiB host, in
+reference card's cutover was **OOM-killed on two boots** before the third came up, on a 251 GiB host, in
 the pinning phase after the weights had already loaded. A host-resident KV pool converts a VRAM
 budget into a host-RAM budget; budget it with the care §3.13 applies to VRAM, including the page
 cache the previous instance left behind.
@@ -743,7 +743,7 @@ four cells** (stock is 4 reps; the in-distribution T=1 cell is n=240 at concurre
 | In-distribution, T=0 | 2.904 [2.890–2.921] | 2.971, 2.989 | **+2.6 %** |
 
 `[measured]` **On this tree's fused / SM120 path it was flat.** Same eval-split probe, same
-production configuration, only the checkpoint changed:
+reference configuration, only the checkpoint changed:
 
 | | Stock | v3 |
 |---|---|---|
@@ -910,7 +910,7 @@ when linearizing onto the upstream base.
 
 **Patches `0033`–`0038` are the 2026-09-30 group** and they are a *subset* of that day's
 development commits, not all of it. Five engine commits and one test commit are published; the
-deployment harness that was developed alongside them — lane launchers, a production-config
+deployment harness that was developed alongside them — lane launchers, a reference-config
 driver, a Modal replica suite and the long-context needle drivers — is **deliberately not
 published**, for the same reason stated in §8: it encodes one deployment's model pins, paths,
 addresses and lane policy, and it would be a liability to read and useless to run. The

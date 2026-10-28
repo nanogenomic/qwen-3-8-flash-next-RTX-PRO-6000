@@ -23,11 +23,10 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 >
 > - **On-GPU KV** (451,264-token pool): fastest per step; one agent up to ~400K.
 > - **Host-RAM KV pool, 1,310,720 tokens** (the repo default): two 500K sessions stay cached. Costs
->   13–19 % per decode step against on-GPU KV at production depths (+2 % below 50K context).
-> - **2M pool** (2,097,152 tokens): four 500K sessions cached. Same decode speed as 1.31M. Ran in
->   production from 2:06 AM ET on 2026-10-28.
+>   13–19 % per decode step against on-GPU KV at the reference card's depths (+2 % below 50K context).
+> - **2M pool** (2,097,152 tokens): four 500K sessions cached. Same decode speed as 1.31M.
 > - **4M pool** (4,194,304 tokens): eight 500K sessions cached. Decode speed within noise of 2M, 1.83 GB
->   less free GPU. Booted in production at 4:14 AM ET on 2026-10-28, together with the flag below.
+>   less free GPU.
 > - **Optional `--prefill-decode-interval 8`**: a long prefill in one session no longer freezes the
 >   others (worst 4-stream stall 7.79 s → 0.76 s), for +27 % on a cold 300K prefill and −11 % per stream
 >   at 2 busy streams.
@@ -49,14 +48,32 @@ from 4 to 8. The MoE experts stay NVFP4 and the KV cache stays fp8, exactly as b
 Launch block: [CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams).
 Full tables: [BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27).
 **Every measured S8-FP8 number in one place** (KL vs BF16 0.087 nats/token and 91.8 % top-1; decode-path
-lossless check FAIL; needles 20/20; speed by context; production under live load; 2M and 4M pools):
-[BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-production-bigger-pools-2026-10-28).
+lossless check FAIL; needles 20/20; speed by context; a 300 W card serving other traffic; 2M and 4M pools):
+[BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-300-w-card-bigger-pools-2026-10-28).
 
-`[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` Same host-KV pool (1,310,720
+**Current numbers for this profile** (latest runs, 2026-10-28; [BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-300-w-card-bigger-pools-2026-10-28),
+[KV-POOLS §8](KV-POOLS.md#8-options-2m-4m-and-the-interval-flag)). `[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]`
+unless the column says otherwise:
+
+| | 1.31M pool (default) | 2M pool | 4M pool | 300 W Max-Q card serving other traffic, 1.31M pool |
+|---|---|---|---|---|
+| Aggregate decode, 1 / 2 / 4 / 8 short streams (tok/s) | 274.9 / 402.8 / 609.3 / 811.2 | 273.9 / 403.2 / 604.5 / 804.9 | 273.0 / 405.3 / 599.4 / 807.7 | 134.4 / 188.2 / 291.0 / 397.9 (shares the card with live traffic) |
+| Single stream at 131,072 tokens: decode / first token | 233.4 tok/s / 13.10 s | 241.0 / 12.18 s | 230.6 / 12.42 s | 43.4 / 14.31 s (under load) |
+| Single stream at 500,000 tokens: decode / first token | 231.8 / 53.45 s | 230.9 / 53.16 s | 225.5 / 53.03 s | 12.45 / 63.9 s (quieter window) |
+| 500K sessions kept cached | 2 | 4 | 8 | — |
+| Free GPU after boot | 9.61 GB | 8.97 GB | 7.14 GB | same as Modal at 1.31M and 2M |
+| Needles / GSM8K (n = 100) | 20/20 (65K–500K); 0.96 | 9/9; 0.98 | 9/9; 0.97 | 9/9; 0.97 |
+
+Quality for all columns: KL divergence against BF16 **0.087 nats/token**, top-1 agreement **91.8 %**
+(BF16 against itself: 0.005, 99.3 %). Optional `--prefill-decode-interval 8` on the 4M pool: GSM8K 0.98,
+worst 4-stream stall 7.79 s → 0.76 s, cold 300K prefill +27 % ([KV-POOLS §8.2](KV-POOLS.md#82-the-optional---prefill-decode-interval-8-flag)).
+
+**Same-day comparison against the previous configuration** (2026-10-27, [BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27);
+all three columns from that session, so they compare fairly with each other). `[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` Same host-KV pool (1,310,720
 tokens), same 540K context, same NEXTN 3/1/4 speculation with the hot-24k token map. Aggregate
 tok/s at 1 / 2 / 4 / 8 concurrent streams, mean of 2 rounds:
 
-| Streams | Previous production config (cap 4, BF16 dense) | Same cap-8 config, BF16 dense | **S8-FP8** | vs previous production | vs BF16 cap 8 |
+| Streams | Previous reference config (cap 4, BF16 dense) | Same cap-8 config, BF16 dense | **S8-FP8** | vs previous reference | vs BF16 cap 8 |
 |---|---|---|---|---|---|
 | 1 | 228.3 | 229.2 | **276.8** | **+21 %** | +21 % |
 | 2 | 342.2 | 342.3 | **400.4** | **+17 %** | +17 % |
@@ -69,7 +86,7 @@ weights add +3.3 % at 8 streams; their gain is concentrated at 1–4 streams.
 
 Single stream, by context depth:
 
-| Context | Previous production | **S8-FP8** | Δ |
+| Context | Previous reference | **S8-FP8** | Δ |
 |---|---|---|---|
 | short (41-token prompt, median of 3) | 233.1 tok/s | **275.1 tok/s** | +18 % |
 | 131,063 tokens | 197.2 | **233.4** | +18 % |
@@ -80,14 +97,15 @@ Single stream, by context depth:
 - **It is slightly lossy.** Outputs are not token-identical to BF16. The decode-path
   equivalence test **fails** its lossless claim: median greedy agreement with the baseline is
   31 / 30 tokens at concurrency 1 / 4, against a baseline-vs-baseline noise floor of 49 / 45.
-  Task-level quality held: needle retrieval **9 / 9** at 131K, 262K and 500K; GSM8K **0.96**
-  (n = 100); **0 / 192** degenerate outputs; prefix-cache probe **PASS** with 0 errors. A
-  KL-divergence measurement against BF16 is pending.
+  KL divergence against BF16 is **0.087 nats/token** with **91.8 %** top-1 agreement (BF16 against
+  itself: 0.005, 99.3 %). Task-level quality held: needle retrieval **20 / 20** at 65K–500K; GSM8K
+  **0.96–0.98** (n = 100, across runs); **0 / 192** degenerate outputs; prefix-cache probe **PASS** with 0 errors.
 - **Prefill is slower.** 500K-token time to first token is **53.5 s**, against **47.8 s** for the
-  same cap-8 shape in BF16 (and 70.6 s for the previous production run). 131K: 13.1 s vs 11.1 s.
-- **Not yet measured on the production card.** These are Server Edition (600 W) numbers. The
-  production card is a 300 W Max-Q on PCIe Gen4, where absolute numbers will be lower. Live
-  numbers from the production lane will follow in a later update.
+  same cap-8 shape in BF16 (and 70.6 s for the previous reference run). 131K: 13.1 s vs 11.1 s.
+- **Card.** Measured on RTX PRO 6000 Server Edition (600 W). On the 300 W Max-Q Workstation card
+  (PCIe Gen4) absolute numbers are lower; relative comparisons should hold. Numbers from a 300 W Max-Q
+  card serving other traffic are in the table above and in [BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-300-w-card-bigger-pools-2026-10-28);
+  an idle-card run on the 300 W part has not been done.
 
 Two of the four new patches are **not** env-gated, unlike the rest of this tree: the QSA indexer
 split-K (`0040`, `SGLANG_QSA_MQA_SPLITK` defaults to `auto`; bit-identical to the unsplit
@@ -103,23 +121,43 @@ indexer and the mamba admission fix are ports of **Lesilva**'s patches 0003 and 
 
 ## Headline measured results
 
+**Current best configuration: S8-FP8** (8-bit dense weights, NEXTN 3/1/4 with the hot-24k map,
+8 running requests, CUDA graphs to batch 8, 48 mamba slots, host-RAM KV). Latest measured, Modal
+600 W Server Edition ([BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-300-w-card-bigger-pools-2026-10-28)):
+
+| Metric | S8-FP8 |
+|---|---|
+| Single stream, short prompt | **274.9 tok/s** (1.31M pool); 273.0 at 4M |
+| Aggregate, 8 streams | **811.2 tok/s** (1.31M pool); 807.7 at 4M |
+| Single stream at 500,000 tokens | **231.8 tok/s**, first token 53.45 s |
+| KV pool options | 1,310,720 (default), 2,097,152 (four 500K sessions cached), 4,194,304 (eight) |
+| Quality vs BF16 | lossy: KL 0.087 nats/token, top-1 91.8 %; needles 20/20; GSM8K 0.96–0.98 |
+
+The table below is **historical**: the earlier lossless build (BF16 dense, 4 running requests,
+2026-09) against the stock engine, on the 300 W Max-Q card. It is kept because it is the
+cross-engine comparison; its absolute speeds are superseded by the S8-FP8 table above.
+
 Against **the same model on the stock engine** (SGLang PR #36497 @`73a255206f`) on an
-identical card. Temperature 0. The stock figures are the production lane's own **logged**
+identical card. Temperature 0. The stock figures are the reference deployment's own **logged**
 rates; this tree's are single measurement sweeps on a dedicated card. See the noise band
 before reading any single-stream difference under ~6 % as real, and BENCHMARKS.md §1.2 for
 why this is a cross-engine comparison rather than a single-variable A/B.
 
-| Metric | Stock engine | This tree (all lossless levers on) | Δ |
+| Metric (earlier build, superseded) | Stock engine | This tree (all lossless levers on) | Δ |
 |---|---|---|---|
 | Single-stream, short context | 138.8 tok/s | **166.4 tok/s** | **+19.9 %** |
 | Single-stream peak (@325 tokens) | — | 180.5 tok/s | — |
 | 4-concurrent aggregate | 351 tok/s | **413.9 tok/s** | **+17.9 %** |
 | KV pool (test card) | 241,728 tokens | **279,680 tokens** | +15.7 % |
-| KV pool (production card, less foreign VRAM resident) | 241,728 tokens | **331,456 tokens** | +37 % |
-| KV pool (production card, fp8 + **host-resident KV**) | 241,728 tokens | **1,310,720 tokens** | **5.4×** |
+| KV pool (reference card, less foreign VRAM resident) | 241,728 tokens | **331,456 tokens** | +37 % |
+| KV pool (reference card, fp8 + **host-resident KV**) | 241,728 tokens | **1,310,720 tokens** | **5.4×** |
 | Per-token latency, 325 → 250k context | grows with depth | 14.7 → 15.4 ms | +4.5 % over 770× context |
 
 ### Single-stream throughput across the full context range
+
+**Historical (earlier BF16 builds, 2026-09; superseded by [BENCHMARKS §3.25.2](BENCHMARKS.md#3252-speed-by-context)).**
+On the current S8-FP8 profile, single stream: 275.1 tok/s short, 233.4 at 131K, 231.8 at 500K
+(Modal 600 W).
 
 `[measured]` Decode speed on this card is **near-flat in context depth** — the single largest
 qualitative change versus the older engine, where per-token cost grew with depth. Per-token
@@ -142,8 +180,8 @@ is interpolated.
 All tok/s, temperature 0, single stream.
 
 **Read the "not swept" cells correctly — they are a gap in the measurement, not a limit of the
-build.** The shipping bf16-KV configuration holds a **279,680-token pool** (331,456 in
-production), so it can serve well past 98k; its sweep simply used harness cells at 4k / 48.6k /
+build.** The shipping bf16-KV configuration holds a **279,680-token pool** (331,456 on the
+reference card), so it can serve well past 98k; its sweep simply used harness cells at 4k / 48.6k /
 95.4k and never went deeper. **A deep single-stream sweep on the exact shipping configuration
 was not run** — it is listed as an open item in [BENCHMARKS.md §6](BENCHMARKS.md#6-open-measurements).
 What the deeper rows do establish is that the *engine* sustains 141–157 tok/s out to 900k.
@@ -185,7 +223,7 @@ and the open gaps. No strict-mode (≤ 2-point) verdict was issued. The harness 
 
 | | Value |
 |---|---|
-| KV pool | **542,912 tokens** on the test card (2.25× stock); **643,456** on the production card — the largest measured on this hardware |
+| KV pool | **542,912 tokens** on the test card (2.25× stock); **643,456** on the reference card — the largest measured on this hardware |
 | Single-stream, short context | 159.8 tok/s (−4.0 % vs bf16 KV here) |
 | Single-stream @250k context | **145.8 tok/s** |
 | 4-concurrent aggregate | 411.4 tok/s |
@@ -209,11 +247,11 @@ into a 36-slot pool and pushes out every other conversation's turn-boundary chec
 stays resident but unusable, the next turn re-prefills everything, and two long agents fall into
 a re-prefill ping-pong. Nothing errors. The cap keeps only the 2 deepest checkpoints per path.
 
-| | cap unlimited (production before) | `--mamba-max-states-per-path 2` |
+| | cap unlimited (before) | `--mamba-max-states-per-path 2` |
 |---|---|---|
-| Two mains at 300K / 330K plus a cold subagent per round — controlled A/B on Modal, production replica | **0 / 10** turns cached, **31–37 s** per turn | **10 / 10** cached, **0.7–0.85 s** per turn |
-| Production card, cold deep-prefill arrivals per hour | 131 | **15** |
-| Production card, new prefill tokens per minute | 347K | **70K** |
+| Two mains at 300K / 330K plus a cold subagent per round — controlled A/B on Modal, reference-configuration replica | **0 / 10** turns cached, **31–37 s** per turn | **10 / 10** cached, **0.7–0.85 s** per turn |
+| Reference card, cold deep-prefill arrivals per hour | 131 | **15** |
+| Reference card, new prefill tokens per minute | 347K | **70K** |
 
 **Do not lower `--max-mamba-cache-size` to reclaim VRAM**: the logged `mamba usage` excludes
 checkpoints held by the cache, so the pool looks mostly empty when it is full (≤ 3 of 36 free in
@@ -288,7 +326,7 @@ needs `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
 > **Where these were measured.** Everything in this section and the one above was measured on an
 > **RTX PRO 6000 Blackwell Server Edition, 600 W, driver 580.95.05** — same SM120 architecture as the
 > reference card, but not the **300 W Max-Q, driver 610.43.02** that every other number in this
-> repository comes from. It ran a replica of the production configuration: this tree's final
+> repository comes from. It ran a replica of the reference configuration: this tree's final
 > build, fp8 KV, both fuse levers, `sm120gemv`, NEXTN with the stock draft head. **Pass/fail
 > results and same-boot ratios transfer to the reference card. Absolute tok/s, TTFT and pool
 > sizes do not**, and none of them appears in any throughput table here.
@@ -368,7 +406,7 @@ numbers with thinking off.
 
 ### Decode speed is flat in context; the cost of long context is prefill
 
-`[second card, relative only]` Single stream, production configuration, 540K declaration, 2 reps,
+`[second card, relative only]` Single stream, reference configuration, 540K declaration, 2 reps,
 first request discarded:
 
 - **Decode is flat from 4K to 400K** — 152–174 tok/s per stream (median), with 400K at 0.95–1.0× of
@@ -398,17 +436,19 @@ greedy completion.
 
 ## Recommended configuration
 
-These are the conclusions of the suite, measured on the second card and read across by ratio:
+These are the conclusions of the suite, measured on the second card and read across by ratio. Rows
+updated for the current S8-FP8 profile say so; for its full launch line see
+[CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams) and §4c:
 
 | Setting | Recommendation | Why |
 |---|---|---|
 | `--mem-fraction-static` | **0.97**, not 0.98 | 0.98 left 287 MiB of device-free VRAM and died in prefill under a 14-deep queue; 0.97 leaves ~1.74 GB. Costs 71,616 pool tokens |
 | `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
 | Per-request window to advertise | **~400K (393,216)** on a shared card with an on-GPU pool; **two concurrent 250–300K mains** once the pool is host-resident at 1.31M; four 500K sessions at 2M, eight at 4M ([KV-POOLS](KV-POOLS.md)) | Where the pool binds. At 451,264 one ~400K request needs most of the pool, so gate it as exclusive use. At 1,310,720 it stops being the constraint — see below |
-| `--max-mamba-cache-size` | **36** at 4 running requests — **do not lower it** | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations. The logged `mamba usage` makes it look over-provisioned; it is not |
+| `--max-mamba-cache-size` | **48** at 8 running requests on S8-FP8 (needs patch `0041`); **36** at 4 on earlier builds — **do not go below these** | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations. The logged `mamba usage` makes it look over-provisioned; it is not |
 | `--mamba-max-states-per-path` | **2** whenever more than one long conversation shares the card | Two 300K+ mains: 0/10 → 10/10 turns cached, 31–37 s → 0.7–0.85 s per turn ([§3.21](BENCHMARKS.md#321-the-mamba-checkpoint-path-cap--the-flag-that-makes-multi-lane-high-context-work)). Upstream flag, no VRAM. Not 1 |
-| `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
-| `--enable-priority-scheduling` | only **if fan-out grows past 4** — and set `--default-priority-value` | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
+| `--max-running-requests` | **8** on S8-FP8 (with `--cuda-graph-max-bs-decode 8`); 4 on earlier BF16 builds | S8-FP8: 274.9 → 811.2 tok/s aggregate from 1 to 8 streams ([§3.25](BENCHMARKS.md#3252-speed-by-context)). Earlier BF16 builds: throughput barely rose past 4 and each extra stream cost ~29K pool |
+| `--enable-priority-scheduling` | **on** in S8-FP8 (with `--default-priority-value 0 --radix-eviction-policy priority`); on earlier builds only if fan-out grew past 4 | Cuts the main agent's time-to-first-token 4.7× under saturation; see the caveat |
 | `--max-queued-requests` | **64**, never unbounded | Unset is unbounded. That is how the 2026-09-30 OOM accumulated a 14-deep queue and ~1.49 M pending tokens. At 4 running requests, 64 is 16 batches of runway; over the cap the server returns an error, so the client sees backpressure instead of a silent multi-minute wait |
 | `--crash-dump-folder` | **set it** | The 16:44 and 16:45 deaths left a traceback and no request mix. Costs nothing until something dies |
 | Model weights | **on NVMe, not spinning disk** | Boot 563 s → 285 s measured; weight load 449 s → 151 s |
@@ -421,12 +461,12 @@ while serving. Later the same day it was cut over to the **host-resident KV pool
 what it runs now.
 
 Both pool figures came out above a projection of ~420K made earlier from the *test* card's 519,040;
-the production card carries less foreign VRAM. Note the direction of travel: every pool number in
+the reference card carries less foreign VRAM. Note the direction of travel: every pool number in
 this repository is specific to one card's spare memory, and the headroom you must leave is not.
 
 ### The pool is no longer the binding constraint: host-resident KV
 
-`[measured, production card, 2026-09-30 23:34Z]` The table above recommends advertising ~400K per
+`[measured, reference card, 2026-09-30 23:34Z]` The table above recommends advertising ~400K per
 request because that is where a 451,264-token pool binds. **Moving the KV pool into pinned host RAM
 changes that number by 2.9×**, for no VRAM at all — it gives some back — and it is what the
 reference deployment now serves on:
@@ -572,7 +612,12 @@ git am /path/to/this/patches/0*.patch
 
 ### Run it
 
-This is the configuration the headline results were measured on, transcribed from the reference
+> **For the current best configuration (S8-FP8, 8 streams, host-RAM KV with a 1.31M, 2M or 4M
+> pool), use [CONTEXT-PROFILES §4b/§4c](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams)
+> or `POOL=2m ./ops/examples/kv-pools/launch-s8fp8-kvpool.sh`.** The block below is the earlier
+> lossless build's command (historical).
+
+This is the configuration the earlier headline results were measured on, transcribed from the reference
 deployment's own service unit rather than reconstructed, **with one deliberate change: it shows
 `--mem-fraction-static 0.97`, not the 0.98 the benchmarks ran at.** 0.98 later killed the lane with
 a runtime CUDA OOM and is not safe to copy — see
@@ -760,7 +805,7 @@ for prefill under a deep queue.**
 
 #### The fix, and what it actually costs
 
-`[measured on the production card]` Four configurations, each read from that boot's own log:
+`[measured on the reference card]` Four configurations, each read from that boot's own log:
 
 | `--mem-fraction-static` | Slots | Declared ctx | KV pool | Boot `available_gpu_mem` | Device-free while serving |
 |---|---|---|---|---|---|
@@ -845,7 +890,7 @@ env-gated.
 
 **⛔ The one cell where it did not show: a 2 × 250K cold prefill on the host-KV configuration
 measured the same non-pool peak on both trees, +1,248 MiB over idle.** The micro and needle results
-are real and reproducible, and the cell that most resembles the production workload saw no
+are real and reproducible, and the cell that most resembles the reference workload saw no
 difference. Why is not established. Full tables, the two cells that get marginally worse, and one
 host-path result that did not reproduce:
 [BENCHMARKS §3.16](BENCHMARKS.md#316-bounded-qsa-prefill-gather--the-transient-that-scaled-with-context).
@@ -1019,8 +1064,8 @@ count, including 4. The content moved it, not the batch size.
 
 > **⛔ The interior peak in that table is at 6 streams, and it does not help you pick a cap at 4.**
 > The table above is a synthetic sweep on the second card, up to 12 streams, and it does show
-> aggregate turning over between 6 and 8. **Below 4 — the range the production card actually runs in
-> — there is no interior maximum at all.** On the production lane's own traffic, aggregate decode
+> aggregate turning over between 6 and 8. **Below 4 — the range the reference card actually runs in
+> — there is no interior maximum at all.** On the reference deployment's own traffic, aggregate decode
 > rises monotonically through concurrency 3 on both pool geometries: 173.9 → 272.3 → 336.6 → 361.8
 > tok/s on the on-GPU pool, and 158.2 → 233.7 → 269.1 on the host-resident pool, while a single
 > lane keeps only 78 % / 65 % / 52 % and 74 % / 57 % of its solo rate respectively. The two results
@@ -1086,7 +1131,7 @@ confirmations on cards with different amounts of foreign VRAM resident**:
 | Card | bf16 pool | fp8 pool | Ratio |
 |---|---|---|---|
 | Test card | 279,680 | 542,912 | **1.941×** |
-| Production card (read from `/get_server_info` at 18:31Z) | 331,456 | **643,456** | **1.941×** |
+| Reference card (read from `/get_server_info` at 18:31Z) | 331,456 | **643,456** | **1.941×** |
 
 Agreeing to three decimal places across different occupancy is worth stating plainly: **the
 1.94× is a property of the dtype change, not of one card's spare memory.** **643,456 tokens is
@@ -1119,7 +1164,7 @@ agreement with a bf16 baseline matters, it is not.
 
 **An independent check that fp8 does not cost much single-stream throughput in practice.**
 `[measured, live, 18:31Z]` Three sequential 512-token greedy completions of the same prompt
-through the serving router on the production card after warm-up: **175.3 / 183.3 / 173.1 tok/s**
+through the serving router on the reference card after warm-up: **175.3 / 183.3 / 173.1 tok/s**
 (mean ~177). These are **router-path chat completions, not harness cells** — different prompt,
 different path, different cell definition — so they are **not** directly comparable to the sweep
 numbers in [BENCHMARKS.md](BENCHMARKS.md). They are a sanity check, and they are consistent with

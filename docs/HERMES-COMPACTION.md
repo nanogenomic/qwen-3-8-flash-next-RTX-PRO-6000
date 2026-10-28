@@ -2,11 +2,11 @@
 
 Status: proposal only. Hermes was not modified. Measured 2026-10-28 (ET) on Modal, 1× RTX PRO 6000,
 S8-FP8 profile (max-running 8, chunk 4096, mamba 48, NEXTN 3/1/4, host KV pool 1,310,720 tokens).
-Raw data: `flashnext-modal-bench/results_trough/r20261028tr/hm_*`. Benchmark detail: BENCHMARKS.md §3.24.
+Raw data: Modal run `r20261028tr`. Benchmark detail: BENCHMARKS.md §3.24.
 
 ## Scenario
 
-There are 8 sessions on one server, matching 4 panes × 2 workers. One Hermes session (H) sits at about 250K tokens and
+There are 8 sessions on one server, matching 4 clients × 2 workers. One Hermes session (H) sits at about 250K tokens and
 hits its compaction threshold. The other 7 run agent loops at 131K, 65K and 5× 32K contexts, with think gaps of 1–15 s.
 
 - **Blocking (today's behaviour):** H stops, the summarizer runs, then H resumes on summary + last turn.

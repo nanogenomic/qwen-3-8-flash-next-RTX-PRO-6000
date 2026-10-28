@@ -99,7 +99,7 @@ the routed-expert union.
 Two tests ship with the fix.
 
 **`test/registered/unit/attention/test_qsa_pending_ring.py`** — **117 CPU test cases**, no GPU
-needed. They drive the production slot builders over a range of prefill lengths, verify widths
+needed. They drive the shipped slot builders over a range of prefill lengths, verify widths
 1–8, exhaustive accept patterns, and rejection/rollback streams. Crucially, they **assert that
 a ratio-sized ring aliases**, so the sizing cannot be quietly reverted later:
 
