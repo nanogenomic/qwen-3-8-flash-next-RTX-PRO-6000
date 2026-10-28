@@ -1604,6 +1604,89 @@ Open: KL divergence against BF16; the same sweep on the production Max-Q; live n
 the production lane; a same-session A/B of the three arms (the rows above come from two Modal
 sessions, and §1.1's ~6 % noise band applies to any single-stream difference smaller than that).
 
+### 3.24 Troughs, compaction and between-turn (2026-10-28)
+
+Setup: Modal, 1× RTX PRO 6000, S8-FP8 profile (max-running 8, cuda-graph-max-bs-decode 8, mamba 48, chunk 4096, NEXTN 3/1/4,
+host KV pool 1,310,720 tokens, priority scheduling). Each arm was its own engine boot, running 1/2/4-stream agent loops (32K–131K contexts,
+think gaps 1–15 s) with client per-token timelines and server per-step logs. Raw data and scripts: `flashnext-modal-bench/results_trough/`.
+
+**Boot gotcha.** `SGLANG_QSA_HOST_KV_STATS=1` with a 1 s interval made several arms fail at boot with "CUDA graph capture invalidated"
+(the stats thread's GPU→host copy and sync run during capture). With `=0`, every arm booted. This is the same root cause as UPSTREAM-BUG-cuda-graph-capture-invalidated.md / §3.19.
+
+#### Where the troughs come from (base flags, share of lost stream-seconds)
+
+| Streams | Idle (think gap / tool) | Own prefill | Another stream's prefill | Low MTP acceptance | Scheduler / batch | Slow step |
+|---|---|---|---|---|---|---|
+| 1 | 92.1% | 4.0% | — | 3.5% | — | 0.4% |
+| 2 | 66.0% | 14.6% | 10.0% | 7.0% | 1.5% | 0.9% |
+| 4 | 41.7% | 26.6% | 13.7% | 8.2% | 7.7% | 2.0% |
+| 4, inside turns only | — | 45.7% | 23.4% | 14.0% | 13.2% | 3.5% |
+
+At 4 streams there were 71 stalls over 250 ms, 44.1 s in total; the longest was 7.79 s. Almost every in-turn trough is a prefill chunk
+(this stream's or another's) running ahead of decode: the scheduler always serves a waiting prefill chunk before a decode round.
+
+#### Gap-filling arms (vs base; 2-stream / 4-stream)
+
+| Arm | Per-stream tok/s | Median TTFT | Longest stall | Cold 131K TTFT | Verdict |
+|---|---|---|---|---|---|
+| base | 217.8 / 159.2 (1 stream 253.5) | 1.06 / 0.89 s | 2.39 / 7.79 s | 11.9 s | — |
+| chunk 2048 | −4.7% / −3.3% | +22% / +26% | 3.2 / 10.0 s | +23% | worse |
+| chunk 1024 | −11.4% / −10.4% | +38% / +79% | 4.9 / 14.9 s | +81% | worse |
+| prefill-decode-interval 4 | −11.3% / −3.7% | −3% / +20% | −76% / −88% | +2% | good |
+| **prefill-decode-interval 8** | −11.0% / −1.9% | +23% / +19% | **−70% / −90%** | +2% | **best balance** |
+| interval 16 | −8.6% / +0.1% | +23% / +35% | −68% / −92% | +4% | similar; 1 stream −5% |
+| chunk 2048 + interval 8 | −9.9% / −5.3% | +12% / +44% | −75% / −94% | +28% | fewest stalls (−78% stall time), slower prefill |
+| mamba 112 | 4 streams −3.8% | +27% | 7.93 s | — | no gain, about 3.5 GB more memory |
+| mixed chunk | — | — | — | — | crashed (device-side assert) about 1 min into 2-stream load |
+| overlap scheduler off | — | — | — | — | will not start (the lazy mamba buffer requires overlap) |
+
+Background filler on a 32K interactive session: filling only idle gaps and aborting the filler when the user's turn starts gave +2.6% interactive tok/s,
++280% total tok/s and +11% TTFT. An always-on filler cost −34% interactive (−27% with the filler at low priority).
+
+#### Compaction while another stream decodes (300K summarize)
+
+| Arm | Summarizer | Summary TTFT | Other stream during the summary prefill |
+|---|---|---|---|
+| base | warm (shared prefix) | 1.14 s | −32% tok/s, below 80% for 8.75 s |
+| base | cold | 29.5 s | frozen 28.2 s |
+| chunk 2048 / 1024 | cold | — | frozen 35.8 / 53.5 s |
+| interval 8 | cold | 37.5 s (+27%) | about 60 tok/s and never stalled more than 1.27 s; 270.5 tok/s afterwards |
+
+After compaction, TTFT on turns that hit the prefix cache was 0.15–0.29 s.
+
+#### Between-turn responsiveness (base): follow-up TTFT after a gap
+
+| Context | 1 s | 5 s | 15 s | 30 s | Cold |
+|---|---|---|---|---|---|
+| 32K | 0.70 | 0.71 | 0.44 | 0.34 | 2.8 |
+| 131K | 0.60 | 1.03 | 0.62 | 0.74 | 11.9 |
+| 500K | 2.43 | 2.45 | 2.55 | 2.59 | 52.3 |
+
+The prior context was fully cached at every gap, with or without other streams churning. Mamba 112 made 500K follow-ups 22–26% slower, with no cache-hit gain.
+
+#### Hermes compaction, blocking vs background (250K session + 7 workers)
+
+See [docs/HERMES-COMPACTION.md](docs/HERMES-COMPACTION.md). Headlines:
+- Background compaction cuts the session's stall from 7–8 s to about 2.8 s, but only with a prefix-sharing summarizer.
+- A cold summarizer (Hermes today) stalls 26 s in background vs 31–38 s blocking, and uses about 200K more peak KV.
+- `--prefill-decode-interval 8` keeps the other 7 sessions' longest gap at or under 2 s during a cold compaction, vs 24–25 s on base flags.
+
+#### Live production (zeta, passive /metrics, 00:12–00:51 ET)
+
+- Prefill was active in 83% of seconds, and a request was queued in 64%.
+- Decode ran at 86 tok/s in seconds with prefill vs 510 tok/s in decode-only seconds.
+- There were 108 decode-starved runs: median 7 s, p90 28 s, max 88 s.
+- Prefill tokens outnumbered decode tokens about 41:1 (14.9M vs 365K).
+
+#### Recommendation (proposal, not applied)
+
+- Add `--prefill-decode-interval 8` and keep chunk 4096, mamba 48 and the overlap scheduler on.
+- Effect: 1-stream speed unchanged within noise; worst stalls −70% to −90%; a cold compaction no longer freezes other sessions.
+- Cost: about +27% on a cold 300K prefill, and about −11% per-stream tok/s at 2 busy streams (−2% at 4).
+- Because zeta is prefill-saturated, watch queue time after the change.
+- Do not shrink the chunk size, and do not enable mixed chunk.
+- Keep `SGLANG_QSA_HOST_KV_STATS=0`.
+
 ## 4. Quality instruments — what each one can and cannot see
 
 This matters more than usual here, because the obvious instrument is the wrong one. The
