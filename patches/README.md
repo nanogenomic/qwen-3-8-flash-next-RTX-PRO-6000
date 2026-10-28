@@ -44,3 +44,12 @@ dense layers; off by default, lossy). See [`../BENCHMARKS.md` §3.23](../BENCHMA
 
 These patches cover the source tree only. The top-level documentation is this repository's,
 not part of the series. `../make-fork.sh` applies the whole series onto upstream for you.
+
+## Optional extras (`optional/`, not applied by `make-fork.sh`)
+
+`make-fork.sh` applies only `patches/0*.patch`. Files under `optional/` are opt-in and are applied
+with `git apply` on top of the built fork:
+
+- `optional/0043-opt-in-expert-census.diff` — expert / vocabulary / PLE-row usage census, off unless
+  `SGLANG_EXPERT_CENSUS=1`; no measurable overhead when on. See
+  [`../KV-POOLS.md` §7](../KV-POOLS.md#7-optional-expert-usage-census-off-by-default).

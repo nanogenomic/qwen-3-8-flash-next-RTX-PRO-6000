@@ -278,6 +278,7 @@ This is the exact launch line that was benchmarked, with paths generalised.
 | `--max-mamba-cache-size 48` | Not section 2's "do not lower it" mistake: patch `0041` fixes the admission bug that made a small slot pool exhaust under concurrent admission, and 48 is what was measured at cap 8. 112 slots with BF16 at cap 8 booted a smaller pool (1,177,408) |
 | Hot-cache sets | **Keep 4,096.** 16,384 sets did not boot with this pool and context (out of GPU memory at 0.97 and 0.96) |
 | Production card | Not yet measured on the 300 W Max-Q; expect lower absolute numbers there |
+| Bigger pool | 1.5M and 2M tokens measured with unchanged decode speed; 2M keeps four 500K sessions cached. Flags, costs and drop-in: [KV-POOLS.md](KV-POOLS.md) |
 
 ---
 

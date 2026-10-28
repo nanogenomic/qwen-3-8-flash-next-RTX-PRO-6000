@@ -21,6 +21,11 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 > **[CONTEXT-PROFILES.md](CONTEXT-PROFILES.md)**: two copyable flag profiles (on-GPU KV, and a
 > host-RAM KV pool of 1.31M tokens), which one to pick, and what each costs in step time and in
 > delivered throughput. And add **`--mamba-max-states-per-path 2`** — [below](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
+>
+> **More long sessions resident at once?** **[KV-POOLS.md](KV-POOLS.md)**: raise the host-RAM pool
+> to 1.5M or 2M tokens with two settings (`--max-total-tokens`, `SGLANG_QSA_HOST_KV_MAX_GB`). Same
+> decode speed, four 500K sessions stay cached instead of two, for 10.75 GiB of host RAM and 0.64 GB
+> of GPU memory at 2M. Verified in production.
 
 ---
 
@@ -506,9 +511,11 @@ UPSTREAM-BUG-qsa-index-key-ring.md             a filable upstream correctness bu
 UPSTREAM-BUG-cuda-graph-capture-invalidated.md  NOT an upstream bug after all: cause found in this
                                                fork's stats thread (§3.19). Kept as the record
 CONTEXT-PROFILES.md      high-context flag profiles and their measured speed costs
+KV-POOLS.md              bigger host-RAM KV pools (1.5M / 2M): flags, costs, systemd drop-in, rollback
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 42 commits as a git-am-able series against the base commit
+patches/optional/        opt-in extras NOT applied by make-fork.sh (0043: expert-usage census)
 COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
 python/  test/           the 56 changed files, at their exact upstream paths
 clients/README.md        the client contract: what any orchestrator must do to use this well
@@ -1185,6 +1192,7 @@ allocation, so it is unconditional.
 |---|---|
 | `SGLANG_MTP_HIDDEN_DUMP_DIR` | Enables the scheduler-side MTP hidden-state dump. Everything else in that feature is inert without it. |
 | `SGLANG_MTP_HIDDEN_DUMP_GATE`, `..._MAX_TOKENS`, `..._QUEUE`, `..._SHARD_GIB` | Dump window, budget, queue depth and shard size. |
+| `SGLANG_EXPERT_CENSUS` (+ `_DIR`, `_INTERVAL_S`, `_TAGS`, `_PLE_BLOCK`) | Only with the optional patch `patches/optional/0043`: per-layer expert, vocabulary and PLE-row usage counts, split by workload tag. Off by default; no measurable overhead when on. See [KV-POOLS §7](KV-POOLS.md#7-optional-expert-usage-census-off-by-default). |
 | `SGLANG_QSA_PENDING_RING_SLOTS` | Pins the pending index-key ring to a fixed row count. `0` derives it correctly. **Set it only to reproduce an older build's (aliasing) addressing in an A/B.** |
 
 ### Upstream variables this fork's results depend on

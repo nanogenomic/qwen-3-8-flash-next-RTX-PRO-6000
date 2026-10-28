@@ -1,0 +1,410 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 2344281..de50cd1 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -105,6 +105,7 @@ from sglang.srt.layers.moe import (
+ )
+ from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
++from sglang.srt.state_capturer import expert_census as _expert_census
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_bool_env_var,
+@@ -2231,6 +2232,8 @@ def capture_routed_experts_if_allowed(
+     Routing all backends through here keeps the draft-side opt-out from being
+     bypassed by an inlined capturer call.
+     """
++    if _expert_census.enabled() and (_c := _expert_census.get()) is not None:
++        _c.record(getattr(topk_config, "census_slot", layer_id), topk_ids)
+     if not topk_config.allow_routed_experts_capture:
+         return
+     if (cap := get_global_experts_capturer()) is not None:
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index cf03827..8bf6f80 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -996,6 +996,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             sampling_info=batch.sampling_info,
+             spec_info=batch.spec_info,
+         )
++        from sglang.srt.state_capturer import expert_census as _expert_census
++
++        if _expert_census.enabled() and (_c := _expert_census.get()) is not None:
++            _c.stage_batch(ret, batch.reqs)
+ 
+         ret._maybe_init_non_generation_fields(batch)
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 604a72f..817e18b 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1860,6 +1860,15 @@ class ModelRunner:
+         reinit_attn_backend: bool = False,
+         split_forward_count: int = 1,
+     ) -> ModelRunnerOutput:
++        from sglang.srt.state_capturer import expert_census as _expert_census
++
++        if _expert_census.enabled() and (_c := _expert_census.get()) is not None:
++            if not _c._started:
++                _c.reset()
++                _c.start()
++            _c.before_forward(
++                forward_batch, count_vocab=not getattr(self, "is_draft_worker", False)
++            )
+         if has_forward_context():
+             ctx_mgr = contextlib.nullcontext()
+         else:
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 2aa1df7..27a6ffa 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -304,6 +304,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             renormalize=config.norm_topk_prob,
+             layer_id=layer_id,
+         )
++        from sglang.srt.state_capturer import expert_census as _expert_census
++
++        if _expert_census.enabled():
++            _expert_census.maybe_init(
++                int(getattr(config, "num_hidden_layers", 48)),
++                int(config.num_experts),
++                int(getattr(config, "vocab_size", 0) or 0),
++            )
++            self.topk.topk_config.census_slot = (
++                _expert_census.DRAFT_SLOT if is_nextn else layer_id
++            )
+         # qwenopt dynamic-k: off unless SGLANG_QWENOPT_DYNK is set.
+         from sglang.srt.layers.moe import dynk as _dynk_mod
+ 
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 4b8756b..c8659ae 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -519,6 +519,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             (total_vocab_size + self.make_ngram_vocab_size_divisible_by - 1)
+             // self.make_ngram_vocab_size_divisible_by
+         ) * self.make_ngram_vocab_size_divisible_by
++        self._census_rows = int(padded_vocab_size)
+         self.use_attn_tp_ngram = _use_attn_tp_ngram()
+         self.gather_dp_tokens = (
+             is_dp_attention_enabled()
+@@ -765,10 +766,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                 ]
+             contexts = contexts.to(torch.long)
+             pool.ple_window_cache = (batch, contexts, None)
+-        return self._hash_contexts(
++        ngram_ids = self._hash_contexts(
+             contexts,
+             decode_sized=batch.mode.is_decode() or batch.mode.is_target_verify(),
+         )
++        from sglang.srt.state_capturer import expert_census as _expert_census
++
++        if _expert_census.enabled() and (_c := _expert_census.get()) is not None:
++            if _c.ple_bits is None:
++                _c.init_ple(int(getattr(self, "_census_rows", 0)))
++            _c.record_ple(ngram_ids)
++        return ngram_ids
+ 
+ 
+ @triton.jit
+diff --git a/python/sglang/srt/state_capturer/expert_census.py b/python/sglang/srt/state_capturer/expert_census.py
+new file mode 100644
+index 0000000..2a1eb5b
+--- /dev/null
++++ b/python/sglang/srt/state_capturer/expert_census.py
+@@ -0,0 +1,295 @@
++# Copyright (c) 2026 Ligandal, Inc.
++"""Low-overhead expert / vocab / n-gram-row usage census for Qwen3.8 Flash-Next (default OFF).
++
++Enable with SGLANG_EXPERT_CENSUS=1. Everything is counted on the GPU inside the
++existing kernels' stream (CUDA-graph safe: persistent buffers, one tiny Triton
++kernel per MoE layer per forward), and a daemon thread copies the counters to
++host every SGLANG_EXPERT_CENSUS_INTERVAL_S seconds (default 600) and writes the
++*delta* since the last flush to SGLANG_EXPERT_CENSUS_DIR as a compressed .npz.
++
++Counted:
++  experts[tag, layer, expert]  routed top-k selections (target layers 0..L-1, the
++                               MTP draft MoE in slot L). Counts every token that
++                               went through the router, including speculative
++                               draft tokens later rejected (they cost the same).
++  vocab[token_id]              every token id fed into a forward (prompt tokens and
++                               generated tokens), i.e. lm_head / embedding usage.
++  ple_blocks[block]            n-gram (PLE) embedding row lookups, bucketed in
++                               blocks of SGLANG_EXPERT_CENSUS_PLE_BLOCK rows (4096).
++  ple_bitset                   1 bit per n-gram row ever touched (cumulative,
++                               rewritten as ple_bitset.npy on each flush).
++
++Per-workload split: a request is tagged by "census_tag" in its custom_params
++(OpenAI body: {"custom_params": {"census_tag": "hermes"}}) or the
++x-custom-labels header {"census_tag": "hermes"}. Allowed tags come from
++SGLANG_EXPERT_CENSUS_TAGS (default "default,hermes,sdk,bio,chat"); anything else
++counts as "default".
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import threading
++import time
++from typing import List, Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_ENABLED = os.environ.get("SGLANG_EXPERT_CENSUS", "0").strip().lower() in ("1", "true", "on", "yes")
++DRAFT_SLOT = -2  # mapped to slot L at record time
++
++_census: Optional["ExpertCensus"] = None
++
++
++def enabled() -> bool:
++    return _ENABLED
++
++
++def get() -> Optional["ExpertCensus"]:
++    return _census
++
++
++try:
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def _census_expert_kernel(ids_ptr, tag_ptr, cnt_ptr, n_rows, layer_slot,
++                              stride_tag, stride_layer, discard_off,
++                              K: tl.constexpr, BLOCK: tl.constexpr):
++        pid = tl.program_id(0)
++        offs = pid * BLOCK + tl.arange(0, BLOCK)
++        m = offs < n_rows * K
++        row = offs // K
++        e = tl.load(ids_ptr + offs, mask=m, other=-1).to(tl.int64)
++        t = tl.load(tag_ptr + row, mask=m, other=0).to(tl.int64)
++        idx = t * stride_tag + layer_slot * stride_layer + e
++        idx = tl.where(e >= 0, idx, discard_off)
++        tl.atomic_add(cnt_ptr + idx, 1, mask=m, sem="relaxed")
++
++    @triton.jit
++    def _census_rows_kernel(ids_ptr, n, blk_ptr, bits_ptr, n_rows_total,
++                            BLOCK_SHIFT: tl.constexpr, BLOCK: tl.constexpr):
++        pid = tl.program_id(0)
++        offs = pid * BLOCK + tl.arange(0, BLOCK)
++        m = offs < n
++        r = tl.load(ids_ptr + offs, mask=m, other=-1).to(tl.int64)
++        m = m & (r >= 0) & (r < n_rows_total)
++        tl.atomic_add(blk_ptr + (r >> BLOCK_SHIFT), 1, mask=m, sem="relaxed")
++        word = r >> 5
++        bit = (r & 31).to(tl.int32)
++        tl.atomic_or(bits_ptr + word, (1 << bit).to(tl.int32), mask=m, sem="relaxed")
++
++    _HAVE_TRITON = True
++except Exception:  # pragma: no cover
++    _HAVE_TRITON = False
++
++
++class ExpertCensus:
++    def __init__(self, num_layers: int, num_experts: int, vocab_size: int,
++                 max_tokens: int = 65536, device: str = "cuda"):
++        self.tags: List[str] = [t.strip() for t in os.environ.get(
++            "SGLANG_EXPERT_CENSUS_TAGS", "default,hermes,sdk,bio,chat").split(",") if t.strip()]
++        if "default" not in self.tags:
++            self.tags.insert(0, "default")
++        self.tag_index = {t: i for i, t in enumerate(self.tags)}
++        self.T = len(self.tags)
++        self.L = num_layers + 1  # + draft slot
++        self.E = num_experts
++        self.V = vocab_size
++        self.max_tokens = max_tokens
++        self.dev = torch.device(device, torch.cuda.current_device())
++        # slot T is the discard bucket (padded / masked rows)
++        self.experts = torch.zeros((self.T + 1, self.L, self.E), dtype=torch.int64, device=self.dev)
++        self.vocab = torch.zeros(self.V, dtype=torch.int64, device=self.dev)
++        self.token_tag = torch.zeros(max_tokens, dtype=torch.int32, device=self.dev)
++        self._ones = torch.ones(max_tokens, dtype=torch.int64, device=self.dev)
++        self._const_tag = -1  # token_tag[:_valid_n] all == this value (-1 = mixed/unknown)
++        self._valid_n = -1
++        self.ple_rows = 0
++        self.ple_block_shift = max(0, int(os.environ.get("SGLANG_EXPERT_CENSUS_PLE_BLOCK", "4096")).bit_length() - 1)
++        self.ple_blocks = None
++        self.ple_bits = None
++        self.out_dir = os.environ.get("SGLANG_EXPERT_CENSUS_DIR", "/tmp/expert_census")
++        self.interval = float(os.environ.get("SGLANG_EXPERT_CENSUS_INTERVAL_S", "600"))
++        os.makedirs(self.out_dir, exist_ok=True)
++        self._last = None
++        self._pinned_tag = torch.zeros(max_tokens, dtype=torch.int32, device="cpu").pin_memory()
++        self._lock = threading.Lock()
++        self._started = False
++        logger.info("expert census ON: tags=%s layers=%d(+draft) experts=%d vocab=%d dir=%s every %.0fs",
++                    self.tags, num_layers, num_experts, vocab_size, self.out_dir, self.interval)
++
++    # ---------------- PLE rows
++    def init_ple(self, total_rows: int):
++        if self.ple_bits is not None or total_rows <= 0:
++            return
++        self.ple_rows = int(total_rows)
++        nblk = (self.ple_rows >> self.ple_block_shift) + 1
++        self.ple_blocks = torch.zeros(nblk, dtype=torch.int64, device=self.dev)
++        self.ple_bits = torch.zeros((self.ple_rows + 31) // 32, dtype=torch.int32, device=self.dev)
++        logger.info("expert census: n-gram table %d rows, %d blocks, bitset %.1f MiB",
++                    self.ple_rows, nblk, self.ple_bits.numel() * 4 / 2**20)
++
++    def record_ple(self, ids: torch.Tensor):
++        if self.ple_bits is None or ids is None or ids.numel() == 0:
++            return
++        flat = ids.reshape(-1)
++        if not flat.is_contiguous():
++            flat = flat.contiguous()
++        n = flat.numel()
++        B = 1024
++        _census_rows_kernel[(triton.cdiv(n, B),)](flat, n, self.ple_blocks, self.ple_bits, self.ple_rows,
++                                                    BLOCK_SHIFT=self.ple_block_shift, BLOCK=B)
++
++    # ---------------- experts
++    def record(self, layer_slot: int, topk_ids: torch.Tensor):
++        if topk_ids is None or topk_ids.dim() != 2 or topk_ids.shape[0] == 0:
++            return
++        if layer_slot == DRAFT_SLOT:
++            layer_slot = self.L - 1
++        if layer_slot is None or layer_slot < 0 or layer_slot >= self.L:
++            return
++        ids = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
++        n, k = ids.shape
++        if n > self.max_tokens:
++            return
++        B = 512
++        _census_expert_kernel[(triton.cdiv(n * k, B),)](
++            ids, self.token_tag, self.experts, n, layer_slot,
++            self.L * self.E, self.E, self.T * self.L * self.E, K=k, BLOCK=B)
++
++    # ---------------- per-forward staging (outside CUDA graphs)
++    def tag_of_req(self, req) -> int:
++        tag = None
++        sp = getattr(req, "sampling_params", None)
++        cp = getattr(sp, "custom_params", None) if sp is not None else None
++        if isinstance(cp, dict):
++            tag = cp.get("census_tag")
++        if tag is None:
++            cl = getattr(req, "custom_labels", None)
++            if isinstance(cl, dict):
++                tag = cl.get("census_tag")
++        return self.tag_index.get(str(tag), 0) if tag is not None else 0
++
++    def stage_batch(self, forward_batch, reqs):
++        try:
++            forward_batch._census_req_tags = [self.tag_of_req(r) for r in reqs]
++        except Exception:
++            pass
++
++    def before_forward(self, forward_batch, count_vocab: bool = True):
++        """Fill per-token tags and count input token ids. Cheap: no kernel at all when
++        every request carries the same tag as last time (the common case)."""
++        ids = getattr(forward_batch, "input_ids", None)
++        if ids is None:
++            return
++        n = int(ids.shape[0])
++        if n == 0:
++            return
++        if count_vocab and self.V > 0 and n <= self.max_tokens and ids.dtype in (torch.int32, torch.int64):
++            self.vocab.index_add_(0, ids.clamp(0, self.V - 1).long(), self._ones[:n])
++        tags = getattr(forward_batch, "_census_req_tags", None)
++        if n > self.max_tokens:
++            return
++        if not tags or all(t == tags[0] for t in tags):
++            tag = tags[0] if tags else 0
++            if self._const_tag != tag or self._valid_n != n:
++                # rows past n (CUDA-graph padding) go to the discard bucket
++                self.token_tag[:n].fill_(tag)
++                self.token_tag[n:].fill_(self.T)
++                self._const_tag = tag; self._valid_n = n
++            return
++        ext = getattr(forward_batch, "extend_seq_lens_cpu", None)
++        mode = getattr(forward_batch, "forward_mode", None)
++        is_ext = mode is not None and hasattr(mode, "is_extend") and mode.is_extend() and ext and len(ext) == len(tags)
++        per = None
++        if is_ext and sum(ext) == n:
++            per = ext
++        elif n % len(tags) == 0:
++            per = [n // len(tags)] * len(tags)
++        if per is None:
++            self.token_tag[:n].fill_(0); self.token_tag[n:].fill_(self.T)
++            self._const_tag = 0; self._valid_n = n
++            return
++        buf = self._pinned_tag
++        o = 0
++        for t, c in zip(tags, per):
++            buf[o:o + c] = t; o += c
++        buf[n:].fill_(self.T)
++        # blocking copy: the pinned buffer is reused next forward (mixed-tag batches only)
++        self.token_tag.copy_(buf)
++        self._const_tag = -1; self._valid_n = -1
++
++    # ---------------- flushing
++    def reset(self):
++        self.experts.zero_(); self.vocab.zero_()
++        if self.ple_blocks is not None:
++            self.ple_blocks.zero_(); self.ple_bits.zero_()
++        self._last = None
++
++    def start(self):
++        if self._started:
++            return
++        self._started = True
++        threading.Thread(target=self._loop, name="expert-census-flush", daemon=True).start()
++
++    def _snapshot(self, stream):
++        with torch.cuda.stream(stream):
++            e = self.experts.to("cpu", non_blocking=True)
++            v = self.vocab.to("cpu", non_blocking=True)
++            b = self.ple_blocks.to("cpu", non_blocking=True) if self.ple_blocks is not None else None
++        stream.synchronize()
++        return e, v, b
++
++    def flush(self, stream=None, final=False):
++        import numpy as np
++        stream = stream or torch.cuda.Stream(device=self.dev)
++        with self._lock:
++            e, v, b = self._snapshot(stream)
++            if self._last is None:
++                de, dv, db = e, v, b
++            else:
++                de, dv = e - self._last[0], v - self._last[1]
++                db = (b - self._last[2]) if b is not None else None
++            self._last = (e, v, b)
++            ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
++            arrs = {"experts": de[: self.T].numpy().astype(np.int64),
++                    "experts_discard": de[self.T].numpy().astype(np.int64),
++                    "vocab": dv.numpy().astype(np.int64)}
++            if db is not None:
++                arrs["ple_blocks"] = db.numpy().astype(np.int64)
++            meta = {"ts_utc": ts, "unix": time.time(), "tags": self.tags, "layers": self.L - 1,
++                    "draft_slot": self.L - 1, "experts": self.E, "vocab": self.V,
++                    "ple_rows": self.ple_rows, "ple_block": 1 << self.ple_block_shift,
++                    "interval_s": self.interval, "delta": True}
++            tmp = os.path.join(self.out_dir, f".census_{ts}.npz")
++            np.savez_compressed(tmp, meta=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8), **arrs)
++            os.replace(tmp, os.path.join(self.out_dir, f"census_{ts}.npz"))
++            if self.ple_bits is not None:
++                with torch.cuda.stream(stream):
++                    bits = self.ple_bits.to("cpu", non_blocking=True)
++                stream.synchronize()
++                tmpb = os.path.join(self.out_dir, ".ple_bitset.npy")
++                np.save(tmpb, bits.numpy())
++                os.replace(tmpb, os.path.join(self.out_dir, "ple_bitset.npy"))
++
++    def _loop(self):
++        stream = torch.cuda.Stream(device=self.dev)
++        while True:
++            time.sleep(self.interval)
++            try:
++                self.flush(stream)
++            except Exception as ex:  # never take the server down
++                logger.warning("expert census flush failed: %s", ex)
++
++
++def maybe_init(num_layers: int, num_experts: int, vocab_size: int):
++    global _census
++    if not _ENABLED or _census is not None or not _HAVE_TRITON:
++        return _census
++    _census = ExpertCensus(num_layers, num_experts, vocab_size)
++    return _census
