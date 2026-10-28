@@ -14,11 +14,12 @@ restart at 2,097,152 tokens. No code change is needed: this is flags and one env
 | 1,310,720 (S8-FP8 default) | 24 (default 100 is fine too) | 15.00 + 1.25 GiB | 9.61 GB | 2 | baseline |
 | 1,572,864 | 24 | 18.00 + 1.50 GiB | 9.37 GB | 3 | cautious middle step |
 | **2,097,152 (recommended)** | **28** | **24.00 + 2.00 GiB** | **8.97 GB** | **4** | several long agents at once |
+| 4,194,304 | 50 | 48.00 + 4.00 GiB | 7.14 GB | 8 | eight long agents at once (Modal only; staged, not live in production) |
 
-The pool buys **room, not speed**. Decode speed is the same at all three sizes (section 3). What
+The pool buys **room, not speed**. Decode speed is the same at every size measured, 1.31M to 4M (section 3). What
 changes is how many long sessions stay resident: at 1.31M a third 500K session evicts the others and
 their next turn re-reads 500K tokens (52–107 s to first token); at 2M four 500K sessions stay cached
-and follow-ups start in 2.5–3.5 s.
+and follow-ups start in 2.5–3.5 s; at 4M eight do (2.6–7.0 s with all eight active).
 
 ## 2. Flags and environment
 
@@ -55,18 +56,20 @@ available_gpu_mem=8.97 GB                 # after CUDA-graph capture
 | 1,310,720 | 274.9 / 402.8 / 609.3 / 811.2 | — | — | 9/9 (earlier run) | 0.97 (earlier run) | 93.0 GiB |
 | 1,572,864 | 273.4 / 402.1 / 596.3 / 802.7 | 243.6 tok/s, 14.2 s | 227.2 tok/s, 53.0 s | 9/9 | 0.97 | 96.5 GiB |
 | 2,097,152 | 273.9 / 403.2 / 604.5 / 804.9 | 241.0 tok/s, 12.2 s | 230.9 tok/s, 53.2 s | 9/9 | 0.98 | 103.1 GiB |
+| 4,194,304 (same-container A/B, run `r20261028ab`) | 273.0 / 405.3 / 599.4 / 807.7 (2M in the same container: 278.7 / 403.0 / 603.7 / 807.5) | 230.6 tok/s, 12.4 s | 225.5 tok/s, 53.0 s | 9/9 | 0.97 | — |
 
 Several 500K sessions decoding at once (total decode tok/s from the server's own decode log; the
 benchmark client counts streamed chunks, about 3 tokens each with the draft model, so client-side
 per-stream rates under concurrency read low):
 
-| Concurrent 500K sessions | 1 | 2 | 3 | 4 |
-|---|---|---|---|---|
-| 1.31M pool | 224.6 | 342.3 | (third session evicts: next first token 52.5 s and 106.9 s instead of 2.5 s) | — |
-| 1.5M pool | 229.8 | 317.7 | 396.7 | — |
-| 2M pool | 237.3 | 335.6 | 385.3 | 429.3 |
+| Concurrent 500K sessions | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|
+| 1.31M pool | 224.6 | 342.3 | (third session evicts: next first token 52.5 s and 106.9 s instead of 2.5 s) | — | — | — |
+| 1.5M pool | 229.8 | 317.7 | 396.7 | — | — | — |
+| 2M pool | 237.3 | 335.6 | 385.3 | 429.3 | — | — |
+| 4M pool | 233.3 | 350.6 | — | 456.3 | 444.9 (slow container, one sample) | all 8 cached; total rate not logged |
 
-Follow-up first token for a session that stayed cached: 2.45–3.53 s at 2M with 4 × 500K resident.
+Follow-up first token for a session that stayed cached: 2.45–3.53 s at 2M with 4 × 500K resident. At 4M with 8 × 500K resident: 2.6–7.0 s, all eight fully cached (run `r20261028p40`). The 4M pool costs 1.83 GB of free GPU against 2M and no measurable speed; it needs `SGLANG_QSA_HOST_KV_MAX_GB=50`. Full numbers: [BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions).
 
 ### Hot-cache hit rate
 

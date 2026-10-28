@@ -1580,7 +1580,7 @@ stack, noise = a second baseline run, [§4](#4-quality-instruments--what-each-on
 | Prefix-cache probe | 6 cache-hit pairs, max mean \|Δlogprob\| 0.42 vs limit 1.33, 0 errors, 0 degenerate | PASS |
 | Needle retrieval | **9 / 9** (131,072, 262,144, 500,000) | — |
 | GSM8K | **0.96** (n = 100; 3 truncated, 0 degenerate) | — |
-| KL divergence vs BF16 | **pending** | — |
+| KL divergence vs BF16 | **0.087** nats/token, top-1 **91.8 %** (BF16 vs BF16: 0.005, 99.3 %), [§3.25](#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-production-bigger-pools-2026-10-28) | lossy |
 
 So S8-FP8 is **lossy, not lossless**: greedy outputs diverge from BF16 about 35 % sooner than
 two BF16 runs diverge from each other. No task-level loss was seen at these sample sizes,
@@ -1600,7 +1600,7 @@ which this bundle did not try to satisfy; the needle run above is a separate bun
 - **A split-K retune of the 8-bit GEMV** (run `r20261027t`): regressed against the shipped
   launch settings and was dropped; `0042` carries the un-retuned kernel.
 
-Open: KL divergence against BF16; the same sweep on the production Max-Q; live numbers from
+Open: the same sweep on the production Max-Q; live numbers from
 the production lane; a same-session A/B of the three arms (the rows above come from two Modal
 sessions, and §1.1's ~6 % noise band applies to any single-stream difference smaller than that).
 
@@ -1686,6 +1686,143 @@ See [docs/HERMES-COMPACTION.md](docs/HERMES-COMPACTION.md). Headlines:
 - Because zeta is prefill-saturated, watch queue time after the change.
 - Do not shrink the chunk size, and do not enable mixed chunk.
 - Keep `SGLANG_QSA_HOST_KV_STATS=0`.
+
+### 3.25 Every measured number for the S8-FP8 profile in one place: quality, speed by context, production, bigger pools (2026-10-28)
+
+This section collects the S8-FP8 measurements that were spread over §3.23, [KV-POOLS.md](KV-POOLS.md)
+and the production lane's notes, and adds the ones that were still open. Three kinds of number
+appear, and they are labelled on every row:
+
+- `[Modal]`: one RTX PRO 6000 Blackwell **Server Edition** (600 W, PCIe Gen5) on Modal, nothing
+  else on the card, temperature 0. Capability numbers.
+- `[production, under live load]`: the production lane, an RTX PRO 6000 Blackwell **Max-Q
+  Workstation Edition** (300 W, Gen4), the sole routed replica, **serving real users during every
+  row**. These are "what one client got while other traffic ran", not capability numbers, and the
+  load window is given wherever it was recorded.
+- `[production, boot log]`: read from the server's own boot log; not load-sensitive.
+
+#### 3.25.1 Quality
+
+| Instrument | S8-FP8 result | Reference / noise | Where | Verdict |
+|---|---|---|---|---|
+| **KL divergence vs BF16**, 8-bit weight-only dense (`rowwise`, the shipped S8-FP8) | **0.087 nats/token**, top-1 agreement **91.8 %** | BF16 vs BF16 (two boots): **0.005**, 99.3 % | `[Modal]` run `r20261028k`, 27,648 teacher-forced positions, top-20 logprobs | lossy: ~17× the noise floor; ~8 % of top-1 tokens differ |
+| KL, by slice (rowwise) | prose 0.083 / 91.4 %; code 0.107 / 93.7 %; 32K-context windows 0.063 / 92.6 % | BF16 vs BF16: prose 0.006 / 99.2 %; code 0.002 / 99.9 %; 32K 0.044 / 94.1 % | same | — |
+| KL, MXFP8 dense instead of rowwise | **0.093**, 91.4 % | 0.005, 99.3 % | same | slightly worse than rowwise |
+| KL, rowwise with the lm_head kept BF16 | **0.086**, 91.8 % | 0.005, 99.3 % | same | the lm_head is not the cause |
+| KL, rowwise with the HyperConnection linears kept BF16 | **0.087**, 91.8 % (10 HC linears skipped, confirmed in the log) | 0.005, 99.3 % | same | HyperConnection is not the cause; by elimination the loss is in the 8-bit dense layers |
+| Decode-path equivalence, 1 stream | median agreement **31** tokens vs noise floor **49** | two BF16 runs | `[Modal]` `r20261027u2` (§3.23) | **FAIL** (p = 0.0002) |
+| Decode-path equivalence, 4 streams | median agreement **30** vs **45** | two BF16 runs | same | **FAIL** |
+| Needle retrieval, 20 cases | **20 / 20** (5 each at 65,536, 131,072, 262,144, 500,000) | — | `[Modal]` `r20261028k` | pass |
+| Needle retrieval, 9 cases | **9 / 9** at 1.5M and 2M pools; **9 / 9** at the 4M pool | — | `[Modal]` `r20261028kv`, `r20261028p40`, `r20261028ab` | pass |
+| GSM8K, n = 100 | **0.96** (§3.23), **0.97** (1.5M pool), **0.98** (2M pool), **0.97** (4M pool) | — | `[Modal]` | pass |
+| Needle retrieval at 900K with `--context-length 1048576` | **1 / 3** (depths 0.1 and 0.9 came back empty) | — | `[Modal]` `r20261028kv` | **lossy past the trained window**; keep 540K |
+| GSM8K on production | **0.97** (n = 100, 0 errors, 1 truncated, 0 degenerate) | Modal 0.96 | `[production, under live load]`, 1.31M pool | pass; the one cross-card number fair to compare directly |
+| Needles on production | **9 / 9** (131K, 262K, 500K) | — | `[production, under live load]`, 1.31M pool; haystack file `pg2701.txt` differs from the published corpus | pass |
+| 500K needle on production after the 2M-pool restart | **1 / 1**, 67.4 s wall including the cold 500K prefill | — | `[production, under live load]`, 2M pool, n = 1 | smoke test only |
+
+S8-FP8 is **lossy, not lossless**, and now by two independent instruments: greedy decode diverges
+from BF16 sooner than BF16 diverges from itself, and the token distributions differ by 0.087 nats per
+token. No task-level loss was seen at these sample sizes (needles 20/20 and 9/9, GSM8K 0.96–0.98),
+which can rule out only large regressions ([§4.6](#46-statistical-power--what-these-sample-sizes-can-actually-resolve)).
+
+#### 3.25.2 Speed by context
+
+Single stream, 512 tokens decoded, decode tok/s and time to first token (TTFT). Deep cells are one
+request each (n = 1).
+
+| Prompt | `[Modal]` 1.31M pool (§3.23) | `[Modal]` 1.5M pool | `[Modal]` 2M pool | `[Modal]` 4M pool (A/B container) | `[production, under live load]` 1.31M pool |
+|---|---|---|---|---|---|
+| 41–300 tokens | 275.1 / — | 284.0 median / 0.08 s | 281.7 median / 0.09 s | 289.0 median / 0.09 s | 154.7 (running 2–3) · 124.4 (queue ≤ 6, TTFT 9.1 s) · 129.8 (running 2–4) |
+| 131,072 | 233.4 / 13.10 s | 243.6 / 14.21 s | 241.0 / 12.18 s | 230.6 / 12.42 s | 43.4 / 14.31 s (running 1–6, queue ≤ 2) |
+| 500,000 | 231.8 / 53.45 s | 227.2 / 52.99 s | 230.9 / 53.16 s | 225.5 / 53.03 s | 1.81 / 76.4 s (running 2–7, queue ≤ 10); re-measured in a quieter window: 12.45 / 63.9 s (running 1–7, queue 0–6) |
+
+Aggregate decode, N short streams (tok/s; Modal = median of rounds, production = better of 2 rounds):
+
+| Streams | `[Modal]` 1.31M | `[Modal]` 1.5M | `[Modal]` 2M | `[Modal]` 4M (A/B container) | `[production, under live load]` |
+|---|---|---|---|---|---|
+| 1 | 274.9 | 273.4 | 273.9 | 273.0 | 134.4 |
+| 2 | 402.8 | 402.1 | 403.2 | 405.3 | 188.2 (other round 60.2) |
+| 4 | 609.3 | 596.3 | 604.5 | 599.4 | 291.0 (other round 86.2) |
+| 8 | 811.2 | 802.7 | 804.9 | 807.7 | 397.9 (other round 359.8) |
+
+The production server's own decode log recorded 325–570 tok/s aggregate with 2–3 live requests
+during that sweep, well above any one benchmark client's share. Production reaches about half of
+Modal at every stream count; this run cannot separate the 300 W power budget from live-load
+contention, and it does not try to.
+
+Several 500K-token sessions decoding at once (total decode tok/s from the server's decode log;
+the benchmark client counts streamed chunks of about 3 tokens each, so its own per-stream figures
+under concurrency read low):
+
+| Concurrent 500K sessions | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|
+| `[Modal]` 1.31M pool | 224.6 | 342.3 | third evicts others | — | — | — |
+| `[Modal]` 1.5M pool | 229.8 | 317.7 | 396.7 | — | — | — |
+| `[Modal]` 2M pool | 237.3 | 335.6 | 385.3 | 429.3 | — | — |
+| `[Modal]` 4M pool (A/B container, §3.25.4) | 233.3 | 350.6 | — | 456.3 | — | — |
+| `[Modal]` 4M pool (8-session container, ran slow, §3.25.4) | 209.0 | 324.7 | — | 394.1 | 444.9 (one log sample) | not logged (no steady decode window) |
+
+Speculative decoding accept length: `[Modal]` 3.1–3.3 tokens per step across all pool sizes and
+depths. `[production, under live load]` scraped from live traffic (n = 256): min 1.45, median
+**2.85**, mean 2.79, max 3.92; the previous production config read 2.79–3.34, essentially unchanged.
+Live traffic is not a controlled comparison.
+
+#### 3.25.3 Production boot after the 2M-pool restart
+
+`[production, boot log]`, 2026-10-28 06:06 UTC: `max_total_num_tokens=2097152`, context 540,000,
+host KV **24.00 + 2.00 GiB** pinned, weights **70.99 GB**, **8.97 GB** free GPU after boot (Modal
+predicted 8.97 GB; at 1.31M the same host showed 9.61 GB, again identical to Modal). Restart to
+`/health` 200: 3 min 59 s. GSM8K, the 9-needle set, the depth table and the concurrency sweep have
+**not** been re-measured on production at 2M.
+
+#### 3.25.4 The 4M pool and eight 500K sessions
+
+The question: can the pool hold **eight** 500K-token sessions at once, and does a 4,194,304-token
+pool cost anything? Config: S8-FP8 with production's flags, `--max-total-tokens 4194304`,
+`SGLANG_QSA_HOST_KV_MAX_GB=50` (the guard is per pool and the target pool needs 48 GiB).
+
+`[Modal]` boot log: host KV **48.00 + 4.00 GiB** pinned; `max_total_num_tokens=4194304`;
+**7.14 GB** free GPU after boot (2M: 8.97 GB, so the bigger pool's GPU-side index costs 1.83 GB).
+Boot 281 s and 166 s in two containers.
+
+Eight sessions at 500K (run `r20261028p40`): all 8 prefilled cold (52.2–53.3 s each), then every one
+came back fully cached on its follow-up (499,968 cached tokens each), with first-token times of
+2.6–7.0 s while all eight were active. At 6 sessions: all cached, 2.9–6.1 s. At 1.31M a third
+500K session evicted the others, and 2M held four; 4M is the first pool that holds eight.
+
+Speed, same container, 4M then 2M (run `r20261028ab`; this is the fair comparison, because the 8-session
+container read 5–10 % slow across the board, including on short prompts where the pool cannot matter):
+
+| | 4M pool | 2M pool | difference |
+|---|---|---|---|
+| Aggregate decode, 1 / 2 / 4 / 8 short streams (tok/s) | 273.0 / 405.3 / 599.4 / 807.7 | 278.7 / 403.0 / 603.7 / 807.5 | −2.0 / +0.6 / −0.7 / 0.0 % (noise) |
+| Single stream at 131,072 (tok/s / TTFT) | 230.6 / 12.42 s | 220.7 / 12.13 s | within noise |
+| Single stream at 500,000 | 225.5 / 53.03 s | 237.2 / 52.98 s | within noise (n = 1) |
+| 500K sessions × 1 / 2 / 4, total decode from the server log | 233.3 / 350.6 / 456.3 | 220.5 / 351.8 / 453.5 | within noise |
+| Needles (9) / GSM8K (n = 100) | 9 / 9, 0.97 (8-session container) | 9 / 9, 0.98 (§3.25.1) | — |
+
+So 4M costs no measurable speed and 1.83 GB of free GPU, and buys room for eight 500K sessions.
+**Not yet on production.** A drop-in for it is staged but inactive (see [KV-POOLS.md](KV-POOLS.md));
+predicted free GPU after boot on the production card is 7.14 GB, since Modal matched the
+production card exactly at 1.31M and at 2M.
+
+#### 3.25.5 The 4M pool together with `--prefill-decode-interval 8`
+
+`[Modal]` run `r20261028c40p8`: the 4M pool plus `--prefill-decode-interval 8`, the flag §3.24 recommends
+to cut in-turn stalls. It boots (316 s) with the same memory as 4M alone: host KV 48.00 + 4.00 GiB,
+`max_total_num_tokens=4194304`, **7.14 GB** free GPU.
+
+| | 4M + interval 8 | 4M alone (§3.25.4, A/B container) |
+|---|---|---|
+| Aggregate decode, 1 / 2 / 4 / 8 short streams (tok/s) | 261.9 / 360.9 / 548.2 / 744.8 | 273.0 / 405.3 / 599.4 / 807.7 |
+| Eight 500K sessions: all cached on follow-up? | yes, 8 / 8 | yes, 8 / 8 |
+| Follow-up first token with all eight active | 6.6–9.0 s | 2.6–7.0 s |
+| GSM8K, n = 100 | **0.98** (0 errors, 0 truncated, 0 degenerate) | 0.97 |
+
+The two columns come from different containers, which read 5–10 % apart on their own (§3.25.4),
+so the −4 / −11 / −9 / −8 % gap is an upper bound on the flag's cost, not a measurement of it. The
+−11 % at 2 streams matches §3.24's per-stream cost for the same flag. The combination works; the
+flag trades a few percent of short-stream throughput for far shorter freezes while other sessions prefill.
 
 ## 4. Quality instruments — what each one can and cannot see
 
@@ -1970,7 +2107,7 @@ Added by the 2026-10-28 S8-FP8 profile (§3.23):
 
 | Item | Status |
 |---|---|
-| KL divergence of S8-FP8 against BF16 | **pending.** |
-| S8-FP8 on the production Max-Q (300 W, Gen4) | **not measured.** Every §3.23 number is a 600 W Server Edition number; absolute rates on the Max-Q will be lower, by an amount not measured. Live production numbers to follow. |
+| KL divergence of S8-FP8 against BF16 | **measured** (§3.25): 0.087 nats/token, top-1 91.8 % vs BF16-vs-BF16 0.005 / 99.3 %. |
+| S8-FP8 on the production Max-Q (300 W, Gen4) | **not measured.** Every §3.23 number is a 600 W Server Edition number; absolute rates on the Max-Q will be lower, by an amount not measured. Live production numbers under load are in §3.25; a controlled (idle-card) production run has not been done. |
 | A same-session A/B of previous production, BF16 cap 8 and S8-FP8 | **not run.** The FP8 arm and the two BF16 arms ran in two Modal sessions on the same day. |
 | Using the VRAM that FP8 frees (larger pool, or more hot-cache sets) | **not measured.** 16,384 sets did not fit next to the production pool; smaller steps were not tried. |

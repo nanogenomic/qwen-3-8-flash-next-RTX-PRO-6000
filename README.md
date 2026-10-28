@@ -25,7 +25,8 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 > **More long sessions resident at once?** **[KV-POOLS.md](KV-POOLS.md)**: raise the host-RAM pool
 > to 1.5M or 2M tokens with two settings (`--max-total-tokens`, `SGLANG_QSA_HOST_KV_MAX_GB`). Same
 > decode speed, four 500K sessions stay cached instead of two, for 10.75 GiB of host RAM and 0.64 GB
-> of GPU memory at 2M. Verified in production.
+> of GPU memory at 2M. Verified in production. A 4M pool holds eight 500K sessions at the same speed
+> (Modal; [BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions)).
 
 ---
 
@@ -37,6 +38,9 @@ hyper-connection mix, lm_head) as 8-bit FP8 at load time, and raises the running
 from 4 to 8. The MoE experts stay NVFP4 and the KV cache stays fp8, exactly as before.
 Launch block: [CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams).
 Full tables: [BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27).
+**Every measured S8-FP8 number in one place** (KL vs BF16 0.087 nats/token and 91.8 % top-1; decode-path
+lossless check FAIL; needles 20/20; speed by context; production under live load; 2M and 4M pools):
+[BENCHMARKS §3.25](BENCHMARKS.md#325-every-measured-number-for-the-s8-fp8-profile-in-one-place-quality-speed-by-context-production-bigger-pools-2026-10-28).
 
 `[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` Same host-KV pool (1,310,720
 tokens), same 540K context, same NEXTN 3/1/4 speculation with the hot-24k token map. Aggregate
