@@ -83,6 +83,14 @@ no interactive turn is active; abort in-flight filler with `/abort_request` when
 an interactive turn arrives. Do not co-run the filler during active interactive
 decode.
 
-Follow-up: these numbers are on the 1,310,720-token host pool. For a larger pool
-with `--prefill-decode-interval 8`, re-run the same A/B on a matching Modal
-configuration before relying on it there.
+## With `--prefill-decode-interval 8`
+
+Repeating the 4-stream A/B with `--prefill-decode-interval 8` (3 reps) leaves the
+tradeoff unchanged: idle-gated filler adds +82% total output (24.2 -> 44.0
+tok/s), interactive first-token p90 is within noise (63.0 -> 62.7 s, -0.5%),
+peak pool use is unchanged (0.52 -> 0.48), and the filler stays non-degenerate.
+
+Follow-up: all numbers here are on the 1,310,720-token host pool. For a larger
+pool (with or without `--prefill-decode-interval 8`), re-run the same A/B on a
+matching configuration before relying on it there; pool size is the one
+variable this study did not vary.
