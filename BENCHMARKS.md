@@ -1804,7 +1804,8 @@ So 4M costs no measurable speed and 1.83 GB of free GPU, and buys room for eight
 **Booted on a 300 W Max-Q card serving other traffic**, together with `--prefill-decode-interval 8`
 ([KV-POOLS §4.1](KV-POOLS.md#41-boot-at-4194304-tokens-with---prefill-decode-interval-8)).
 The prediction held: that card's boot log shows 48.00 + 4.00 GiB host KV and **7.14 GB** free GPU,
-the same as Modal, as it was at 1.31M and at 2M.
+the same as Modal, as it was at 1.31M and at 2M. On that card at 4M + interval 8: GSM8K n=100 **0.97**,
+a 500K needle **1/1** (66.3 s), restart to `/health` 200 in 4 min 8 s, `NRestarts=0`.
 
 #### 3.25.5 The 4M pool together with `--prefill-decode-interval 8`
 

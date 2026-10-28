@@ -92,8 +92,15 @@ At 2,097,152 tokens, applied as a systemd drop-in on an RTX PRO 6000 Max-Q (300 
 
 Armed as `60-kvpool.conf` (4M, replacing the 2M file, which is kept as `60-kvpool.conf.bak-2m`) plus
 `70-pdi8.conf`, same card. Boot log: host KV **48.00 + 4.00 GiB**, `max_total_num_tokens=4194304`,
-**7.14 GB** free GPU after boot (Modal predicted 7.14 GB). `/health` 200, `NRestarts=0`. Quality and
-long-session checks on this card at 4M have not been re-run yet.
+**7.14 GB** free GPU after boot (Modal predicted 7.14 GB). Restart to `/health` 200: **4 min 8 s**;
+`NRestarts=0` before and after the checks below. `nvidia-smi` 93,072 / 97,887 MiB; 349 GiB host RAM still
+available. Checks on this card at 4M + interval 8, while it kept serving other traffic:
+
+- GSM8K n=100: **0.97** (0 errors, 0 truncated, 0 degenerate; 159.1 s).
+- 500K-token needle: **1/1** in 66.3 s.
+- Short chat OK; `/v1/models` reports `max_model_len` 540,000.
+
+The 9-needle set, the depth table and the concurrency sweep have not been re-run on this card at 4M.
 
 ## 5. 1M context is lossy — keep 540K
 
