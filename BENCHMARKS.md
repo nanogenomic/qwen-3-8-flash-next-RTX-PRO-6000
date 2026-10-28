@@ -1802,9 +1802,10 @@ container read 5–10 % slow across the board, including on short prompts where 
 | Needles (9) / GSM8K (n = 100) | 9 / 9, 0.97 (8-session container) | 9 / 9, 0.98 (§3.25.1) | — |
 
 So 4M costs no measurable speed and 1.83 GB of free GPU, and buys room for eight 500K sessions.
-**Not yet on production.** A drop-in for it is staged but inactive (see [KV-POOLS.md](KV-POOLS.md));
-predicted free GPU after boot on the production card is 7.14 GB, since Modal matched the
-production card exactly at 1.31M and at 2M.
+**On production since 2026-10-28 4:14 AM ET**, together with `--prefill-decode-interval 8`
+([KV-POOLS §4.1](KV-POOLS.md#41-production-boot-at-4194304-tokens-with---prefill-decode-interval-8-2026-10-28)).
+The prediction held: the production boot log shows 48.00 + 4.00 GiB host KV and **7.14 GB** free GPU,
+the same as Modal, as it was at 1.31M and at 2M.
 
 #### 3.25.5 The 4M pool together with `--prefill-decode-interval 8`
 

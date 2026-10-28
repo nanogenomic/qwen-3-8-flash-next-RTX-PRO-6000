@@ -18,17 +18,25 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 > and the mamba-slot admission fix (`0041`, a bug fix with no switch).
 
 > **Serving long context — 250K+ per agent, or several long agents on one card?** Start at
-> **[CONTEXT-PROFILES.md](CONTEXT-PROFILES.md)**: two copyable flag profiles (on-GPU KV, and a
-> host-RAM KV pool of 1.31M tokens), which one to pick, and what each costs in step time and in
-> delivered throughput. And add **`--mamba-max-states-per-path 2`** — [below](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
+> **[CONTEXT-PROFILES.md](CONTEXT-PROFILES.md)**: copyable launch profiles and a "which one to pick"
+> table by number of sessions × context length:
 >
-> **More long sessions resident at once?** **[KV-POOLS.md](KV-POOLS.md)**: raise the host-RAM pool
-> to 1.5M or 2M tokens with two settings (`--max-total-tokens`, `SGLANG_QSA_HOST_KV_MAX_GB`). Same
-> decode speed, four 500K sessions stay cached instead of two, for 10.75 GiB of host RAM and 0.64 GB
-> of GPU memory at 2M. Verified in production. A 4M pool holds eight 500K sessions at the same speed
-> (Modal; [BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions)).
-> Copyable opt-in configs for 2M, 4M and the optional `--prefill-decode-interval 8` flag, with
-> measured trade-offs and rollback: **[KV-POOLS §8](KV-POOLS.md#8-options-2m-4m-and-the-interval-flag)** and [`ops/examples/kv-pools/`](ops/examples/kv-pools/).
+> - **On-GPU KV** (451,264-token pool): fastest per step; one agent up to ~400K.
+> - **Host-RAM KV pool, 1,310,720 tokens** (the repo default): two 500K sessions stay cached. Costs
+>   13–19 % per decode step against on-GPU KV at production depths (+2 % below 50K context).
+> - **2M pool** (2,097,152 tokens): four 500K sessions cached. Same decode speed as 1.31M. Ran in
+>   production from 2:06 AM ET on 2026-10-28.
+> - **4M pool** (4,194,304 tokens): eight 500K sessions cached. Decode speed within noise of 2M, 1.83 GB
+>   less free GPU. Booted in production at 4:14 AM ET on 2026-10-28, together with the flag below.
+> - **Optional `--prefill-decode-interval 8`**: a long prefill in one session no longer freezes the
+>   others (worst 4-stream stall 7.79 s → 0.76 s), for +27 % on a cold 300K prefill and −11 % per stream
+>   at 2 busy streams.
+>
+> Copyable systemd drop-ins and a plain launch script: [`ops/examples/kv-pools/`](ops/examples/kv-pools/).
+> Measured trade-offs and rollback: **[KV-POOLS §8](KV-POOLS.md#8-options-2m-4m-and-the-interval-flag)**.
+> Whichever you pick, add **`--mamba-max-states-per-path 2`** when more than one long conversation shares the
+> card (it caps saved recurrent-state checkpoints per conversation; it is separate from
+> `--max-mamba-cache-size`, which S8-FP8 sets to 48) — [below](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
 
 ---
 
@@ -396,7 +404,7 @@ These are the conclusions of the suite, measured on the second card and read acr
 |---|---|---|
 | `--mem-fraction-static` | **0.97**, not 0.98 | 0.98 left 287 MiB of device-free VRAM and died in prefill under a 14-deep queue; 0.97 leaves ~1.74 GB. Costs 71,616 pool tokens |
 | `--context-length` | **540000**, no YaRN | Short-context output lossless vs 262,144; costs ~3 % pool; caps nothing the pool could hold |
-| Per-request window to advertise | **~400K (393,216)** on a shared card with an on-GPU pool; **two concurrent 250–300K mains** once the pool is host-resident | Where the pool binds. At 451,264 one ~400K request needs most of the pool, so gate it as exclusive use. At 1,310,720 it stops being the constraint — see below |
+| Per-request window to advertise | **~400K (393,216)** on a shared card with an on-GPU pool; **two concurrent 250–300K mains** once the pool is host-resident at 1.31M; four 500K sessions at 2M, eight at 4M ([KV-POOLS](KV-POOLS.md)) | Where the pool binds. At 451,264 one ~400K request needs most of the pool, so gate it as exclusive use. At 1,310,720 it stops being the constraint — see below |
 | `--max-mamba-cache-size` | **36** at 4 running requests — **do not lower it** | Prefix-cache hit 5 % → 96 %, TTFT 16.8 s → 2.5 s for 6 agent conversations. The logged `mamba usage` makes it look over-provisioned; it is not |
 | `--mamba-max-states-per-path` | **2** whenever more than one long conversation shares the card | Two 300K+ mains: 0/10 → 10/10 turns cached, 31–37 s → 0.7–0.85 s per turn ([§3.21](BENCHMARKS.md#321-the-mamba-checkpoint-path-cap--the-flag-that-makes-multi-lane-high-context-work)). Upstream flag, no VRAM. Not 1 |
 | `--max-running-requests` | **stay at 4** | Aggregate throughput barely rises beyond it; each extra stream costs ~29K pool |
@@ -423,7 +431,7 @@ request because that is where a 451,264-token pool binds. **Moving the KV pool i
 changes that number by 2.9×**, for no VRAM at all — it gives some back — and it is what the
 reference deployment now serves on:
 
-| | On-GPU KV | **Host-resident KV, current** |
+| | On-GPU KV | **Host-resident KV (2026-09-30)** |
 |---|---|---|
 | `max_total_num_tokens` | 451,264 | **1,310,720** |
 | Pinned host RAM | — | **16.25 GiB** |
@@ -450,6 +458,10 @@ prefixes entirely (TTFT 22.9 s and 41.1 s, `cache_hit_rate` 0.0).** Needles pass
 300K–520K and 2/2 at two concurrent 250Ks; a 6 × 7-turn agent simulation holds a 95.6 % cached
 fraction with 0 errors. Full tables, the control, and the limits:
 [BENCHMARKS §3.15](BENCHMARKS.md#315-host-resident-qsa-kv-pool--1310720-tokens-on-one-96-gb-card).
+
+Since then the pool has grown again with no change in decode speed: 2,097,152 tokens (four 500K
+sessions cached) and 4,194,304 tokens (eight), both with `--context-length 540000`. See
+[KV-POOLS.md](KV-POOLS.md) and [CONTEXT-PROFILES §4c](CONTEXT-PROFILES.md#4c-bigger-pools-2m-and-4m-and-the-interval-flag).
 
 Three things to get right before you copy it:
 

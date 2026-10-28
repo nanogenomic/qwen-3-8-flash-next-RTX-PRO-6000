@@ -25,6 +25,9 @@ The evidence behind this page lives in [BENCHMARKS §3.21](BENCHMARKS.md#321-the
 | One agent up to ~400K, **or** two up to ~200K each, and nothing else long | **A — on-GPU KV** | baseline | **451,264** tokens `[measured]` |
 | Two or more long agents (250K–400K each) plus subagents, on one card | **B — host-RAM KV** | **+2 %** at <50K context, **+11–15 %** at 50K–450K, single stream `[measured, depth-matched]` | **1,310,720** tokens `[measured]` |
 | Profile B's workload, up to 8 concurrent agents, faster per stream, and a slightly lossy decode is acceptable | **[S8-FP8](#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams)** — host KV, FP8 dense weights, cap 8 | **faster**: 276.8 vs 228.3 tok/s single-stream, 784.1 at 8 streams `[measured, 600 W Server Edition]`; 500K TTFT +5.6 s | **1,310,720** tokens `[measured]` |
+| S8-FP8 with **three or four** long sessions (up to 4 × 500K) | **[S8-FP8 + 2M pool](#4c-bigger-pools-2m-and-4m-and-the-interval-flag)** | same decode speed as the 1.31M pool `[measured]` | **2,097,152** tokens |
+| S8-FP8 with **five to eight** long sessions (up to 8 × 500K) | **[S8-FP8 + 4M pool](#4c-bigger-pools-2m-and-4m-and-the-interval-flag)** | within noise of 2M `[measured, same-container A/B]` | **4,194,304** tokens |
+| Any host-KV profile where one session's long cold prompt (e.g. a compaction) must not freeze the others | add **[`--prefill-decode-interval 8`](#4c-bigger-pools-2m-and-4m-and-the-interval-flag)** | +27 % cold 300K prefill, −11 % per stream at 2 busy streams `[measured]` | unchanged |
 | One request near 1M tokens | not a profile here — see [CHANGES §3.4](CHANGES-vs-upstream.md#34-1m-context-on-one-card--measured-and-not-the-default) | — | lossy YaRN lane, quality gate INVALID |
 
 **Whichever you pick, add `--mamba-max-states-per-path 2` if more than one long conversation
@@ -278,7 +281,78 @@ This is the exact launch line that was benchmarked, with paths generalised.
 | `--max-mamba-cache-size 48` | Not section 2's "do not lower it" mistake: patch `0041` fixes the admission bug that made a small slot pool exhaust under concurrent admission, and 48 is what was measured at cap 8. 112 slots with BF16 at cap 8 booted a smaller pool (1,177,408) |
 | Hot-cache sets | **Keep 4,096.** 16,384 sets did not boot with this pool and context (out of GPU memory at 0.97 and 0.96) |
 | Production card | Not yet measured on the 300 W Max-Q; expect lower absolute numbers there |
-| Bigger pool | 1.5M and 2M tokens measured with unchanged decode speed; 2M keeps four 500K sessions cached. Flags, costs and drop-in: [KV-POOLS.md](KV-POOLS.md) |
+| Bigger pool | 1.5M, 2M and 4M tokens measured with unchanged decode speed; 2M keeps four 500K sessions cached, 4M keeps eight. Launch blocks: [§4c](#4c-bigger-pools-2m-and-4m-and-the-interval-flag); full numbers: [KV-POOLS.md](KV-POOLS.md) |
+
+---
+
+## 4c. Bigger pools: 2M and 4M, and the interval flag
+
+S8-FP8 (§4b) with a larger host-RAM pool. The pool buys **room, not speed**: it decides how many
+long sessions keep their cache between turns. It does not change decode speed and it does not raise
+the per-session limit, which stays `--context-length 540000` (900K needles passed 1 of 3,
+[KV-POOLS §5](KV-POOLS.md#5-1m-context-is-lossy--keep-540k)). The repo default stays 1,310,720.
+
+### Which pool to pick: sessions × context
+
+The pool is shared. A session stays cached only if every live session's context fits in it at once.
+`[measured, Modal]` rows come from [KV-POOLS §3](KV-POOLS.md#3-measured-modal-one-gpu-per-run) and
+[BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions); the rule is `[arithmetic]`.
+
+| Long sessions at once | 500K each | Pool | What was measured |
+|---|---|---|---|
+| 1–2 | ≤ 1.0M | **1,310,720** (default) | 2 × 500K cached; a third evicts the others (next first token 52.5 s and 106.9 s instead of 2.5 s) |
+| 3 | ≤ 1.5M | 1,572,864 | 3 × 500K, 396.7 tok/s total decode |
+| 3–4 | ≤ 2.0M | **2,097,152** | 4 × 500K cached, follow-up first token 2.45–3.53 s |
+| 5–8 | ≤ 4.0M | **4,194,304** | 8 × 500K cached, follow-up first token 2.6–7.0 s with all eight active; 6 × 500K 2.9–6.1 s |
+
+Rule of thumb `[arithmetic]`: pool ≥ sum of the contexts you want kept cached, with some slack for
+subagents and short requests. For shorter sessions, e.g. 250K each, the same pool holds about twice
+as many; that case was not benchmarked separately.
+
+### Copyable: 2M or 4M
+
+Start from the §4b block, then change two settings:
+
+```bash
+# 2M pool (four 500K sessions)
+export SGLANG_QSA_HOST_KV_MAX_GB=28      # guard per pool; target pool is 24.00 GiB at 2M
+#   ...and in the §4b launch line:  --max-total-tokens 2097152
+
+# 4M pool (eight 500K sessions)
+export SGLANG_QSA_HOST_KV_MAX_GB=50      # target pool is 48.00 GiB at 4M
+#   ...and in the §4b launch line:  --max-total-tokens 4194304
+```
+
+### Add-on: `--prefill-decode-interval 8`
+
+Append `--prefill-decode-interval 8` to the launch line (any pool size). The scheduler then runs
+decode steps between prefill chunks, so one session's long prefill stops freezing the others.
+
+Or use the ready-made files: systemd drop-ins (`60-kvpool-2m.conf.staged`, `60-kvpool-4m.conf.staged`,
+`70-pdi8.conf.staged`) and a plain launcher (`POOL=4m PDI8=1 ./launch-s8fp8-kvpool.sh`) in
+[`ops/examples/kv-pools/`](ops/examples/kv-pools/). Apply and rollback steps:
+[KV-POOLS §8.4](KV-POOLS.md#84-apply-and-roll-back-systemd).
+
+### What each costs `[measured]`
+
+| | Cost | Source |
+|---|---|---|
+| Host-RAM KV vs on-GPU KV | **13–19 %** per decode step at production depths; depth-matched +2 % below 50K, +11–15 % at 50K–450K | §5.1 below |
+| Growing the pool, 1.31M → 4M | **no further speed cost**: 1 / 2 / 4 / 8 short streams 274.9 / 402.8 / 609.3 / 811.2 tok/s at 1.31M, 273.9 / 403.2 / 604.5 / 804.9 at 2M | [KV-POOLS §3](KV-POOLS.md#3-measured-modal-one-gpu-per-run) |
+| 4M vs 2M, same container | 273.0 / 405.3 / 599.4 / 807.7 vs 278.7 / 403.0 / 603.7 / 807.5 tok/s (−2.0 / +0.6 / −0.7 / 0.0 %, noise) | [BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions) |
+| Memory, 2M | 24.00 + 2.00 GiB pinned host RAM; 8.97 GB free GPU after boot (1.31M: 9.61 GB) | [KV-POOLS §1](KV-POOLS.md#1-short-version) |
+| Memory, 4M | 48.00 + 4.00 GiB pinned host RAM; 7.14 GB free GPU after boot (Modal and production) | same |
+| Quality | needles 9/9 at 1.5M, 2M and 4M; GSM8K 0.97 / 0.98 / 0.97 | [KV-POOLS §3](KV-POOLS.md#3-measured-modal-one-gpu-per-run) |
+| Interval flag: what it buys | worst 4-stream stall 7.79 s → 0.76 s; others frozen during a cold 300K prefill 28.2 s → at most 1.27 s | [BENCHMARKS §3.24](BENCHMARKS.md#324-troughs-compaction-and-between-turn-2026-10-28) |
+| Interval flag: what it costs | cold 300K prefill +27 % (29.5 → 37.5 s); per stream −11 % at 2 busy streams, −2 % at 4; 1 stream unchanged | same |
+| 4M + interval flag | boots, 7.14 GB free GPU, 8 × 500K cached (follow-up first token 6.6–9.0 s), GSM8K 0.98; short streams 4–11 % below 4M alone, measured in a different container (containers differ 5–10 % on their own), so an upper bound | [BENCHMARKS §3.25.5](BENCHMARKS.md#3255-the-4m-pool-together-with---prefill-decode-interval-8) |
+
+Known not to work with this profile: `--enable-mixed-chunk` (crashed under 2-stream load), turning
+the overlap scheduler off (will not start), `--max-mamba-cache-size 112` (no gain, more memory,
+slower 500K follow-ups), and `SGLANG_QSA_HOST_KV_STATS=1` (can break CUDA-graph capture at boot).
+
+Production: the 2M pool ran from 2026-10-28 2:06 AM ET; the 4M pool with the interval flag booted at
+4:14 AM ET the same day ([KV-POOLS §4.1](KV-POOLS.md#41-production-boot-at-4194304-tokens-with---prefill-decode-interval-8-2026-10-28)).
 
 ---
 
