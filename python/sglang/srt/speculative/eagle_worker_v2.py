@@ -364,9 +364,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
+                _orig_head = head
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
+                # port: keep the sm120 online-fp8 rowwise scale with the hot-token rows
+                _rs = getattr(_orig_head, "_sm120_rowwise_scale", None)
+                if _rs is not None:
+                    setattr(head, "_sm120_rowwise_scale", _rs[self.hot_token_id].contiguous())
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)

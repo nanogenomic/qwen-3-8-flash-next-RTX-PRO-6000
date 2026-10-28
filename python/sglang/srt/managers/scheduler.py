@@ -3848,6 +3848,41 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _mamba_admission_ok(self, req, can_run_list) -> bool:
+        """Local fix: admit only if the static mamba pool can cover every slot the
+        batch will still allocate (working state + first ping-pong buffer), else the
+        batch alloc asserts and kills the scheduler."""
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        pool = self.req_to_token_pool
+        if not isinstance(pool, HybridReqToTokenPool):
+            return True
+
+        def outstanding(r) -> int:
+            n = 1 if r.kv.mamba_pool_idx is None else 0
+            if pool.enable_mamba_extra_buffer and r.kv.mamba_ping_pong_track_buffer is None:
+                n += (
+                    1
+                    if pool.enable_mamba_extra_buffer_lazy
+                    else pool.mamba_ping_pong_track_buffer_size
+                )
+            return n
+
+        need = outstanding(req) + sum(outstanding(r) for r in can_run_list)
+        if need == 0:
+            return True
+        alloc = pool.mamba_allocator
+        avail = alloc.available_size()
+        if avail < need and self.tree_cache is not None and self.tree_cache.supports_mamba():
+            # can_run_list sources are pinned by add_one_req's lock, so this cannot
+            # evict a state an admitted request still has to COW from.
+            self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=0, mamba_num=need - avail)
+            )
+            avail = alloc.available_size()
+        return avail >= need
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3966,9 +4001,8 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # Local fix (ping-pong exhaustion): no group prealloc here -- it hides free
+        # slots from _mamba_admission_ok; it was only a batching optimization.
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -4025,6 +4059,10 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if not self._mamba_admission_ok(req, adder.can_run_list):
+                # Stay queued (keep FCFS order); running requests free slots as
+                # they finish or cross a track boundary.
+                break
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
@@ -4074,9 +4112,6 @@ class Scheduler(
                         )
                         req.kv.mamba_pool_idx = None
                 break
-
-        if mamba_allocator is not None:
-            mamba_allocator.alloc_group_end()
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

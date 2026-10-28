@@ -1,0 +1,155 @@
+From 67246d4422ec76477ed3c077c150044bd4f1b82c Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 28 Oct 2026 00:07:44 -0400
+Subject: [PATCH 40/42] perf(qsa): split-K for the QSA indexer MQA scoring
+ kernel
+
+Port of Lesilva's patch 0003 (QSA indexer split-K). Deep long-context chunks
+otherwise launch about 8 CTAs on 188 SMs. With split-K, several CTAs per row
+block each score a disjoint range of the block's key tiles. Every logit is
+still produced by exactly one CTA with the same tile arithmetic, so results are
+bit-identical to split=1; only the grid grows.
+
+SGLANG_QSA_MQA_SPLITK=auto (default) picks a power-of-two split that aims for a
+few waves while keeping a minimum number of key tiles per CTA. =1 disables it;
+any other integer forces that split.
+
+Credit: Lesilva (qwen38-flashnext-nvfp4-kv).
+---
+ python/sglang/srt/layers/attention/qsa/mqa.py | 84 ++++++++++++++-----
+ 1 file changed, 62 insertions(+), 22 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/mqa.py b/python/sglang/srt/layers/attention/qsa/mqa.py
+index 88e201e..1f549c1 100644
+--- a/python/sglang/srt/layers/attention/qsa/mqa.py
++++ b/python/sglang/srt/layers/attention/qsa/mqa.py
+@@ -2,6 +2,7 @@
+ the torch implementations are the fallback and the reference."""
+ 
+ import math
++import os
+ from typing import Optional
+ 
+ import torch
+@@ -124,7 +125,12 @@ if HAS_TILELANG:
+         block_q: int = 32,
+         num_stages: int = 3,
+         threads: int = 512,
++        split: int = 1,
+     ):
++        # Local (split-K): `split` CTAs per row block each score a disjoint range of
++        # the block's key tiles. Every logit is still produced by exactly one CTA with
++        # the same tile arithmetic, so results are bit-identical to split=1; only the
++        # grid grows (deep long-context chunks otherwise launch ~8 CTAs on 188 SMs).
+         rows = T.dynamic("rows")
+         keys = T.dynamic("keys")
+ 
+@@ -136,7 +142,10 @@ if HAS_TILELANG:
+             Starts: T.Tensor([rows], T.int32),  # type: ignore
+             Ends: T.Tensor([rows], T.int32),  # type: ignore
+         ):
+-            with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
++            with T.Kernel(T.ceildiv(rows, block_q), split, threads=threads) as (
++                bx,
++                by,
++            ):
+                 q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
+                 k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
+                 scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
+@@ -151,26 +160,31 @@ if HAS_TILELANG:
+                     start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
+                     end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+ 
+-                T.copy(Q[row_base * heads, 0], q_shared)
+-                for ni in T.Pipelined(
+-                    T.ceildiv(end_max - start_min, block_n), num_stages=num_stages
+-                ):
+-                    T.copy(K[start_min + ni * block_n, 0], k_shared)
+-                    T.gemm(
+-                        k_shared,
+-                        q_shared,
+-                        scores,
+-                        transpose_B=True,
+-                        clear_accum=True,
+-                        policy=T.GemmWarpPolicy.FullCol,
+-                    )
+-                    for n, qi, head in T.Parallel(block_n, block_q, heads):
+-                        scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
+-                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+-                    for qi, n in T.Parallel(block_q, block_n):
+-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
+-                            n, qi
+-                        ]
++                tiles = T.alloc_var(T.int32)
++                tile_lo = T.alloc_var(T.int32)
++                tile_hi = T.alloc_var(T.int32)
++                tiles = T.ceildiv(end_max - start_min, block_n)
++                tile_lo = tiles * by // split
++                tile_hi = tiles * (by + 1) // split
++                if tile_lo < tile_hi:
++                    T.copy(Q[row_base * heads, 0], q_shared)
++                    for ni in T.Pipelined(tile_hi - tile_lo, num_stages=num_stages):
++                        T.copy(K[start_min + (tile_lo + ni) * block_n, 0], k_shared)
++                        T.gemm(
++                            k_shared,
++                            q_shared,
++                            scores,
++                            transpose_B=True,
++                            clear_accum=True,
++                            policy=T.GemmWarpPolicy.FullCol,
++                        )
++                        for n, qi, head in T.Parallel(block_n, block_q, heads):
++                            scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
++                        T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
++                        for qi, n in T.Parallel(block_q, block_n):
++                            Logits[
++                                row_base + qi, start_min + (tile_lo + ni) * block_n + n
++                            ] = reduced[n, qi]
+ 
+         return kernel
+ 
+@@ -275,6 +289,29 @@ if HAS_TILELANG:
+         return kernel
+ 
+ 
++# Local (split-K): aim for a few waves of CTAs, but keep >= _SPLITK_MIN_TILES key
++# tiles per CTA so short windows do not drown in per-CTA Q loads. Powers of two
++# bound the number of compiled kernel variants. SGLANG_QSA_MQA_SPLITK=1 disables
++# it; any other integer forces that split.
++_SPLITK_TARGET_CTAS = 4 * 188
++_SPLITK_MIN_TILES = 4
++_SPLITK_MAX = 64
++_SPLITK_BLOCK_N = 64
++
++
++def _qsa_mqa_prefill_split(padded_rows: int, keys: int, block_q: int) -> int:
++    forced = os.environ.get("SGLANG_QSA_MQA_SPLITK", "auto")
++    if forced != "auto":
++        return max(1, int(forced))
++    row_blocks = max(1, padded_rows // block_q)
++    max_by_tiles = max(1, -(-keys // _SPLITK_BLOCK_N) // _SPLITK_MIN_TILES)
++    want = min(_SPLITK_MAX, max_by_tiles, -(-_SPLITK_TARGET_CTAS // row_blocks))
++    split = 1
++    while split * 2 <= want:
++        split *= 2
++    return split
++
++
+ def tilelang_qsa_mqa_prefill(
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -309,7 +346,10 @@ def tilelang_qsa_mqa_prefill(
+         starts = torch.cat([starts, starts[-1:].expand(padding)])
+         ends = torch.cat([ends, ends[-1:].expand(padding)])
+ 
+-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
++    split = _qsa_mqa_prefill_split(padded_rows, keys, block_q)
++    _tilelang_qsa_mqa_prefill_kernel(
++        heads=heads, head_dim=head_dim, block_q=block_q, split=split
++    )(
+         q_padded.reshape(-1, head_dim),
+         k[:, 0].to(torch.bfloat16).contiguous(),
+         logits,
+-- 
+2.43.0
+

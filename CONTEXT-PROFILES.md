@@ -24,6 +24,7 @@ The evidence behind this page lives in [BENCHMARKS §3.21](BENCHMARKS.md#321-the
 |---|---|---|---|
 | One agent up to ~400K, **or** two up to ~200K each, and nothing else long | **A — on-GPU KV** | baseline | **451,264** tokens `[measured]` |
 | Two or more long agents (250K–400K each) plus subagents, on one card | **B — host-RAM KV** | **+2 %** at <50K context, **+11–15 %** at 50K–450K, single stream `[measured, depth-matched]` | **1,310,720** tokens `[measured]` |
+| Profile B's workload, up to 8 concurrent agents, faster per stream, and a slightly lossy decode is acceptable | **[S8-FP8](#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams)** — host KV, FP8 dense weights, cap 8 | **faster**: 276.8 vs 228.3 tok/s single-stream, 784.1 at 8 streams `[measured, 600 W Server Edition]`; 500K TTFT +5.6 s | **1,310,720** tokens `[measured]` |
 | One request near 1M tokens | not a profile here — see [CHANGES §3.4](CHANGES-vs-upstream.md#34-1m-context-on-one-card--measured-and-not-the-default) | — | lossy YaRN lane, quality gate INVALID |
 
 **Whichever you pick, add `--mamba-max-states-per-path 2` if more than one long conversation
@@ -223,6 +224,60 @@ estimate assumes the tax is miss traffic, which the depth-matched data supports 
 50K, where the hot cache covers almost everything) but does not prove, and no same-card
 Gen4/Gen5 A/B exists. [§3.20](BENCHMARKS.md#320-throughput-versus-concurrency-warm-segmented--and-the-071-retraction)'s
 statement that no Gen4/Gen5 *decode factor* has been measured still stands.
+
+---
+
+## 4b. Profile S8-FP8 (8-bit dense, cap 8) — host-RAM KV, eight streams
+
+Profile B with two changes: the always-on BF16 weights are served as 8-bit FP8 (patch `0042`),
+and the running-request cap goes from 4 to 8. Use it when you want more tokens per second per
+stream and more simultaneous agents, and can accept a slightly lossy decode. Evidence:
+[BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27).
+Requires this series through patch `0042`.
+
+```bash
+# the exports from Profile A, plus Profile B's host-KV exports, then:
+export SGLANG_SM120_ONLINE_MXFP8=true          # online FP8 for the BF16 weights (lossy)
+export SGLANG_SM120_ONLINE_FP8_DENSE=rowwise   # 8-bit weight-only GEMV for the dense linears
+export SGLANG_QSA_MQA_SPLITK=auto              # the default; bit-identical
+export SGLANG_QSA_SORT_TOPK=0                  # the default; leave it off
+export SGLANG_TOOL_STRICT_LEVEL=2              # upstream: strict tool-call parsing
+
+python -m sglang.launch_server \
+  --model-path "<your Qwen3.8-Flash-Next NVFP4 checkpoint>" \
+  --quantization modelopt_fp4 --trust-remote-code \
+  --context-length 540000 \
+  --max-total-tokens 1310720 --mem-fraction-static 0.97 \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend flashinfer --sampling-backend flashinfer \
+  --moe-runner-backend flashinfer_cutlass --bf16-gemm-backend sm120gemv \
+  --mamba-ssm-dtype bfloat16 --mamba-radix-cache-strategy extra_buffer_lazy \
+  --max-mamba-cache-size 48 --mamba-max-states-per-path 2 \
+  --page-size 64 \
+  --max-running-requests 8 --cuda-graph-max-bs-decode 8 \
+  --cuda-graph-backend-prefill=disabled \
+  --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --speculative-token-map /path/to/hot_24k.pt \
+  --ple-offload-embedding --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+  --enable-metrics --enable-cache-report \
+  --enable-priority-scheduling --default-priority-value 0 --radix-eviction-policy priority \
+  --max-queued-requests 64 --crash-dump-folder /path/to/crashdumps
+```
+
+This is the exact launch line that was benchmarked, with paths generalised.
+
+| | Value |
+|---|---|
+| Aggregate, 1 / 2 / 4 / 8 streams | **276.8 / 400.4 / 610.8 / 784.1 tok/s** `[measured, Modal Server Edition 600 W]` |
+| Single stream at 41 / 131K / 500K tokens | **275.1 / 233.4 / 231.8 tok/s** `[measured, same]` |
+| 500K time to first token | **53.5 s** (BF16 at the same cap: 47.8 s) `[measured, n = 1]` |
+| Pool | 1,310,720 tokens, as Profile B `[measured, boot]` |
+| Quality | **Lossy.** Decode-path lossless check FAIL (median agreement 31 / 30 vs noise 49 / 45); needles 9 / 9, GSM8K 0.96, 0 / 192 degenerate, prefix-cache PASS. KL divergence pending |
+| `--max-mamba-cache-size 48` | Not section 2's "do not lower it" mistake: patch `0041` fixes the admission bug that made a small slot pool exhaust under concurrent admission, and 48 is what was measured at cap 8. 112 slots with BF16 at cap 8 booted a smaller pool (1,177,408) |
+| Hot-cache sets | **Keep 4,096.** 16,384 sets did not boot with this pool and context (out of GPU memory at 0.97 and 0.96) |
+| Production card | Not yet measured on the 300 W Max-Q; expect lower absolute numbers there |
 
 ---
 

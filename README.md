@@ -6,19 +6,79 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 
 **Base commit:** upstream SGLang `6fa3fe69e2e5e19b75cadd9fc285b72634551992`
 (*"[PD] Keep the sampling mask of a replayed rebootstrap token (#41235)"*).
-38 commits on top, 50 files, +8,466 / −103.
+42 commits on top, 56 files, +9,459 / −149.
 
 > **Every performance lever in this tree is env-gated and OFF by default.** With no
 > `SGLANG_QWENOPT_*` variable set and no `--bf16-gemm-backend sm120gemv`, the engine takes
 > the original upstream code paths. The two exceptions are the **QSA index-key ring fix**
 > (a correctness fix — it is always on, and `SGLANG_QSA_PENDING_RING_SLOTS` exists only to
 > pin the old, aliasing layout for an A/B) and `SGLANG_QSA_SHARE_SCRATCH`, which defaults
-> to on and only changes *where* a buffer is allocated.
+> to on and only changes *where* a buffer is allocated. Two of the 2026-10-28 patches are also on by
+> default: the QSA indexer split-K (`0040`, bit-identical; `SGLANG_QSA_MQA_SPLITK=1` disables it)
+> and the mamba-slot admission fix (`0041`, a bug fix with no switch).
 
 > **Serving long context — 250K+ per agent, or several long agents on one card?** Start at
 > **[CONTEXT-PROFILES.md](CONTEXT-PROFILES.md)**: two copyable flag profiles (on-GPU KV, and a
 > host-RAM KV pool of 1.31M tokens), which one to pick, and what each costs in step time and in
 > delivered throughput. And add **`--mamba-max-states-per-path 2`** — [below](#two-or-more-long-agents-on-one-card-add---mamba-max-states-per-path-2).
+
+---
+
+## Latest (2026-10-28): the S8-FP8 profile — 8-bit dense weights, 8 streams
+
+A new opt-in profile, **S8-FP8 (8-bit dense, cap 8)**, built from patches `0039`–`0042`. It
+serves the always-on BF16 weights (attention and DeltaNet projections, shared expert,
+hyper-connection mix, lm_head) as 8-bit FP8 at load time, and raises the running-request cap
+from 4 to 8. The MoE experts stay NVFP4 and the KV cache stays fp8, exactly as before.
+Launch block: [CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams).
+Full tables: [BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27).
+
+`[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` Same host-KV pool (1,310,720
+tokens), same 540K context, same NEXTN 3/1/4 speculation with the hot-24k token map. Aggregate
+tok/s at 1 / 2 / 4 / 8 concurrent streams, mean of 2 rounds:
+
+| Streams | Previous production config (cap 4, BF16 dense) | Same cap-8 config, BF16 dense | **S8-FP8** | vs previous production | vs BF16 cap 8 |
+|---|---|---|---|---|---|
+| 1 | 228.3 | 229.2 | **276.8** | **+21 %** | +21 % |
+| 2 | 342.2 | 342.3 | **400.4** | **+17 %** | +17 % |
+| 4 | 535.2 | 539.9 | **610.8** | **+14 %** | +13 % |
+| 8 | 531.5 | 759.2 | **784.1** | **+47.5 %** | +3.3 % |
+
+Read the 8-stream column correctly: almost all of the +47.5 % is the cap going from 4 to 8
+(the old config simply cannot run 8 at once). Against the same cap-8 shape in BF16 the FP8
+weights add +3.3 % at 8 streams; their gain is concentrated at 1–4 streams.
+
+Single stream, by context depth:
+
+| Context | Previous production | **S8-FP8** | Δ |
+|---|---|---|---|
+| short (41-token prompt, median of 3) | 233.1 tok/s | **275.1 tok/s** | +18 % |
+| 131,063 tokens | 197.2 | **233.4** | +18 % |
+| 499,991 tokens | 190.0 | **231.8** | +22 % |
+
+**What it costs.**
+
+- **It is slightly lossy.** Outputs are not token-identical to BF16. The decode-path
+  equivalence test **fails** its lossless claim: median greedy agreement with the baseline is
+  31 / 30 tokens at concurrency 1 / 4, against a baseline-vs-baseline noise floor of 49 / 45.
+  Task-level quality held: needle retrieval **9 / 9** at 131K, 262K and 500K; GSM8K **0.96**
+  (n = 100); **0 / 192** degenerate outputs; prefix-cache probe **PASS** with 0 errors. A
+  KL-divergence measurement against BF16 is pending.
+- **Prefill is slower.** 500K-token time to first token is **53.5 s**, against **47.8 s** for the
+  same cap-8 shape in BF16 (and 70.6 s for the previous production run). 131K: 13.1 s vs 11.1 s.
+- **Not yet measured on the production card.** These are Server Edition (600 W) numbers. The
+  production card is a 300 W Max-Q on PCIe Gen4, where absolute numbers will be lower. Live
+  numbers from the production lane will follow in a later update.
+
+Two of the four new patches are **not** env-gated, unlike the rest of this tree: the QSA indexer
+split-K (`0040`, `SGLANG_QSA_MQA_SPLITK` defaults to `auto`; bit-identical to the unsplit
+kernel, `=1` turns it off) and the mamba-slot admission fix (`0041`, a bug fix). The FP8 path
+(`0042`) and the top-k sort (`0039`) are off unless set.
+
+**Credits.** The online-FP8 path is a port of **mratsim**'s `sglang-qwen38fn-sm120-turbo`
+patches; the FP8 measurements that motivated it came from **Penny Royal** (`jpezzulli/sglang-rtxpro6000`);
+the weight-only 8-bit approach for low-batch dense layers is **gabrielolympie**'s; the split-K
+indexer and the mamba admission fix are ports of **Lesilva**'s patches 0003 and 0002.
 
 ---
 
@@ -448,9 +508,9 @@ UPSTREAM-BUG-cuda-graph-capture-invalidated.md  NOT an upstream bug after all: c
 CONTEXT-PROFILES.md      high-context flag profiles and their measured speed costs
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
-patches/                 the 38 commits as a git-am-able series against the base commit
+patches/                 the 42 commits as a git-am-able series against the base commit
 COMMIT-MAP.tsv           patch file -> development SHA, for the engineering notes
-python/  test/           the 50 changed files, at their exact upstream paths
+python/  test/           the 56 changed files, at their exact upstream paths
 clients/README.md        the client contract: what any orchestrator must do to use this well
 clients/hermes/          Hermes Agent reference implementation -- MIT, not Apache-2.0
 tools/qgate/             the quality-gate harness behind BENCHMARKS §4 (not part of the engine)
@@ -473,7 +533,7 @@ fork where the normal git operations work:
 ```bash
 cd /path/to/sglang-qwenopt
 git diff upstream-base..qwenopt                          # exactly this fork's change set
-git log  --oneline upstream-base..qwenopt                 # the 38 commits
+git log  --oneline upstream-base..qwenopt                 # the 42 commits
 git rebase --onto sglang/main upstream-base qwenopt       # rebase onto newer upstream
 ```
 
@@ -1093,6 +1153,10 @@ Everything is off unless listed otherwise. Details and measured effects per leve
 | `SGLANG_QWENOPT_FUSE_MOE_FINALIZE_ILP=1` | off | Loads a locally built flashinfer `fused_moe_120` with an ILP finalize (bitwise). Requires `SGLANG_QWENOPT_FI_MOE_SO`. Redundant when SBMOE is on. |
 | `SGLANG_QWENOPT_FI_MOE_SO` | unset | Path to that `.so`. No default; the ILP lever raises without it. |
 | `SGLANG_QWENOPT_FUSE_MOE_FINALIZE=1` | off | flashinfer's own fused finalize. **LOSSY and non-deterministic** (bf16 atomic adds). Not in the lossless stack. |
+| `SGLANG_SM120_ONLINE_MXFP8=true` | off | Serves the always-on BF16 weights as 8-bit FP8 at load on SM120 (dense/attention projections MXFP8; hyper-connection mix and lm_head rowwise FP8). **Lossy** — see [S8-FP8](#latest-2026-10-28-the-s8-fp8-profile--8-bit-dense-weights-8-streams). Patch `0042`. |
+| `SGLANG_SM120_ONLINE_FP8_DENSE` | `mxfp8` | With the above, `rowwise` serves the dense linears as 8-bit weight-only (FP8 weights, BF16 activations) through a rowwise FP8 GEMV at decode sizes. The fastest measured setting. |
+| `SGLANG_QSA_MQA_SPLITK` | **`auto`** | Split-K for the QSA indexer MQA scoring kernel (Lesilva). **Bit-identical** to the unsplit kernel. `1` disables; an integer forces that split. Patch `0040`. |
+| `SGLANG_QSA_SORT_TOPK=1` | off | Sorts the selected QSA top-k block indices before the gather. A bench toggle only; S8-FP8 leaves it off. Patch `0039`. |
 | `SGLANG_QSA_SHARE_SCRATCH` | **on** | One shared 128 MiB trtllm workspace + packed-KV scratch across QSA backends, instead of one per adaptive tier. Auto-off under two-batch overlap / PDMux. |
 
 ### Capacity and resilience levers

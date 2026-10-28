@@ -1,0 +1,137 @@
+From 7a2e30e1b19d4838d36eb861377d27d905a8ad86 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 28 Oct 2026 00:07:44 -0400
+Subject: [PATCH 41/42] fix(mamba): stop mamba-slot ping-pong exhaustion under
+ concurrent admission
+
+Port of Lesilva's patch 0002, rebased onto this fork's lock_receipt API.
+
+- No group prealloc of mamba slots at admission: it hid free slots from
+  _mamba_admission_ok and was only a batching optimization. A request that
+  cannot get a slot stays queued in FCFS order until running requests free one.
+- When no checkpoint was donated in a round (extend below the checkpoint grid,
+  or donation skipped under pressure), apply the same skip-MAMBA relock as the
+  normal path, so the admission lock no longer pins the COW source's mamba slot
+  for the whole request.
+
+Needed for --max-running-requests 8 with a small --max-mamba-cache-size (48).
+
+Credit: Lesilva (qwen38-flashnext-nvfp4-kv).
+---
+ python/sglang/srt/managers/scheduler.py       | 47 ++++++++++++++++---
+ .../srt/mem_cache/unified_radix_cache.py      | 20 ++++++++
+ 2 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index ceec2a8..894cc68 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3848,6 +3848,41 @@ class Scheduler(
+ 
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
++    def _mamba_admission_ok(self, req, can_run_list) -> bool:
++        """Local fix: admit only if the static mamba pool can cover every slot the
++        batch will still allocate (working state + first ping-pong buffer), else the
++        batch alloc asserts and kills the scheduler."""
++        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
++        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
++
++        pool = self.req_to_token_pool
++        if not isinstance(pool, HybridReqToTokenPool):
++            return True
++
++        def outstanding(r) -> int:
++            n = 1 if r.kv.mamba_pool_idx is None else 0
++            if pool.enable_mamba_extra_buffer and r.kv.mamba_ping_pong_track_buffer is None:
++                n += (
++                    1
++                    if pool.enable_mamba_extra_buffer_lazy
++                    else pool.mamba_ping_pong_track_buffer_size
++                )
++            return n
++
++        need = outstanding(req) + sum(outstanding(r) for r in can_run_list)
++        if need == 0:
++            return True
++        alloc = pool.mamba_allocator
++        avail = alloc.available_size()
++        if avail < need and self.tree_cache is not None and self.tree_cache.supports_mamba():
++            # can_run_list sources are pinned by add_one_req's lock, so this cannot
++            # evict a state an admitted request still has to COW from.
++            self.tree_cache.evict_for_alloc(
++                EvictParams(num_tokens=0, mamba_num=need - avail)
++            )
++            avail = alloc.available_size()
++        return avail >= need
++
+     def _get_new_batch_prefill_raw(
+         self,
+         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+@@ -3966,9 +4001,8 @@ class Scheduler(
+                     running_batch.reqs,
+                 )
+ 
+-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
++        # Local fix (ping-pong exhaustion): no group prealloc here -- it hides free
++        # slots from _mamba_admission_ok; it was only a batching optimization.
+         buffer_pipeline = self.tree_cache.buffer_pipeline
+         # Get requests from the waiting queue to a new prefill batch
+         for req in self.waiting_queue:
+@@ -4025,6 +4059,10 @@ class Scheduler(
+                     # marks the staged span below once it is surfaced.
+                     req.host_hit_is_storage = False
+ 
++            if not self._mamba_admission_ok(req, adder.can_run_list):
++                # Stay queued (keep FCFS order); running requests free slots as
++                # they finish or cross a track boundary.
++                break
+             req.init_next_round_input(self.tree_cache)
+             if self.enable_hicache_storage and (
+                 self._prefetch_after_device_hit_loss(req)
+@@ -4075,9 +4113,6 @@ class Scheduler(
+                         req.kv.mamba_pool_idx = None
+                 break
+ 
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_end()
+-
+         # Update waiting queue
+         can_run_list: List[Req] = adder.can_run_list
+         if len(can_run_list) == 0:
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index f9c0fcc..ae39952 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -1188,6 +1188,26 @@ class UnifiedRadixCache(BasePrefixCache):
+ 
+         if effective_cache_len <= 0:
+             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
++            # Local fix (ping-pong exhaustion): no checkpoint was donated this round
++            # (extend below the checkpoint grid, or donation skipped under pressure),
++            # so the relock below never runs and the admission lock would pin the
++            # COW source's mamba slot for the whole request. Apply the same
++            # skip-MAMBA relock as the normal path; the source was already COW'd.
++            if (
++                not chunked
++                and envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
++                and ComponentType.MAMBA in self.tree_components
++                and req.last_node is not None
++                and ComponentType.MAMBA
++                not in (req.lock_receipt.skipped_lock_components or ())
++            ):
++                # Ported to the 0a65190 receipt API (lock_receipt).
++                self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
++                lock_result = self.inc_lock_ref(
++                    req.last_node, skip_lock_components=(ComponentType.MAMBA,)
++                )
++                req.lock_receipt = lock_result.to_dec_params()
++                req.swa_prefix_lock_released = False
+             for comp in self._components_tuple:
+                 comp.cleanup_after_caching_req(
+                     req, is_finished=False, insert_params=insert_params
+-- 
+2.43.0
+

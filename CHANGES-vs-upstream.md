@@ -1,7 +1,7 @@
 # CHANGES vs upstream — full specification
 
 Base: upstream SGLang `6fa3fe69e2e5e19b75cadd9fc285b72634551992`.
-This fork: 38 commits, 50 files, +8,466 / −103.
+This fork: 42 commits, 56 files, +9,459 / −149.
 
 **How numbers are labelled.** `[measured]` means a number produced by a run on the
 hardware named. `[GPU2-proxy]` means it was measured on a **second, smaller SM120 card
@@ -30,6 +30,7 @@ has the detail.
 - [7. Why not 2x single-stream](#7-why-not-2x-single-stream)
 - [8. Things that are upstream's, not this fork's](#8-things-that-are-upstreams-not-this-forks)
 - [9. Commit list](#9-commit-list)
+- [10. The 2026-10-28 group: S8-FP8, split-K, mamba admission](#10-the-2026-10-28-group-s8-fp8-split-k-mamba-admission)
 
 ---
 
@@ -969,3 +970,63 @@ The development head these were verified against was `be24acf0a5`, a merge commi
 the series reproduces. Note that four files differ from the development tree by design (the
 environment-variable change); see §2 of [BENCHMARKS.md](BENCHMARKS.md) for what was and was
 not re-verified after it.
+
+---
+
+## 10. The 2026-10-28 group: S8-FP8, split-K, mamba admission
+
+Four patches, applied after `0038`. Measured results are in
+[BENCHMARKS §3.23](BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27);
+the launch block is [CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams).
+
+| Patch | Development SHA | Subject | Default |
+|---|---|---|---|
+| `0039` | `bf859739d2` | feat(qsa): opt-in `SGLANG_QSA_SORT_TOPK=1` sorts the selected top-k block indices | off |
+| `0040` | `cec151bc4f` | perf(qsa): split-K for the QSA indexer MQA scoring kernel | **on** (`auto`), bit-identical |
+| `0041` | `4edf78a0dc` | fix(mamba): stop mamba-slot ping-pong exhaustion under concurrent admission | always (bug fix) |
+| `0042` | — | perf(sm120): online FP8 for the always-on BF16 weights, 8-bit weight-only dense path | off; **lossy** when on |
+
+### 10.1 `SGLANG_SM120_ONLINE_MXFP8` / `SGLANG_SM120_ONLINE_FP8_DENSE` — 8-bit always-on weights
+
+Decode on this card is dominated by the weights read every token that are *not* NVFP4: the
+attention and DeltaNet projections, the shared expert, the hyper-connection mix and lm_head.
+With `SGLANG_SM120_ONLINE_MXFP8=true` they are quantized at load: dense and attention
+projections to MXFP8, the hyper-connection mix pair and lm_head to rowwise FP8 (one fp32 scale
+per output row). The mix pair is created on the meta device and ingested as FP8, so its BF16
+copy never lands in VRAM. `SGLANG_SM120_ONLINE_FP8_DENSE=rowwise` replaces the MXFP8 dense path
+with an 8-bit weight-only one (FP8 weights, BF16 activations) through a rowwise FP8 GEMV at
+decode batch sizes; prefill dequantizes to BF16 block by block. Also in `0042`: the fused mix
+kernel accepts FP8 weights, batches of 17–128 rows run it in 16-row slices instead of
+dequantizing the pair every step, and the NEXTN draft slices the rowwise scale together with
+the hot-token lm_head rows so the draft reads the same FP8 pair as the target.
+
+`[measured, Modal Server Edition 600 W]` +21 / +17 / +13 / +3 % aggregate at 1 / 2 / 4 / 8 streams
+against the same cap-8 BF16 configuration; 500K TTFT +5.6 s. **Not lossless**: the decode-path
+test fails (median agreement 31 / 30 vs a noise floor of 49 / 45); needles 9 / 9, GSM8K 0.96,
+0 / 192 degenerate. KL divergence pending.
+
+Credit: **mratsim** (`sglang-qwen38fn-sm120-turbo` patches 0003 and 0008, ported here),
+**Penny Royal** (`jpezzulli/sglang-rtxpro6000`, the FP8 measurements), **gabrielolympie**
+(the W8A16 weight-only approach for low-batch dense layers).
+
+### 10.2 `SGLANG_QSA_MQA_SPLITK` — split-K for the QSA indexer
+
+Port of **Lesilva**'s patch 0003. Deep long-context chunks otherwise launch about 8 CTAs on 188
+SMs. With split-K, several CTAs per row block each score a disjoint range of key tiles; each
+logit is still produced by exactly one CTA with the same tile arithmetic, so results are
+bit-identical to `split=1` and only the grid grows. `auto` (default) picks a power-of-two split;
+`1` disables it; any other integer forces that split.
+
+### 10.3 Mamba-slot admission fix
+
+Port of **Lesilva**'s patch 0002 onto this fork's lock-receipt API. Admission no longer
+preallocates mamba slots for a whole group (which hid free slots from the admission check), and
+when no checkpoint was donated in a round the same skip-mamba relock as the normal path is
+applied, so the admission lock no longer pins the copy-on-write source's slot for the whole
+request. This is what makes `--max-running-requests 8` work with 48 mamba slots.
+
+### 10.4 `SGLANG_QSA_SORT_TOPK` — bench toggle
+
+Sorts the QSA top-k block indices before the sparse gather, for the block-order question raised
+in Penny Royal's `sglang-rtxpro6000` issue 84. Off by default and in S8-FP8; carried so the
+benchmarked tree reproduces exactly.

@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 
+_FP8_MIX_CHUNK_MAX_ROWS = 128
+
 # qwen-opt fuse: fold the combine gate into the mix kernel and the
 # combine apply + next sublayer's grouped RMSNorm (+ MoE shared-expert gate/add) into one
 # tail kernel. Off by default; with the flag unset every method below runs its original body.
@@ -141,20 +143,30 @@ class GatedResidual(HyperConnectionBase):
         )
 
         if use_mix:
+            from sglang.kernels.ops.gemm import sm120_online_fp8 as _online_mod
+
+            _rowwise = _online_mod.rowwise_mix_enabled(config.params_dtype)
+            _mix_device = (
+                "meta" if _rowwise else torch.get_device_module().current_device()
+            )
             self.input_mix_weight_down = nn.Linear(
                 self.hidden_size * self.hc_count,
                 self.config.hc_lowrank,
                 bias=False,
-                device=torch.get_device_module().current_device(),
+                device=_mix_device,
                 dtype=config.params_dtype,
             )
             self.input_mix_weight_up = nn.Linear(
                 self.config.hc_lowrank,
                 self.hc_count * self.hidden_size,
                 bias=False,
-                device=torch.get_device_module().current_device(),
+                device=_mix_device,
                 dtype=config.params_dtype,
             )
+            if _rowwise:
+                _online_mod.attach_rowwise_ingest(
+                    [self.input_mix_weight_down, self.input_mix_weight_up]
+                )
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
                 torch.cuda.is_available()
@@ -280,10 +292,43 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
+            w_down = self.input_mix_weight_down.weight
+            w_up = self.input_mix_weight_up.weight
+            _rows = hyper_input_normed.shape[0]
+            if (
+                w_down.dtype == torch.float8_e4m3fn
+                and _rows <= _FP8_MIX_CHUNK_MAX_ROWS
+                and fused_hc_mix_supported(hyper_input_normed[:16], w_down, w_up)
+            ):
+                # sm120 online FP8, decode/verify batches of 17-128 rows: run the fp8-aware
+                # fused kernel in 16-row slices instead of dequantizing the pair every step.
+                return (
+                    torch.cat(
+                        [
+                            fused_hc_mix(
+                                hyper_input_normed[i : i + 16],
+                                w_down,
+                                w_up,
+                                self.hc_count,
+                                self.hidden_size,
+                            )
+                            for i in range(0, _rows, 16)
+                        ]
+                    ).to(self.params_dtype),
+                    (hyper_input, hyper_input_normed),
+                )
+            if w_down.dtype == torch.float8_e4m3fn:
+                # sm120 online FP8 replacement: prefill rows re-materialize the bf16 operands the torch.compile path expects, row blocks
+                # at a time, from the fp8 pair that stayed resident.
+                from sglang.kernels.ops.gemm.sm120_online_fp8 import (
+                    dequant_rowwise_weight,
+                )
+                w_down = dequant_rowwise_weight(w_down, hyper_input_normed.dtype)
+                w_up = dequant_rowwise_weight(w_up, hyper_input_normed.dtype)
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                w_down,
+                w_up,
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
@@ -431,10 +476,43 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
+            w_down = self.input_mix_weight_down.weight
+            w_up = self.input_mix_weight_up.weight
+            _rows = hyper_input_normed.shape[0]
+            if (
+                w_down.dtype == torch.float8_e4m3fn
+                and _rows <= _FP8_MIX_CHUNK_MAX_ROWS
+                and fused_hc_mix_supported(hyper_input_normed[:16], w_down, w_up)
+            ):
+                # sm120 online FP8, decode/verify batches of 17-128 rows: run the fp8-aware
+                # fused kernel in 16-row slices instead of dequantizing the pair every step.
+                return (
+                    torch.cat(
+                        [
+                            fused_hc_mix(
+                                hyper_input_normed[i : i + 16],
+                                w_down,
+                                w_up,
+                                self.hc_count,
+                                self.hidden_size,
+                            )
+                            for i in range(0, _rows, 16)
+                        ]
+                    ).to(self.params_dtype),
+                    (hyper_input, hyper_input_normed),
+                )
+            if w_down.dtype == torch.float8_e4m3fn:
+                # sm120 online FP8: rows past the fused kernels' limit take the torch.compile
+                # path, which needs bf16 operands; dequantize from the resident fp8 pair.
+                from sglang.kernels.ops.gemm.sm120_online_fp8 import (
+                    dequant_rowwise_weight,
+                )
+                w_down = dequant_rowwise_weight(w_down, hyper_input_normed.dtype)
+                w_up = dequant_rowwise_weight(w_up, hyper_input_normed.dtype)
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                w_down,
+                w_up,
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)

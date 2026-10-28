@@ -1525,6 +1525,85 @@ depth-matched table supports but does not prove — a Gen5 host would roughly ha
 `[estimated]`. No same-card Gen4/Gen5 decode A/B exists, and §3.20's withdrawal of the "0.8–0.9×"
 factor stands.
 
+### 3.23 The S8-FP8 profile — 8-bit dense weights, cap 8 (2026-10-27)
+
+`[measured, Modal RTX PRO 6000 Server Edition, 600 W, PCIe Gen5]` — **not** the production
+Max-Q (300 W, Gen4). Every arm boots the production lane's own launch line (540K context,
+`--max-total-tokens 1310720`, host KV `all` with 4,096 hot-cache sets, fp8 KV, NEXTN 3/1/4 with
+the hot-24k token map, `--mamba-max-states-per-path 2`, priority scheduling), and changes only
+what the arm column says. Temperature 0. Patches `0039`–`0042`; the launch block is
+[CONTEXT-PROFILES §4b](CONTEXT-PROFILES.md#4b-profile-s8-fp8-8-bit-dense-cap-8--host-ram-kv-eight-streams).
+
+| Arm | Tree | Cap (running / graph bs) | Mamba slots | Dense weights |
+|---|---|---|---|---|
+| Previous production | through `0038` | 4 / 4 | 112 | BF16 |
+| BF16 cap 8 | through `0041` | 8 / 8 | 48 | BF16 |
+| **S8-FP8** | through `0042` | 8 / 8 | 48 | **FP8** (`SGLANG_SM120_ONLINE_MXFP8=true`, `SGLANG_SM120_ONLINE_FP8_DENSE=rowwise`) |
+
+All three set `SGLANG_QSA_MQA_SPLITK=auto` where the tree has it and leave `SGLANG_QSA_SORT_TOPK`
+off. The first two arms ran in one Modal session, S8-FP8 in another, the same day.
+
+**Aggregate tok/s, concurrency sweep.** Each cell is 2 rounds of N streams × 512 tokens; the
+mean is shown, with the rounds for S8-FP8.
+
+| Streams | Previous production | BF16 cap 8 | **S8-FP8** (rounds) | vs previous | vs BF16 cap 8 |
+|---|---|---|---|---|---|
+| 1 | 228.3 | 229.2 | **276.8** (276.8 / 276.7) | +21.2 % | +20.8 % |
+| 2 | 342.2 | 342.3 | **400.4** (397.3 / 403.5) | +17.0 % | +17.0 % |
+| 4 | 535.2 | 539.9 | **610.8** (611.2 / 610.4) | +14.1 % | +13.1 % |
+| 8 | 531.5 | 759.2 | **784.1** (769.8 / 798.4) | +47.5 % | +3.3 % |
+
+The previous config's 8-stream cell is capped at 4 running requests, so the +47.5 % is mostly
+the cap. The FP8 weights' own contribution is the right-hand column.
+
+**Single stream by depth** (512 tokens decoded; one request per deep cell, so treat those as n = 1):
+
+| Prompt | Previous production: decode / TTFT | BF16 cap 8: decode / TTFT | **S8-FP8: decode / TTFT** | S8-FP8 prefill |
+|---|---|---|---|---|
+| 41 tokens (median of 3) | 233.1 / 0.1 s | 232.2 / 0.09 s | **275.1** (274.8 / 288.9 / 275.1) / — | — |
+| 131,063 | 197.2 / 11.32 s | 200.6 / 11.11 s | **233.4** / 13.10 s | 10,003 tok/s |
+| 499,991 | 190.0 / 70.56 s | 191.4 / 47.83 s | **231.8** / 53.45 s | 9,354 tok/s |
+
+Decode stays near-flat in depth (275 → 232 from short to 500K). The cost is prefill: 500K
+TTFT is **+5.6 s (+12 %)** against BF16 at the same cap. The previous-production 500K TTFT of
+70.56 s is a single request and is out of line with the other BF16 arms (47.8–48.8 s); it is
+reported as measured and not used for any claim.
+
+**Quality** (run `r20261027u2`, same S8-FP8 boot configuration; baseline = this tree's lossless
+stack, noise = a second baseline run, [§4](#4-quality-instruments--what-each-one-can-and-cannot-see)):
+
+| Instrument | Result | Verdict |
+|---|---|---|
+| Decode-path equivalence, conc 1 | median agreement **31** tokens vs noise floor 49 (1 / 96 identical vs 7 / 144); mean \|Δlogprob\| 0.0236 vs tolerance 0.0240 | **FAIL** (p = 0.0002 on agreement) |
+| Decode-path equivalence, conc 4 | median agreement **30** vs 45 (0 / 96 vs 7 / 144); 0.0243 vs 0.0226 | **FAIL** |
+| Degeneracy | **0 / 192** bad, 0 impossible tokens, 0 loops | PASS |
+| Prefix-cache probe | 6 cache-hit pairs, max mean \|Δlogprob\| 0.42 vs limit 1.33, 0 errors, 0 degenerate | PASS |
+| Needle retrieval | **9 / 9** (131,072, 262,144, 500,000) | — |
+| GSM8K | **0.96** (n = 100; 3 truncated, 0 degenerate) | — |
+| KL divergence vs BF16 | **pending** | — |
+
+So S8-FP8 is **lossy, not lossless**: greedy outputs diverge from BF16 about 35 % sooner than
+two BF16 runs diverge from each other. No task-level loss was seen at these sample sizes,
+which can only rule out large regressions ([§4.6](#46-statistical-power--what-these-sample-sizes-can-actually-resolve)).
+(The composite gate also reports FAIL on the separate 540K long-context scope rule of §3.15c,
+which this bundle did not try to satisfy; the needle run above is a separate bundle.)
+
+**Tried and not adopted** (same harness, same day):
+
+- **16,384 hot-cache sets** (§3.22's lever) with the production pool and 540K context: did not
+  boot — out of GPU memory at warm-up at `--mem-fraction-static` 0.97 and again at 0.96. S8-FP8
+  keeps 4,096.
+- **Adaptive speculation depth** (BF16 cap 8): 231.7 / 338.6 / 514.8 / 740.0 at 1 / 2 / 4 / 8
+  streams, against 229.2 / 342.3 / 539.9 / 759.2 for fixed 3/1/4 — slower from 2 streams up.
+- **Deeper fixed speculation, 4/1/5** (BF16 cap 8): 239.4 single-stream (+4 %), but 517.6 at 4
+  streams (−4 %). Not worth it for a multi-stream lane.
+- **A split-K retune of the 8-bit GEMV** (run `r20261027t`): regressed against the shipped
+  launch settings and was dropped; `0042` carries the un-retuned kernel.
+
+Open: KL divergence against BF16; the same sweep on the production Max-Q; live numbers from
+the production lane; a same-session A/B of the three arms (the rows above come from two Modal
+sessions, and §1.1's ~6 % noise band applies to any single-stream difference smaller than that).
+
 ## 4. Quality instruments — what each one can and cannot see
 
 This matters more than usual here, because the obvious instrument is the wrong one. The
@@ -1803,3 +1882,12 @@ Added by the 2026-10-01 analysis (§3.18a, §3.19, §3.20, §3.15e):
 | Residency-weighted hot-cache allocation instead of fair-share-per-slot | **not implemented, not tested** (§3.15e). Every request slot gets the same 16,384 tokens whether it lives for one turn or holds 500K. |
 | The lowest safe `--mem-fraction-static` **on the host-KV configuration** | **moot, measured** (§3.15e): with `--max-total-tokens` set, 0.94 and 0.97 boot identically on Modal — same pool, same free memory. The fraction does nothing in this mode. |
 | Whether the on-GPU compressed index and the GPU hot cache are two allocations or one | **cannot be distinguished from the boot log** (§3.15e). The two figures are bit-for-bit identical at this pool size and slot count by arithmetic coincidence, and the boot accounting shows only 0.91 GB for the step that would contain both. Needs a device-side allocation trace. |
+
+Added by the 2026-10-28 S8-FP8 profile (§3.23):
+
+| Item | Status |
+|---|---|
+| KL divergence of S8-FP8 against BF16 | **pending.** |
+| S8-FP8 on the production Max-Q (300 W, Gen4) | **not measured.** Every §3.23 number is a 600 W Server Edition number; absolute rates on the Max-Q will be lower, by an amount not measured. Live production numbers to follow. |
+| A same-session A/B of previous production, BF16 cap 8 and S8-FP8 | **not run.** The FP8 arm and the two BF16 arms ran in two Modal sessions on the same day. |
+| Using the VRAM that FP8 frees (larger pool, or more hot-cache sets) | **not measured.** 16,384 sets did not fit next to the production pool; smaller steps were not tried. |

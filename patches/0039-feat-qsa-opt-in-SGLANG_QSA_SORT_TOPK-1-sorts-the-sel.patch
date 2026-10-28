@@ -1,0 +1,51 @@
+From 4d4a7384f8eb40bfda878a022562dcc5ab06a565 Mon Sep 17 00:00:00 2001
+From: Andre Watson <dre@ligandal.com>
+Date: Wed, 28 Oct 2026 00:07:44 -0400
+Subject: [PATCH 39/42] feat(qsa): opt-in SGLANG_QSA_SORT_TOPK=1 sorts the
+ selected top-k block indices
+
+Bench toggle for the block-order question raised in Penny Royal's
+sglang-rtxpro6000 issue 84: when set, the QSA top-k block indices are sorted
+before the sparse attention gather. Off by default (unset or 0), in which case
+the kernel path is unchanged. The S8-FP8 profile leaves it off
+(SGLANG_QSA_SORT_TOPK=0); it is carried so the tested tree is reproducible.
+---
+ python/sglang/srt/layers/attention/qsa/kernel.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/kernel.py b/python/sglang/srt/layers/attention/qsa/kernel.py
+index 8a24ba4..07c0c0d 100644
+--- a/python/sglang/srt/layers/attention/qsa/kernel.py
++++ b/python/sglang/srt/layers/attention/qsa/kernel.py
+@@ -231,6 +231,9 @@ def triton_expand_qsa_block_indices(
+     return output
+ 
+ 
++_QSA_SORT_TOPK = __import__("os").environ.get("SGLANG_QSA_SORT_TOPK", "0") == "1"
++
++
+ def expand_qsa_block_indices(
+     block_indices: torch.Tensor,
+     query_positions: torch.Tensor,
+@@ -249,6 +252,18 @@ def expand_qsa_block_indices(
+     rows = block_indices.shape[0]
+     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
+         raise ValueError("query positions and sequence lengths must match top-k rows")
++    if _QSA_SORT_TOPK:
++        # Bench toggle (Penny issue 84 mitigation): order the selected blocks by
++        # index so the sparse-attention accumulation order no longer depends on the
++        # top-k kernel's internal output order. Invalid (-1) slots stay at the end.
++        _big = torch.iinfo(block_indices.dtype).max
++        _keyed = torch.where(
++            block_indices < 0, torch.full_like(block_indices, _big), block_indices
++        )
++        _keyed = torch.sort(_keyed, dim=-1).values
++        block_indices = torch.where(
++            _keyed == _big, torch.full_like(_keyed, -1), _keyed
++        )
+     if block_indices.is_cuda:
+         # The Triton kernel loads positions/lengths as scalars, so any integer
+         # dtype works; skip the int64 conversion copies.
+-- 
+2.43.0
+

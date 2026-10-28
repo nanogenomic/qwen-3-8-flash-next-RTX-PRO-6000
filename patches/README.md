@@ -1,6 +1,6 @@
 # Patch series
 
-The 38 commits of this fork as `git am`-able patches against upstream SGLang
+The 42 commits of this fork as `git am`-able patches against upstream SGLang
 `6fa3fe69e2e5e19b75cadd9fc285b72634551992`.
 
 Use these to apply the change set onto an upstream checkout you already have, without cloning
@@ -33,6 +33,14 @@ Patches `0033`–`0038` are the 2026-09-30 group: host-resident KV (`0033`, `003
 gather (`0035`), non-fatal prefill OOM (`0036`, `0037`) and the host-KV tests (`0038`). `0033`
 and `0034` go together. `0036` and `0037` go together — `0037` closes real holes found reviewing
 `0036`, and `0036` alone should not be deployed.
+
+Patches `0039`–`0042` are the 2026-10-28 group behind the S8-FP8 profile: an opt-in QSA top-k
+sort (`0039`, off; carried so the benchmarked tree reproduces exactly), the QSA indexer split-K
+(`0040`, Lesilva's 0003; on by default, bit-identical), the mamba-slot admission fix (`0041`,
+Lesilva's 0002 ported to this fork's lock-receipt API; needed for `--max-running-requests 8` with
+48 mamba slots), and online FP8 for the always-on BF16 weights (`0042`, after mratsim's
+`sglang-qwen38fn-sm120-turbo` 0003/0008, with gabrielolympie's weight-only 8-bit approach for the
+dense layers; off by default, lossy). See [`../BENCHMARKS.md` §3.23](../BENCHMARKS.md#323-the-s8-fp8-profile--8-bit-dense-weights-cap-8-2026-10-27).
 
 These patches cover the source tree only. The top-level documentation is this repository's,
 not part of the series. `../make-fork.sh` applies the whole series onto upstream for you.

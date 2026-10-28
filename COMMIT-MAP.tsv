@@ -37,3 +37,7 @@ patch	development_sha	subject
 0036-feat-scheduler-survive-a-prefill-CUDA-OOM-instead-of.patch	b4176cf086	feat(scheduler): survive a prefill CUDA OOM instead of killing the lane
 0037-fix-scheduler-close-the-prefill-OOM-recovery-holes-f.patch	0a6519021b	fix(scheduler): close the prefill-OOM recovery holes found in review
 0038-test-qsa-host-resident-K-V-and-GPU-hot-cache-correct.patch	-	test(qsa): host-resident K/V and GPU hot-cache correctness tests
+0039-feat-qsa-opt-in-SGLANG_QSA_SORT_TOPK-1-sorts-the-sel.patch	bf859739d2	feat(qsa): opt-in SGLANG_QSA_SORT_TOPK=1 sorts the selected top-k block indices
+0040-perf-qsa-split-K-for-the-QSA-indexer-MQA-scoring-ker.patch	cec151bc4f	perf(qsa): split-K for the QSA indexer MQA scoring kernel
+0041-fix-mamba-stop-mamba-slot-ping-pong-exhaustion-under.patch	4edf78a0dc	fix(mamba): stop mamba-slot ping-pong exhaustion under concurrent admission
+0042-perf-sm120-online-FP8-for-the-always-on-BF16-weights.patch	-	perf(sm120): online FP8 for the always-on BF16 weights, 8-bit weight-only dense path
