@@ -1,0 +1,37 @@
+# 70-pdi8.conf.staged -- OPTIONAL. 4M pool + --prefill-decode-interval 8 (shorter freezes while
+# another session prefills). Inert while named *.staged. To arm: rename to 70-pdi8.conf.
+# systemd allows ONE ExecStart, so this file restates the WHOLE command and, sorting after 60-*.conf,
+# wins over it. It carries the 4M pool and SGLANG_QSA_HOST_KV_MAX_GB=50 itself, so it is
+# self-contained: arming it boots 4M + interval 8 even if 60-kvpool.conf is still the 2M file.
+# For 2M + interval 8 instead, change --max-total-tokens to 2097152 and the guard to 28.
+# Modal r20261028tr3/tr4/tr5 (2M base flags): worst 4-stream stall 7.79 s -> 0.76 s; a cold 300K
+# prefill freezes other streams 1.27 s instead of 28.2 s; cost: cold 300K prefill +27% (29.5 -> 37.5 s),
+# per-stream -11% at 2 busy streams, -2% at 4. Modal r20261028c40p8 (4M + interval 8): boots, 7.14 GB
+# free GPU, 8 x 500K all cached (follow-up first token 6.6-9.0 s), GSM8K 0.98.
+# Back out the flag only: sudo mv 70-pdi8.conf 70-pdi8.conf.staged && daemon-reload && restart
+#   (falls back to whatever 60-kvpool.conf holds).
+[Service]
+Environment=SGLANG_QSA_HOST_KV_MAX_GB=50
+ExecStart=
+ExecStart=/path/to/venv/bin/python -m sglang.launch_server \
+  --model-path /path/to/qwen38-flash-next-nvfp4 \
+  --served-model-name qwen38-flash-next --host 0.0.0.0 --port 8011 \
+  --quantization modelopt_fp4 --trust-remote-code \
+  --context-length 540000 --mem-fraction-static 0.97 \
+  --max-total-tokens 4194304 \
+  --attention-backend flashinfer --sampling-backend flashinfer \
+  --moe-runner-backend flashinfer_cutlass \
+  --mamba-ssm-dtype bfloat16 --mamba-radix-cache-strategy extra_buffer_lazy \
+  --page-size 64 --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+  --cuda-graph-backend-prefill=disabled --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --ple-offload-embedding --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder --enable-metrics --enable-cache-report --log-level info \
+  --max-running-requests 8 --max-mamba-cache-size 48 --mamba-max-states-per-path 2 \
+  --speculative-token-map /path/to/hot_24k.pt \
+  --bf16-gemm-backend sm120gemv --kv-cache-dtype fp8_e4m3 \
+  --enable-priority-scheduling --default-priority-value 0 --radix-eviction-policy priority \
+  --max-queued-requests 64 \
+  --crash-dump-folder /path/to/crashdumps \
+  --prefill-decode-interval 8

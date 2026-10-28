@@ -1,0 +1,36 @@
+# 60-kvpool-4m.conf.staged -- OPTIONAL. 4,194,304-token pool: eight 500K sessions stay cached.
+# Inert while named *.staged.
+# IMPORTANT: this file must REPLACE the 2M (or 1.5M) 60-kvpool.conf, not sit beside it. systemd keeps
+# only the last ExecStart, and "60-kvpool-4m.conf" sorts BEFORE "60-kvpool.conf", so if both are armed
+# the 2M file wins silently. Arm it under the name 60-kvpool.conf:
+#   sudo mv 60-kvpool.conf 60-kvpool.conf.bak-2m && sudo mv 60-kvpool-4m.conf.staged 60-kvpool.conf
+# Modal r20261028ab / r20261028p40: decode unchanged vs 2M in the same container
+# (273.0/405.3/599.4/807.7 vs 278.7/403.0/603.7/807.5 tok/s at 1/2/4/8 short streams), 8 x 500K all
+# cached on follow-up (first token 2.6-7.0 s with all eight active), needles 9/9, GSM8K 0.97.
+# Host KV pinned 48.00 + 4.00 GiB, so the per-pool guard rises to 50 GiB. Free GPU after boot 7.14 GB.
+# Rollback to 2M: sudo mv 60-kvpool.conf 60-kvpool-4m.conf.staged && sudo mv 60-kvpool.conf.bak-2m 60-kvpool.conf
+#   && sudo systemctl daemon-reload && sudo systemctl restart <your-unit>
+[Service]
+Environment=SGLANG_QSA_HOST_KV_MAX_GB=50
+ExecStart=
+ExecStart=/path/to/venv/bin/python -m sglang.launch_server \
+  --model-path /path/to/qwen38-flash-next-nvfp4 \
+  --served-model-name qwen38-flash-next --host 0.0.0.0 --port 8011 \
+  --quantization modelopt_fp4 --trust-remote-code \
+  --context-length 540000 --mem-fraction-static 0.97 \
+  --max-total-tokens 4194304 \
+  --attention-backend flashinfer --sampling-backend flashinfer \
+  --moe-runner-backend flashinfer_cutlass \
+  --mamba-ssm-dtype bfloat16 --mamba-radix-cache-strategy extra_buffer_lazy \
+  --page-size 64 --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+  --cuda-graph-backend-prefill=disabled --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --ple-offload-embedding --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder --enable-metrics --enable-cache-report --log-level info \
+  --max-running-requests 8 --max-mamba-cache-size 48 --mamba-max-states-per-path 2 \
+  --speculative-token-map /path/to/hot_24k.pt \
+  --bf16-gemm-backend sm120gemv --kv-cache-dtype fp8_e4m3 \
+  --enable-priority-scheduling --default-priority-value 0 --radix-eviction-policy priority \
+  --max-queued-requests 64 \
+  --crash-dump-folder /path/to/crashdumps

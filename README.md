@@ -27,6 +27,8 @@ work, a QSA correctness fix, and memory-capacity work for serving **Qwen3.8-Flas
 > decode speed, four 500K sessions stay cached instead of two, for 10.75 GiB of host RAM and 0.64 GB
 > of GPU memory at 2M. Verified in production. A 4M pool holds eight 500K sessions at the same speed
 > (Modal; [BENCHMARKS §3.25.4](BENCHMARKS.md#3254-the-4m-pool-and-eight-500k-sessions)).
+> Copyable opt-in configs for 2M, 4M and the optional `--prefill-decode-interval 8` flag, with
+> measured trade-offs and rollback: **[KV-POOLS §8](KV-POOLS.md#8-options-2m-4m-and-the-interval-flag)** and [`ops/examples/kv-pools/`](ops/examples/kv-pools/).
 
 ---
 
@@ -515,7 +517,7 @@ UPSTREAM-BUG-qsa-index-key-ring.md             a filable upstream correctness bu
 UPSTREAM-BUG-cuda-graph-capture-invalidated.md  NOT an upstream bug after all: cause found in this
                                                fork's stats thread (§3.19). Kept as the record
 CONTEXT-PROFILES.md      high-context flag profiles and their measured speed costs
-KV-POOLS.md              bigger host-RAM KV pools (1.5M / 2M): flags, costs, systemd drop-in, rollback
+KV-POOLS.md              bigger host-RAM KV pools (1.5M / 2M / 4M), interval flag option: flags, costs, drop-ins, rollback
 LICENSE                  upstream SGLang's Apache-2.0 licence, unmodified
 make-fork.sh             builds the full, rebasable fork locally (below)
 patches/                 the 42 commits as a git-am-able series against the base commit

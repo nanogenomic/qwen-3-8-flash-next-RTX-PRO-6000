@@ -189,3 +189,108 @@ What a first census showed (about 64,000 tokens, all tags): 258 of 24,576 expert
 covering 99 % of picks still needs a median 406 of 512 experts per layer, and a benchmark-only window
 left 577 unused, most of which chat, bio, SDK and tool-calling prompts then used. A short window is
 not a safe trim list; mask before deleting, and gate on needles, GSM8K and held-out tasks.
+
+## 8. Options: 2M, 4M, and the interval flag
+
+Three opt-in choices on top of the S8-FP8 profile. None is the default. Copyable files for all of
+them are in [`ops/examples/kv-pools/`](ops/examples/kv-pools/): systemd drop-ins (`*.conf.staged`)
+and a plain launch script for non-systemd setups.
+
+| Option | Pool `--max-total-tokens` | `SGLANG_QSA_HOST_KV_MAX_GB` | 500K sessions kept cached | Free GPU after boot | File |
+|---|---|---|---|---|---|
+| 2M (4 × 500K) | 2,097,152 | 28 | 4 | 8.97 GB | `60-kvpool-2m.conf.staged` |
+| 4M (8 × 500K) | 4,194,304 | 50 | 8 | 7.14 GB | `60-kvpool-4m.conf.staged` |
+| 4M + interval 8 | 4,194,304 | 50 | 8 | 7.14 GB | `70-pdi8.conf.staged` (self-contained) |
+
+Without systemd:
+
+```bash
+cd ops/examples/kv-pools
+MODEL=/path/to/model TOKEN_MAP=/path/to/hot_24k.pt PY=/path/to/venv/bin/python \
+  POOL=4m PDI8=1 ./launch-s8fp8-kvpool.sh        # POOL=1310k|1p5m|2m|4m, PDI8=0|1
+```
+
+Or by hand: take the S8-FP8 launch line, set `--max-total-tokens 4194304`,
+`export SGLANG_QSA_HOST_KV_MAX_GB=50`, and optionally append `--prefill-decode-interval 8`.
+
+### 8.1 4M vs 2M (measured, Modal, one RTX PRO 6000 at 600 W)
+
+| | 4M pool | 2M pool |
+|---|---|---|
+| Aggregate decode, 1 / 2 / 4 / 8 short streams, same container (run `r20261028ab`) | 273.0 / 405.3 / 599.4 / 807.7 tok/s | 278.7 / 403.0 / 603.7 / 807.5 tok/s |
+| Free GPU after boot | 7.14 GB | 8.97 GB |
+| Host RAM pinned (target + draft) | 48.00 + 4.00 GiB | 24.00 + 2.00 GiB |
+| 500K sessions that stay cached | 8 of 8 (run `r20261028p40`) | 4 |
+| Follow-up first token, sessions cached | 2.6–7.0 s with all eight active | 2.45–3.53 s with four resident |
+| Needles 131–500K / GSM8K n=100 | 9/9, 0.97 | 9/9, 0.98 |
+
+The speed differences (−2.0 / +0.6 / −0.7 / 0.0 %) are within noise. The 4M pool costs 1.83 GB of
+free GPU and 26 GiB more pinned host RAM, and buys room for four more 500K sessions.
+
+### 8.2 The optional `--prefill-decode-interval 8` flag
+
+Makes the scheduler run decode steps between prefill chunks, so a long prefill in one session no
+longer freezes the others. Measured on Modal (runs `r20261028tr3`/`tr4`/`tr5`, [BENCHMARKS §3.24](BENCHMARKS.md#324-troughs-compaction-and-between-turn-2026-10-28)):
+
+| | Without | With interval 8 |
+|---|---|---|
+| Worst per-stream stall, 4 streams | 7.79 s | 0.76 s |
+| Other streams frozen during a cold 300K prefill | 28.2 s | at most 1.27 s |
+| Cold 300K prefill time | 29.5 s | 37.5 s (+27 %) |
+| Per-stream speed, 2 busy streams | — | −11 % (−2 % at 4 streams; 1 stream unchanged) |
+
+With the 4M pool (run `r20261028c40p8`, [BENCHMARKS §3.25.5](BENCHMARKS.md#3255-the-4m-pool-together-with---prefill-decode-interval-8)):
+boots with the same 7.14 GB free GPU, all eight 500K sessions cached, follow-up first token
+6.6–9.0 s with all eight active, GSM8K 0.98. Short-stream speed was 261.9 / 360.9 / 548.2 / 744.8 tok/s
+at 1 / 2 / 4 / 8 streams, 4–11 % below 4M alone, but that run was in a different container and
+containers read 5–10 % apart on their own, so treat 4–11 % as an upper bound on the flag's cost.
+
+Use it when several agents share the card and one of them regularly sends a long cold prompt (for
+example a compaction). Skip it if you care most about raw prefill speed or two-stream throughput.
+
+### 8.3 Known not to work with this profile
+
+- `--enable-mixed-chunk`: crashed (device-side assert) about 1 minute into 2-stream load.
+- Overlap scheduler off (`--disable-overlap-schedule`): will not start; the lazy mamba buffer needs it.
+- `--max-mamba-cache-size 112`: no gain at 4 streams (−3.8 %), about 3.5 GB more memory, 500K follow-ups 22–26 % slower.
+- `SGLANG_QSA_HOST_KV_STATS=1`: the stats thread can break CUDA-graph capture at boot. Keep it `0`.
+- `--context-length` above 540,000: lossy (section 5).
+
+### 8.4 Apply and roll back (systemd)
+
+Only one `60-kvpool.conf` may be armed. systemd keeps the last `ExecStart` in name order, and
+`60-kvpool-4m.conf` sorts **before** `60-kvpool.conf`, so arming the 4M file under its own name next
+to the 2M file leaves the 2M pool in force without any error. The 4M file must replace the 2M one.
+
+```bash
+D=/etc/systemd/system/<your-unit>.service.d
+# 2M -> 4M
+sudo mv $D/60-kvpool.conf $D/60-kvpool.conf.bak-2m
+sudo cp 60-kvpool-4m.conf.staged $D/60-kvpool.conf
+# optional: add the interval flag (self-contained, wins over 60-kvpool.conf)
+sudo cp 70-pdi8.conf.staged $D/70-pdi8.conf
+sudo systemd-analyze verify /etc/systemd/system/<your-unit>.service
+sudo systemctl daemon-reload
+systemctl show <your-unit> -p ExecStart | tr ' ' '\n' | grep -E -A1 'max-total-tokens|prefill-decode-interval'
+sudo systemctl restart <your-unit>
+curl -s http://<host>:8011/health
+grep -E "QSA host KV:|max_total_num_tokens|available_gpu_mem" <your server log> | tail -5
+# expect 48.00 GiB and 4.00 GiB host KV, max_total_num_tokens=4194304, available_gpu_mem=7.14 GB
+```
+
+Roll back the interval flag only (falls back to whatever `60-kvpool.conf` holds):
+
+```bash
+sudo rm -f $D/70-pdi8.conf && sudo systemctl daemon-reload && sudo systemctl restart <your-unit>
+```
+
+Roll back 4M to 2M:
+
+```bash
+sudo rm -f $D/70-pdi8.conf
+sudo mv $D/60-kvpool.conf.bak-2m $D/60-kvpool.conf
+sudo systemctl daemon-reload && sudo systemctl restart <your-unit>
+```
+
+Roll back at once if boot fails on the host-KV guard (raise `SGLANG_QSA_HOST_KV_MAX_GB` only if
+the host has the RAM), if it OOMs, or if `available_gpu_mem` after boot is far below 7.14 GB.
