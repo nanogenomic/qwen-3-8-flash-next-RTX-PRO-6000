@@ -308,3 +308,57 @@ sudo systemctl daemon-reload && sudo systemctl restart <your-unit>
 
 Roll back at once if boot fails on the host-KV guard (raise `SGLANG_QSA_HOST_KV_MAX_GB` only if
 the host has the RAM), if it OOMs, or if `available_gpu_mem` after boot is far below 7.14 GB.
+
+## 9. Two cards: one full copy per card
+
+On a host with two RTX PRO 6000 cards, the fastest setup we have measured is two independent servers, one per card, each with its own 4M pool. Splitting one copy across both cards over PCIe is much slower for a single stream (see BENCHMARKS for the earlier split-card runs), while two copies keep full single-stream speed on each card.
+
+### 9.1 How to run the second copy
+
+Copy your first unit to a second unit file and change only these lines. Everything else (env, flags, 4M pool, `SGLANG_QSA_HOST_KV_MAX_GB=50`, optional interval flag) stays identical.
+
+```ini
+# /etc/systemd/system/<your-unit>-gpu1.service  (differences from the GPU0 unit only)
+Environment=CUDA_VISIBLE_DEVICES=1
+# pin CPU threads and host memory (pinned KV pool) to the card's own socket;
+# find it with: nvidia-smi topo -m   (the "CPU Affinity" / "NUMA Affinity" columns)
+CPUAffinity=16-31 48-63
+NUMAPolicy=bind
+NUMAMask=1
+# in ExecStart:
+#   --port 8012                         (any free port)
+#   --crash-dump-folder <dir>-gpu1      (keep separate)
+StandardOutput=append:<log>-gpu1.log
+StandardError=append:<log>-gpu1.log
+```
+
+No other shared resource needs changing: internal ZMQ and NCCL ports are picked free at boot, shared-memory names are per process, and the host KV pool is anonymous pinned memory, not a file. JIT cache directories can be shared.
+
+Rollback: `sudo systemctl disable --now <your-unit>-gpu1.service`. The first card is not affected.
+
+### 9.2 Host RAM
+
+Each copy with the 4M pool pins 48.00 + 4.00 GiB of host KV and holds about 116 GB of pinned shared memory in total (including the offloaded embedding). Two copies used 232 GB of pinned memory on a 503 GB, two-socket host; 237 GB stayed available. With NUMA binding, the second copy's memory sat entirely on its own socket (every mapping `bind:1`), which kept the first socket's memory and CPU untouched.
+
+### 9.3 Measured: second copy on a 300 W Max-Q card (PCIe Gen4, two-socket host)
+
+Booted in 4 min 8 s, `available_gpu_mem=7.14 GB` (identical to the first card), no restarts. Client-side, 512-token code answers, temperature 0, 3 rounds each:
+
+| streams | total tok/s | per-stream decode tok/s |
+|---|---|---|
+| 1 | 306.1 | 337.9 |
+| 2 | 431.9 | 254.2 |
+| 4 | 632.9 | 186.0 |
+| 8 | 832.7 (870.6 over 14 more rounds) | 122.8 |
+
+Interference between the two copies: with the second card running 8 streams continuously, one stream on the first card decoded at 329.3 tok/s mean (median 339.8), against 351.7 before and 338.2 after with the second card idle. The difference is the same size as the before/after spread, so we see no measurable slowdown from running both.
+
+Together the two cards gave 1,169 tok/s in that test (870.6 on the busy card plus 298.5 on the single stream), and each card can take 8 sessions of up to 540K context.
+
+### 9.4 Quality on the second copy
+
+Same harness and settings as the first card: GSM8K n=150 at 8 concurrent requests scored **0.9667** (0 errors; the first card scored 0.97 at n=100), and a needle at 500,000 tokens (depth 0.5) was found **1/1**.
+
+### 9.5 Routing
+
+The two copies are independent servers with the same model name. Point clients at both (split sessions per card, or load-balance), and keep a long session on the card that already holds its cache: moving a 500K session to the other card means re-reading it from scratch. A router that fails over between the two also removes the outage while one copy restarts.
